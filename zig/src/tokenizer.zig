@@ -65,12 +65,6 @@ const Candidate = struct {
     word_cost: i32,
 };
 
-const CountCandidate = struct {
-    left_id: u16,
-    right_id: u16,
-    word_cost: i32,
-};
-
 pub const Tokenizer = struct {
     allocator: Allocator,
     dictionary: dict_mod.Dictionary,
@@ -191,7 +185,7 @@ pub const Worker = struct {
         try self.resetCount(input.len);
         if (input.len == 0) return error.NoPath;
 
-        try self.count_nodes.append(self.allocator, CountNode.bos());
+        try self.appendCountNode(.bos());
         self.count_end_heads.items[0] = 0;
 
         var begin: usize = 0;
@@ -332,11 +326,7 @@ pub const Worker = struct {
     inline fn appendEntriesCount(self: *Worker, input: []const u8, begin: usize, entries: []const dict_mod.Entry, emitted: *bool) !void {
         for (entries) |entry| {
             if (std.mem.startsWith(u8, input[begin..], entry.surface)) {
-                self.appendBestCountNode(begin, begin + entry.surface.len, .{
-                    .left_id = entry.left_id,
-                    .right_id = entry.right_id,
-                    .word_cost = entry.word_cost,
-                });
+                self.appendBestCountNode(begin, begin + entry.surface.len, entry.left_id, entry.right_id, entry.word_cost);
                 emitted.* = true;
             }
         }
@@ -351,27 +341,13 @@ pub const Worker = struct {
             // skips that empty first-byte term check on the common Japanese
             // count-only path.
             node_index = root.node_index;
-            for (dict_mod.trieCountTerms(self.dictionary.trie_nodes, self.dictionary.trie_count_terms, node_index)) |term| {
-                self.appendBestCountNode(begin, root.end, .{
-                    .left_id = term.left_id,
-                    .right_id = term.right_id,
-                    .word_cost = term.word_cost,
-                });
-                emitted.* = true;
-            }
+            self.appendTrieCountTerms(begin, root.end, node_index, emitted);
             pos = root.end;
         } else {
             const first_node = self.dictionary.trie_first[input[begin]];
             if (first_node == dict_mod.invalid_trie_node) return;
             node_index = @intCast(first_node);
-            for (dict_mod.trieCountTerms(self.dictionary.trie_nodes, self.dictionary.trie_count_terms, node_index)) |term| {
-                self.appendBestCountNode(begin, begin + 1, .{
-                    .left_id = term.left_id,
-                    .right_id = term.right_id,
-                    .word_cost = term.word_cost,
-                });
-                emitted.* = true;
-            }
+            self.appendTrieCountTerms(begin, begin + 1, node_index, emitted);
         }
         if (pos == begin + 1 and pos < input.len) {
             // The root pair table avoids the first trie edge lookup for the
@@ -382,14 +358,7 @@ pub const Worker = struct {
             const pair_node = self.dictionary.trie_pair[pair_index];
             if (pair_node == dict_mod.invalid_trie_node) return;
             node_index = @intCast(pair_node);
-            for (dict_mod.trieCountTerms(self.dictionary.trie_nodes, self.dictionary.trie_count_terms, node_index)) |term| {
-                self.appendBestCountNode(begin, begin + 2, .{
-                    .left_id = term.left_id,
-                    .right_id = term.right_id,
-                    .word_cost = term.word_cost,
-                });
-                emitted.* = true;
-            }
+            self.appendTrieCountTerms(begin, begin + 2, node_index, emitted);
             pos = begin + 2;
         }
         if (self.dictionary.trie_triple.len != 0 and pos == begin + 2 and pos < input.len) {
@@ -400,26 +369,26 @@ pub const Worker = struct {
             const triple_node = self.dictionary.trie_triple[triple_index];
             if (triple_node == dict_mod.invalid_trie_node) return;
             node_index = @intCast(triple_node);
-            for (dict_mod.trieCountTerms(self.dictionary.trie_nodes, self.dictionary.trie_count_terms, node_index)) |term| {
-                self.appendBestCountNode(begin, begin + 3, .{
-                    .left_id = term.left_id,
-                    .right_id = term.right_id,
-                    .word_cost = term.word_cost,
-                });
-                emitted.* = true;
-            }
+            self.appendTrieCountTerms(begin, begin + 3, node_index, emitted);
             pos = begin + 3;
         }
         while (pos < input.len) : (pos += 1) {
             node_index = self.findTrieEdge(node_index, input[pos]) orelse break;
-            for (dict_mod.trieCountTerms(self.dictionary.trie_nodes, self.dictionary.trie_count_terms, node_index)) |term| {
-                self.appendBestCountNode(begin, pos + 1, .{
-                    .left_id = term.left_id,
-                    .right_id = term.right_id,
-                    .word_cost = term.word_cost,
-                });
-                emitted.* = true;
-            }
+            self.appendTrieCountTerms(begin, pos + 1, node_index, emitted);
+        }
+    }
+
+    inline fn appendTrieCountTerms(self: *Worker, begin: usize, end: usize, node_index: usize, emitted: *bool) void {
+        // Count-only trie nodes store a compact term stream. Iterating it here
+        // avoids rebuilding slice values at every trie depth and keeps the
+        // candidate append path shared across root, pair, triple, and edge hits.
+        const node = self.dictionary.trie_nodes[node_index];
+        var index: usize = @intCast(node.count_word_start);
+        const stop = index + @as(usize, @intCast(node.count_word_len));
+        while (index < stop) : (index += 1) {
+            const term = self.dictionary.trie_count_terms[index];
+            self.appendBestCountNode(begin, end, term.left_id, term.right_id, term.word_cost);
+            emitted.* = true;
         }
     }
 
@@ -427,11 +396,7 @@ pub const Worker = struct {
         for (self.dictionary.entry_index.buckets[input[begin]]) |word_id| {
             const entry = self.dictionary.entries[word_id];
             if (surfaceMatchesIndexed(input, begin, entry.surface)) {
-                self.appendBestCountNode(begin, begin + entry.surface.len, .{
-                    .left_id = entry.left_id,
-                    .right_id = entry.right_id,
-                    .word_cost = entry.word_cost,
-                });
+                self.appendBestCountNode(begin, begin + entry.surface.len, entry.left_id, entry.right_id, entry.word_cost);
                 emitted.* = true;
             }
         }
@@ -517,11 +482,7 @@ pub const Worker = struct {
                     break :blk group_len -| 1 <= max_grouping_len;
                 } else true;
                 if (can_group) {
-                    self.appendBestCountNode(begin, end_group, .{
-                        .left_id = unk.left_id,
-                        .right_id = unk.right_id,
-                        .word_cost = unk.word_cost,
-                    });
+                    self.appendBestCountNode(begin, end_group, unk.left_id, unk.right_id, unk.word_cost);
                     emitted = true;
                     grouped = true;
                 }
@@ -530,11 +491,7 @@ pub const Worker = struct {
             while (len <= max_len) : (len += 1) {
                 if (grouped and len == group_len) continue;
                 const end = if (cached_len_ends) len_ends_buf[len - 1] else try nthBoundary(input, begin, len);
-                self.appendBestCountNode(begin, end, .{
-                    .left_id = unk.left_id,
-                    .right_id = unk.right_id,
-                    .word_cost = unk.word_cost,
-                });
+                self.appendBestCountNode(begin, end, unk.left_id, unk.right_id, unk.word_cost);
                 emitted = true;
             }
         }
@@ -542,11 +499,7 @@ pub const Worker = struct {
         if (!has_matched and !emitted) {
             const end = nextBoundary(input, begin) orelse return error.InvalidDictionary;
             const fallback = self.dictionary.unk_index.fallback_terms[info.base_id];
-            self.appendBestCountNode(begin, end, .{
-                .left_id = fallback.left_id,
-                .right_id = fallback.right_id,
-                .word_cost = fallback.word_cost,
-            });
+            self.appendBestCountNode(begin, end, fallback.left_id, fallback.right_id, fallback.word_cost);
         }
     }
 
@@ -580,13 +533,16 @@ pub const Worker = struct {
         self.end_heads.items[end] = index;
     }
 
-    inline fn appendBestCountNode(self: *Worker, begin: usize, end: usize, candidate: CountCandidate) void {
-        const best = self.findBestCountPrev(begin, candidate);
+    inline fn appendBestCountNode(self: *Worker, begin: usize, end: usize, left_id: u16, right_id: u16, word_cost: i32) void {
+        // Keep the count-only candidate fields as scalar arguments. This
+        // avoids materializing a short-lived candidate struct in the tight
+        // dictionary and unknown-word loops.
+        const best = self.findBestCountPrev(begin, left_id, word_cost);
         const token_count = self.count_nodes.items[best.index].token_count + 1;
         var existing_index = self.count_end_heads.items[end];
         while (existing_index != invalid_count_node) : (existing_index = self.count_nodes.items[existing_index].next_end) {
             var existing = &self.count_nodes.items[existing_index];
-            if (existing.right_id != candidate.right_id) continue;
+            if (existing.right_id != right_id) continue;
             if (best.cost > existing.min_cost) return;
             existing.min_cost = best.cost;
             existing.token_count = token_count;
@@ -594,13 +550,25 @@ pub const Worker = struct {
         }
         const index = self.count_nodes.items.len;
         if (index > std.math.maxInt(u32)) unreachable;
-        self.count_nodes.append(self.allocator, .{
-            .right_id = candidate.right_id,
+        self.appendCountNode(.{
+            .right_id = right_id,
             .min_cost = best.cost,
             .token_count = token_count,
             .next_end = self.count_end_heads.items[end],
         }) catch unreachable;
         self.count_end_heads.items[end] = @intCast(index);
+    }
+
+    inline fn appendCountNode(self: *Worker, node: CountNode) !void {
+        // Criterion and production callers commonly reuse a worker after the
+        // first tokenization has grown the lattice buffer. Use the unchecked
+        // append on that steady-state path, while preserving the regular
+        // growing append for larger inputs.
+        if (self.count_nodes.items.len < self.count_nodes.capacity) {
+            self.count_nodes.appendAssumeCapacity(node);
+            return;
+        }
+        try self.count_nodes.append(self.allocator, node);
     }
 
     fn findBestPrev(self: *Worker, begin: usize, candidate: Candidate) !struct { index: usize, cost: i32 } {
@@ -618,10 +586,10 @@ pub const Worker = struct {
         return .{ .index = best_index orelse return error.NoPath, .cost = best_cost };
     }
 
-    inline fn findBestCountPrev(self: *Worker, begin: usize, candidate: CountCandidate) struct { index: u32, cost: i32 } {
+    inline fn findBestCountPrev(self: *Worker, begin: usize, left_id: u16, word_cost: i32) struct { index: u32, cost: i32 } {
         const first_index = self.count_end_heads.items[begin];
         if (first_index == invalid_count_node) unreachable;
-        const row_start = @as(usize, candidate.left_id) * self.dictionary.matrix.right_size;
+        const row_start = @as(usize, left_id) * self.dictionary.matrix.right_size;
         const matrix_row = self.dictionary.matrix.costs[row_start .. row_start + self.dictionary.matrix.right_size];
         const first = self.count_nodes.items[first_index];
         if (first.next_end == invalid_count_node) {
@@ -630,7 +598,7 @@ pub const Worker = struct {
             // a linked-list walk on the hottest count-only transition path.
             return .{
                 .index = first_index,
-                .cost = first.min_cost + @as(i32, matrix_row[first.right_id]) + candidate.word_cost,
+                .cost = first.min_cost + @as(i32, matrix_row[first.right_id]) + word_cost,
             };
         }
 
@@ -639,7 +607,7 @@ pub const Worker = struct {
         var prev_index = first_index;
         while (prev_index != invalid_count_node) : (prev_index = self.count_nodes.items[prev_index].next_end) {
             const prev = self.count_nodes.items[prev_index];
-            const cost = prev.min_cost + @as(i32, matrix_row[prev.right_id]) + candidate.word_cost;
+            const cost = prev.min_cost + @as(i32, matrix_row[prev.right_id]) + word_cost;
             if (best_index == invalid_count_node or cost <= best_cost) {
                 best_index = prev_index;
                 best_cost = cost;
@@ -663,9 +631,17 @@ pub const Worker = struct {
     }
 
     fn bestCountEndNode(self: *Worker, end: usize) !u32 {
+        const first_index = self.count_end_heads.items[end];
+        if (first_index == invalid_count_node) return error.NoPath;
+        if (self.count_nodes.items[first_index].next_end == invalid_count_node) {
+            // The final byte offset commonly has a single surviving right-id
+            // state after count-only deduplication. Return it directly instead
+            // of entering the generic best-node scan.
+            return first_index;
+        }
         var best_index: u32 = invalid_count_node;
         var best_cost: i32 = std.math.maxInt(i32);
-        var index = self.count_end_heads.items[end];
+        var index = first_index;
         while (index != invalid_count_node) : (index = self.count_nodes.items[index].next_end) {
             const cost = self.count_nodes.items[index].min_cost;
             if (best_index == invalid_count_node or cost < best_cost) {
@@ -673,7 +649,6 @@ pub const Worker = struct {
                 best_cost = cost;
             }
         }
-        if (best_index == invalid_count_node) return error.NoPath;
         return best_index;
     }
 
