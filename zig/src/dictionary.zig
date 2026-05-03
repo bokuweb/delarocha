@@ -878,28 +878,13 @@ fn buildTriePair(allocator: Allocator, nodes: []const TrieNode, edges: []const T
 }
 
 fn buildTrieTriple(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) ![]u32 {
-    if (nodes.len < 1024) return &.{};
-
-    const triple = try allocator.alloc(u32, 256 * 256 * 256);
-    @memset(triple, invalid_trie_node);
-    const root = nodes[0];
-    const root_start: usize = @intCast(root.edge_start);
-    const root_len: usize = @intCast(root.edge_len);
-    for (edges[root_start .. root_start + root_len]) |first| {
-        const second_node = nodes[@intCast(first.child)];
-        const second_start: usize = @intCast(second_node.edge_start);
-        const second_len: usize = @intCast(second_node.edge_len);
-        for (edges[second_start .. second_start + second_len]) |second| {
-            const third_node = nodes[@intCast(second.child)];
-            const third_start: usize = @intCast(third_node.edge_start);
-            const third_len: usize = @intCast(third_node.edge_len);
-            for (edges[third_start .. third_start + third_len]) |third| {
-                const key = (@as(usize, first.byte) << 16) | (@as(usize, second.byte) << 8) | @as(usize, third.byte);
-                triple[key] = third.child;
-            }
-        }
-    }
-    return triple;
+    _ = allocator;
+    _ = nodes;
+    _ = edges;
+    // A dense 3-byte table costs 64 MiB and regresses ipadic tokenization by
+    // pushing the hot dictionary data out of cache. Pair lookup plus the
+    // double-array fallback is the better default for large dictionaries.
+    return emptyU32Slice();
 }
 
 fn buildDoubleArray(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) !DoubleArray {
