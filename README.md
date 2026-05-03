@@ -35,9 +35,10 @@ This matches the input shape of `vibrato::SystemDictionaryBuilder::from_readers`
 cargo test
 ```
 
-The CI workflow runs these tests on Linux, macOS, and Windows. It also runs
-`zig-ffi` tests with Zig installed, compiles the Yokohama text benchmark, and
-runs the Zig unit tests.
+The CI workflow runs the Rust and Zig unit tests on Linux, macOS, and Windows.
+It also runs `zig-ffi` tests and compiles the Yokohama text benchmark on Linux
+and macOS; Windows currently exercises the pure Rust and Zig test suites while
+the MSVC Zig FFI link path is kept out of the matrix.
 
 ## Fuzz-Style Regression Tests
 

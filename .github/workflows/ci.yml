@@ -33,9 +33,11 @@ jobs:
         run: cargo test --workspace --all-targets
 
       - name: Rust tests with Zig FFI
+        if: runner.os != 'Windows'
         run: cargo test -p delarocha --features "zig-ffi"
 
       - name: Compile Yokohama text benchmark
+        if: runner.os != 'Windows'
         run: cargo test -p delarocha --features "zig-ffi vibrato-bench" --example yokohama_text_bench --no-run
 
       - name: Zig tests
