@@ -1,0 +1,5 @@
+本,0,0,10,noun,book
+と,0,0,1,particle,and
+カレー,0,0,10,noun,curry
+本と,0,0,0,compound,book-and
+本とカレー,0,0,50,compound,book-and-curry

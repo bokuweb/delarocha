@@ -1,0 +1,12 @@
+# DELAROCHA_DICT_V1
+# matrix <right_size> <left_size> followed by row-major i16 costs.
+matrix	3	3
+0	1	2
+1	0	1
+2	1	0
+# entry <surface> <left_id> <right_id> <word_cost> <feature>
+entry	本	1	1	10	noun,book
+entry	と	2	2	1	particle,and
+entry	カレー	1	1	10	noun,curry
+entry	本と	1	1	0	compound,book-and
+entry	本とカレー	1	1	50	compound,book-and-curry
