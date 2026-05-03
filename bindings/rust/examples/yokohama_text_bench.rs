@@ -1,6 +1,11 @@
+#[cfg(any(feature = "zig-ffi", feature = "vibrato-bench"))]
 use std::hint::black_box;
+#[cfg(feature = "vibrato-bench")]
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "zig-ffi")]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(any(feature = "zig-ffi", feature = "vibrato-bench"))]
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -8,7 +13,9 @@ fn main() {
         .map(PathBuf::from)
         .expect("set YOKOHAMA_TEXT to the extracted Yokohama ordinance text file");
     let text = std::fs::read_to_string(&text_path).expect("read input text");
+    #[cfg(any(feature = "zig-ffi", feature = "vibrato-bench"))]
     let warmup = env_usize("YOKOHAMA_BENCH_WARMUP", 5);
+    #[cfg(any(feature = "zig-ffi", feature = "vibrato-bench"))]
     let iterations = env_usize("YOKOHAMA_BENCH_ITERATIONS", 50);
 
     println!(
@@ -127,6 +134,7 @@ fn run_vibrato_system(text: &str, warmup: usize, iterations: usize) {
     );
 }
 
+#[cfg(any(feature = "zig-ffi", feature = "vibrato-bench"))]
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -134,6 +142,7 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+#[cfg(any(feature = "zig-ffi", feature = "vibrato-bench"))]
 fn measure(iterations: usize, mut f: impl FnMut()) -> Duration {
     let iterations = iterations.max(1);
     let start = Instant::now();
@@ -143,6 +152,7 @@ fn measure(iterations: usize, mut f: impl FnMut()) -> Duration {
     start.elapsed()
 }
 
+#[cfg(any(feature = "zig-ffi", feature = "vibrato-bench"))]
 fn print_result(name: &str, elapsed: Duration, iterations: usize, tokens: usize) {
     let iterations = iterations.max(1);
     let per_iter = elapsed.as_secs_f64() / iterations as f64;

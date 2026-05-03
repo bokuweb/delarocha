@@ -19,7 +19,12 @@ fn main() {
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"));
     let zig_lib = manifest_dir.join("../../zig/src/lib.zig");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
-    let out_lib = out_dir.join("libdelarocha_zig.a");
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let out_lib = if target_env == "msvc" {
+        out_dir.join("delarocha_zig.lib")
+    } else {
+        out_dir.join("libdelarocha_zig.a")
+    };
     let status = Command::new("zig")
         .arg("build-lib")
         .arg(zig_lib)
