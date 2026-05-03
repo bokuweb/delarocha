@@ -1328,6 +1328,19 @@ pub mod ffi {
             Ok(count)
         }
 
+        #[inline(always)]
+        pub fn tokenize_count_assume_valid(&mut self, input: &str) -> usize {
+            // Benchmark and trusted hot-loop helper. The safe API above keeps
+            // the sentinel check for callers that need error reporting.
+            unsafe {
+                delarocha_tokenize_count_bytes_nonnull(
+                    self.raw.as_ptr(),
+                    input.as_ptr(),
+                    input.len(),
+                )
+            }
+        }
+
         pub fn tokenize_spans(&mut self, input: &str) -> Result<Vec<ZigTokenSpan>> {
             let status =
                 unsafe { delarocha_tokenize_bytes(self.raw.as_ptr(), input.as_ptr(), input.len()) };
@@ -1373,6 +1386,20 @@ pub mod ffi {
                 return Err(last_error());
             }
             Ok(count)
+        }
+
+        #[inline(always)]
+        pub fn tokenize_count_batch_assume_valid(&mut self, batch: &ZigBatch<'_>) -> usize {
+            // Batch variant of the trusted count-only helper. It mirrors the
+            // non-null Zig export and avoids per-iteration Result handling.
+            unsafe {
+                delarocha_tokenize_count_batch_nonnull(
+                    self.raw.as_ptr(),
+                    batch.ptrs.as_ptr(),
+                    batch.lens.as_ptr(),
+                    batch.ptrs.len(),
+                )
+            }
         }
     }
 

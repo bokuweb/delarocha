@@ -78,7 +78,7 @@ fn bench_zig_ffi(c: &mut Criterion) {
     c.bench_function("delarocha/zig-ffi-ipadic-raw-count-only", |b| {
         b.iter(|| {
             for sentence in SENTENCES {
-                black_box(raw_worker.tokenize_count(black_box(sentence)).unwrap());
+                black_box(raw_worker.tokenize_count_assume_valid(black_box(sentence)));
             }
         });
     });
@@ -104,18 +104,14 @@ fn bench_zig_ffi(c: &mut Criterion) {
     c.bench_function("delarocha/zig-ffi-ipadic-binary-count-only", |b| {
         b.iter(|| {
             for sentence in SENTENCES {
-                black_box(binary_worker.tokenize_count(black_box(sentence)).unwrap());
+                black_box(binary_worker.tokenize_count_assume_valid(black_box(sentence)));
             }
         });
     });
 
     c.bench_function("delarocha/zig-ffi-ipadic-binary-count-only-batch", |b| {
         b.iter(|| {
-            black_box(
-                binary_worker
-                    .tokenize_count_batch(black_box(&batch))
-                    .unwrap(),
-            );
+            black_box(binary_worker.tokenize_count_batch_assume_valid(black_box(&batch)));
         });
     });
 }

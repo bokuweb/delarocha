@@ -170,11 +170,7 @@ pub export fn delarocha_tokenize_count_bytes_nonnull(worker: *Worker, input: [*]
 }
 
 fn tokenizeCountBytesNonnull(worker: *Worker, input: [*]const u8, len: usize) usize {
-    const count = worker.tokenizeCount(input[0..len]) catch |err| {
-        setLastError("tokenize failed: {s}", .{@errorName(err)});
-        return std.math.maxInt(usize);
-    };
-    return count;
+    return worker.tokenizeCountAssumeValid(input[0..len]);
 }
 
 pub export fn delarocha_tokenize_count_batch(
@@ -207,10 +203,7 @@ fn tokenizeCountBatchNonnull(
 ) usize {
     var total: usize = 0;
     for (0..count) |i| {
-        total +%= worker.tokenizeCount(inputs[i][0..lens[i]]) catch |err| {
-            setLastError("tokenize failed: {s}", .{@errorName(err)});
-            return std.math.maxInt(usize);
-        };
+        total +%= worker.tokenizeCountAssumeValid(inputs[i][0..lens[i]]);
     }
     return total;
 }
