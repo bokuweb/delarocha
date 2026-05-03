@@ -53,6 +53,12 @@ pub const TrieTerm = struct {
     word_cost: i32,
 };
 
+pub const TrieCountTerm = struct {
+    left_id: u16,
+    right_id: u16,
+    word_cost: i32,
+};
+
 pub const UnkTerm = struct {
     unk_id: u32,
     left_id: u16,
@@ -337,7 +343,7 @@ pub const Dictionary = struct {
     trie_nodes: []TrieNode,
     trie_edges: []TrieEdge,
     trie_terms: []TrieTerm,
-    trie_count_terms: []TrieTerm,
+    trie_count_terms: []TrieCountTerm,
     trie_first: [256]u32,
     trie_pair: []u32,
     trie_triple: []u32,
@@ -693,7 +699,7 @@ const TrieBuildResult = struct {
     nodes: []TrieNode,
     edges: []TrieEdge,
     terms: []TrieTerm,
-    count_terms: []TrieTerm,
+    count_terms: []TrieCountTerm,
 };
 
 pub const DoubleArray = struct {
@@ -798,7 +804,7 @@ fn buildTrie(allocator: Allocator, entries: []const Entry) !TrieBuildResult {
     errdefer allocator.free(edges);
     const terms = try allocator.alloc(TrieTerm, word_id_count);
     errdefer allocator.free(terms);
-    var count_terms: std.ArrayList(TrieTerm) = .empty;
+    var count_terms: std.ArrayList(TrieCountTerm) = .empty;
     errdefer count_terms.deinit(allocator);
 
     var edge_offset: usize = 0;
@@ -832,14 +838,18 @@ fn buildTrie(allocator: Allocator, entries: []const Entry) !TrieBuildResult {
     return .{ .nodes = nodes, .edges = edges, .terms = terms, .count_terms = try count_terms.toOwnedSlice(allocator) };
 }
 
-fn appendCountTerm(allocator: Allocator, terms: *std.ArrayList(TrieTerm), term: TrieTerm, start: usize) !void {
+fn appendCountTerm(allocator: Allocator, terms: *std.ArrayList(TrieCountTerm), term: TrieTerm, start: usize) !void {
     for (terms.items[start..]) |*existing| {
         if (existing.left_id == term.left_id and existing.right_id == term.right_id) {
-            if (term.word_cost < existing.word_cost) existing.* = term;
+            if (term.word_cost < existing.word_cost) existing.word_cost = term.word_cost;
             return;
         }
     }
-    try terms.append(allocator, term);
+    try terms.append(allocator, .{
+        .left_id = term.left_id,
+        .right_id = term.right_id,
+        .word_cost = term.word_cost,
+    });
 }
 
 fn findEdgeSlice(edges: []const TrieEdge, byte: u8) ?usize {
@@ -1028,7 +1038,7 @@ pub inline fn trieTerms(nodes: []const TrieNode, trie_terms: []const TrieTerm, n
     return trie_terms[start .. start + len];
 }
 
-pub inline fn trieCountTerms(nodes: []const TrieNode, trie_terms: []const TrieTerm, node_index: usize) []const TrieTerm {
+pub inline fn trieCountTerms(nodes: []const TrieNode, trie_terms: []const TrieCountTerm, node_index: usize) []const TrieCountTerm {
     const node = nodes[node_index];
     const start: usize = @intCast(node.count_word_start);
     const len: usize = @intCast(node.count_word_len);
@@ -1039,7 +1049,7 @@ fn trieEdgeLessThan(_: void, lhs: TrieEdge, rhs: TrieEdge) bool {
     return lhs.byte < rhs.byte;
 }
 
-fn freeTrie(allocator: Allocator, nodes: []TrieNode, edges: []TrieEdge, terms_slice: []TrieTerm, count_terms_slice: []TrieTerm) void {
+fn freeTrie(allocator: Allocator, nodes: []TrieNode, edges: []TrieEdge, terms_slice: []TrieTerm, count_terms_slice: []TrieCountTerm) void {
     allocator.free(nodes);
     allocator.free(edges);
     allocator.free(terms_slice);
