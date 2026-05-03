@@ -53,6 +53,9 @@ pub const TrieTerm = struct {
     word_cost: i32,
 };
 
+// Count-only tokenization never needs the dictionary word id or feature
+// payload. Keeping this term at 8 bytes reduces the hot trie term stream for
+// `tokenizeCount` and avoids loading data that cannot affect the best path.
 pub const TrieCountTerm = struct {
     left_id: u16,
     right_id: u16,
@@ -839,6 +842,9 @@ fn buildTrie(allocator: Allocator, entries: []const Entry) !TrieBuildResult {
 }
 
 fn appendCountTerm(allocator: Allocator, terms: *std.ArrayList(TrieCountTerm), term: TrieTerm, start: usize) !void {
+    // Multiple entries can share the same left/right ids at one trie node. For
+    // count-only tokenization those entries are equivalent except for word
+    // cost, so retain only the cheapest transition.
     for (terms.items[start..]) |*existing| {
         if (existing.left_id == term.left_id and existing.right_id == term.right_id) {
             if (term.word_cost < existing.word_cost) existing.word_cost = term.word_cost;
@@ -871,6 +877,9 @@ fn buildTrieFirst(nodes: []const TrieNode, edges: []const TrieEdge) [256]u32 {
 }
 
 fn buildTriePair(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) ![]u32 {
+    // The dense two-byte root table is small enough (256 KiB) to be worth it:
+    // it skips two levels of root traversal for UTF-8-heavy Japanese input and
+    // still fits comfortably in cache compared with the rejected triple table.
     const pair = try allocator.alloc(u32, 256 * 256);
     @memset(pair, invalid_trie_node);
     const root = nodes[0];
@@ -900,6 +909,9 @@ fn buildTrieTriple(allocator: Allocator, nodes: []const TrieNode, edges: []const
 fn buildDoubleArray(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) !DoubleArray {
     if (nodes.len < 65536) return .{ .base = &.{}, .check = &.{}, .child = &.{} };
 
+    // The double-array is only built for large dictionaries. Disabling it saves
+    // memory but regresses ipadic binary tokenization heavily, so it remains the
+    // fallback after the root pair table.
     const base = try allocator.alloc(u32, nodes.len);
     errdefer allocator.free(base);
     @memset(base, 0);
