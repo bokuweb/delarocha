@@ -1,0 +1,26 @@
+[package]
+name = "delarocha"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[features]
+default = []
+zig-ffi = []
+vibrato-bench = ["dep:vibrato", "dep:zstd"]
+
+[dependencies]
+csv = "1"
+thiserror = "2"
+vibrato = { version = "0.5", optional = true }
+zstd = { version = "0.13", optional = true }
+
+[dev-dependencies]
+criterion = "0.7"
+tempfile = "3"
+
+[[bench]]
+name = "tokenize"
+harness = false
