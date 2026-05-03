@@ -337,8 +337,13 @@ pub const ConnectionMatrix = struct {
 pub const Dictionary = struct {
     allocator: Allocator,
     entries: []Entry,
+    // Binary dictionaries store entry surfaces and features in one contiguous
+    // blob. Raw dictionaries leave this empty and keep per-entry ownership.
+    entry_blob: []u8,
     user_entries: []Entry,
     unk_entries: []UnkEntry,
+    // Mirrors `entry_blob` for unknown-word features loaded from binary files.
+    unk_feature_blob: []u8,
     unk_index: UnkIndex,
     char_property: CharProperty,
     matrix: ConnectionMatrix,
@@ -348,6 +353,7 @@ pub const Dictionary = struct {
     trie_terms: []TrieTerm,
     trie_count_terms: []TrieCountTerm,
     trie_first: [256]u32,
+    trie_bmp: []u32,
     trie_pair: []u32,
     trie_triple: []u32,
     trie_base: []u32,
@@ -400,14 +406,18 @@ pub const Dictionary = struct {
         }
         const matrix = try ConnectionMatrix.parseMinimal(allocator, right_size, left_size, rows.items);
         errdefer allocator.free(matrix.costs);
-        const entry_index = try buildEntryIndex(allocator, owned_entries);
+        // Large dictionaries use the trie path exclusively; building the
+        // first-byte entry index there only consumes memory and load time.
+        const entry_index = if (owned_entries.len <= 32) try buildEntryIndex(allocator, owned_entries) else EntryIndex.empty();
         errdefer entry_index.deinit(allocator);
         const unk_index = try buildUnkIndex(allocator, char_property.categories.len, unk_entries);
         errdefer unk_index.deinit(allocator);
-        const trie = try buildTrie(allocator, owned_entries);
+        const trie = try buildTrie(allocator, owned_entries, &matrix);
         errdefer freeTrie(allocator, trie.nodes, trie.edges, trie.terms, trie.count_terms);
         const trie_pair = if (owned_entries.len <= 32) emptyU32Slice() else try buildTriePair(allocator, trie.nodes, trie.edges);
         errdefer if (trie_pair.len != 0) allocator.free(trie_pair);
+        const trie_bmp = if (owned_entries.len <= 32) emptyU32Slice() else try buildTrieBmp(allocator, trie.nodes, trie.edges);
+        errdefer if (trie_bmp.len != 0) allocator.free(trie_bmp);
         const trie_triple = try buildTrieTriple(allocator, trie.nodes, trie.edges);
         errdefer if (trie_triple.len != 0) allocator.free(trie_triple);
         const double_array = try buildDoubleArray(allocator, trie.nodes, trie.edges);
@@ -415,8 +425,10 @@ pub const Dictionary = struct {
         return .{
             .allocator = allocator,
             .entries = owned_entries,
+            .entry_blob = emptyU8Slice(),
             .user_entries = &.{},
             .unk_entries = unk_entries,
+            .unk_feature_blob = emptyU8Slice(),
             .unk_index = unk_index,
             .char_property = char_property,
             .matrix = matrix,
@@ -426,6 +438,7 @@ pub const Dictionary = struct {
             .trie_terms = trie.terms,
             .trie_count_terms = trie.count_terms,
             .trie_first = buildTrieFirst(trie.nodes, trie.edges),
+            .trie_bmp = trie_bmp,
             .trie_pair = trie_pair,
             .trie_triple = trie_triple,
             .trie_base = double_array.base,
@@ -467,14 +480,18 @@ pub const Dictionary = struct {
         errdefer freeUnkSlice(allocator, unk_entries);
         const matrix = try ConnectionMatrix.parseMecab(allocator, matrix_def);
         errdefer allocator.free(matrix.costs);
-        const entry_index = try buildEntryIndex(allocator, entries);
+        // Large dictionaries use the trie path exclusively; building the
+        // first-byte entry index there only consumes memory and load time.
+        const entry_index = if (entries.len <= 32) try buildEntryIndex(allocator, entries) else EntryIndex.empty();
         errdefer entry_index.deinit(allocator);
         const unk_index = try buildUnkIndex(allocator, char_property.categories.len, unk_entries);
         errdefer unk_index.deinit(allocator);
-        const trie = try buildTrie(allocator, entries);
+        const trie = try buildTrie(allocator, entries, &matrix);
         errdefer freeTrie(allocator, trie.nodes, trie.edges, trie.terms, trie.count_terms);
         const trie_pair = if (entries.len <= 32) emptyU32Slice() else try buildTriePair(allocator, trie.nodes, trie.edges);
         errdefer if (trie_pair.len != 0) allocator.free(trie_pair);
+        const trie_bmp = if (entries.len <= 32) emptyU32Slice() else try buildTrieBmp(allocator, trie.nodes, trie.edges);
+        errdefer if (trie_bmp.len != 0) allocator.free(trie_bmp);
         const trie_triple = try buildTrieTriple(allocator, trie.nodes, trie.edges);
         errdefer if (trie_triple.len != 0) allocator.free(trie_triple);
         const double_array = try buildDoubleArray(allocator, trie.nodes, trie.edges);
@@ -482,8 +499,10 @@ pub const Dictionary = struct {
         return .{
             .allocator = allocator,
             .entries = entries,
+            .entry_blob = emptyU8Slice(),
             .user_entries = &.{},
             .unk_entries = unk_entries,
+            .unk_feature_blob = emptyU8Slice(),
             .unk_index = unk_index,
             .char_property = char_property,
             .matrix = matrix,
@@ -493,6 +512,7 @@ pub const Dictionary = struct {
             .trie_terms = trie.terms,
             .trie_count_terms = trie.count_terms,
             .trie_first = buildTrieFirst(trie.nodes, trie.edges),
+            .trie_bmp = trie_bmp,
             .trie_pair = trie_pair,
             .trie_triple = trie_triple,
             .trie_base = double_array.base,
@@ -562,32 +582,56 @@ pub const Dictionary = struct {
         const right_size = try readU32(bytes, &cursor);
         const left_size = try readU32(bytes, &cursor);
 
+        const entry_blob_len = try scanBinaryEntryBlobLen(bytes, cursor, @intCast(entry_count));
         const entries = try allocator.alloc(Entry, @intCast(entry_count));
-        errdefer freeEntrySlice(allocator, entries);
+        errdefer allocator.free(entries);
+        const entry_blob = try allocator.alloc(u8, entry_blob_len);
+        errdefer allocator.free(entry_blob);
+        var entry_blob_cursor: usize = 0;
         for (entries) |*entry| {
             const surface_len: usize = @intCast(try readU32(bytes, &cursor));
             const left_id = try readU16(bytes, &cursor);
             const right_id = try readU16(bytes, &cursor);
             const word_cost = try readI32(bytes, &cursor);
             const feature_len: usize = @intCast(try readU32(bytes, &cursor));
+            const surface_start = entry_blob_cursor;
+            @memcpy(entry_blob[surface_start .. surface_start + surface_len], try readSlice(bytes, &cursor, surface_len));
+            entry_blob_cursor += surface_len;
+            const feature_start = entry_blob_cursor;
+            @memcpy(entry_blob[feature_start .. feature_start + feature_len], try readSlice(bytes, &cursor, feature_len));
+            entry_blob[feature_start + feature_len] = 0;
+            entry_blob_cursor += feature_len + 1;
             entry.* = .{
-                .surface = try allocator.dupe(u8, try readSlice(bytes, &cursor, surface_len)),
+                .surface = entry_blob[surface_start .. surface_start + surface_len],
                 .left_id = left_id,
                 .right_id = right_id,
                 .word_cost = word_cost,
-                .feature = try allocator.dupeZ(u8, try readSlice(bytes, &cursor, feature_len)),
+                .feature = entry_blob[feature_start .. feature_start + feature_len :0],
             };
         }
 
+        const unk_feature_blob_len = try scanBinaryUnkFeatureBlobLen(bytes, cursor, @intCast(unk_count));
         const unk_entries = try allocator.alloc(UnkEntry, @intCast(unk_count));
-        errdefer freeUnkSlice(allocator, unk_entries);
+        errdefer allocator.free(unk_entries);
+        const unk_feature_blob = try allocator.alloc(u8, unk_feature_blob_len);
+        errdefer allocator.free(unk_feature_blob);
+        var unk_feature_blob_cursor: usize = 0;
         for (unk_entries) |*entry| {
+            const category_id = try readU32(bytes, &cursor);
+            const left_id = try readU16(bytes, &cursor);
+            const right_id = try readU16(bytes, &cursor);
+            const word_cost = try readI32(bytes, &cursor);
+            const feature_len: usize = @intCast(try readU32(bytes, &cursor));
+            const feature_start = unk_feature_blob_cursor;
+            @memcpy(unk_feature_blob[feature_start .. feature_start + feature_len], try readSlice(bytes, &cursor, feature_len));
+            unk_feature_blob[feature_start + feature_len] = 0;
+            unk_feature_blob_cursor += feature_len + 1;
             entry.* = .{
-                .category_id = try readU32(bytes, &cursor),
-                .left_id = try readU16(bytes, &cursor),
-                .right_id = try readU16(bytes, &cursor),
-                .word_cost = try readI32(bytes, &cursor),
-                .feature = try allocator.dupeZ(u8, try readSlice(bytes, &cursor, @intCast(try readU32(bytes, &cursor)))),
+                .category_id = category_id,
+                .left_id = left_id,
+                .right_id = right_id,
+                .word_cost = word_cost,
+                .feature = unk_feature_blob[feature_start .. feature_start + feature_len :0],
             };
         }
 
@@ -630,6 +674,7 @@ pub const Dictionary = struct {
         errdefer allocator.free(costs);
         for (costs) |*cost| cost.* = try readI16(bytes, &cursor);
         if (cursor != bytes.len) return error.InvalidDictionary;
+        const matrix: ConnectionMatrix = .{ .left_size = @intCast(left_size), .right_size = @intCast(right_size), .costs = costs };
 
         const invoke_bmp = try buildInvokeBmp(allocator, categories, ranges);
         errdefer allocator.free(invoke_bmp);
@@ -644,14 +689,18 @@ pub const Dictionary = struct {
             .has_invoke = has_invoke,
         };
         errdefer char_property.deinit();
-        const entry_index = try buildEntryIndex(allocator, entries);
+        // Large dictionaries use the trie path exclusively; building the
+        // first-byte entry index there only consumes memory and load time.
+        const entry_index = if (entries.len <= 32) try buildEntryIndex(allocator, entries) else EntryIndex.empty();
         errdefer entry_index.deinit(allocator);
         const unk_index = try buildUnkIndex(allocator, @intCast(category_count), unk_entries);
         errdefer unk_index.deinit(allocator);
-        const trie = try buildTrie(allocator, entries);
+        const trie = try buildTrie(allocator, entries, &matrix);
         errdefer freeTrie(allocator, trie.nodes, trie.edges, trie.terms, trie.count_terms);
         const trie_pair = if (entries.len <= 32) emptyU32Slice() else try buildTriePair(allocator, trie.nodes, trie.edges);
         errdefer if (trie_pair.len != 0) allocator.free(trie_pair);
+        const trie_bmp = if (entries.len <= 32) emptyU32Slice() else try buildTrieBmp(allocator, trie.nodes, trie.edges);
+        errdefer if (trie_bmp.len != 0) allocator.free(trie_bmp);
         const trie_triple = try buildTrieTriple(allocator, trie.nodes, trie.edges);
         errdefer if (trie_triple.len != 0) allocator.free(trie_triple);
         const double_array = try buildDoubleArray(allocator, trie.nodes, trie.edges);
@@ -659,17 +708,20 @@ pub const Dictionary = struct {
         return .{
             .allocator = allocator,
             .entries = entries,
+            .entry_blob = entry_blob,
             .user_entries = &.{},
             .unk_entries = unk_entries,
+            .unk_feature_blob = unk_feature_blob,
             .unk_index = unk_index,
             .char_property = char_property,
-            .matrix = .{ .left_size = @intCast(left_size), .right_size = @intCast(right_size), .costs = costs },
+            .matrix = matrix,
             .entry_index = entry_index,
             .trie_nodes = trie.nodes,
             .trie_edges = trie.edges,
             .trie_terms = trie.terms,
             .trie_count_terms = trie.count_terms,
             .trie_first = buildTrieFirst(trie.nodes, trie.edges),
+            .trie_bmp = trie_bmp,
             .trie_pair = trie_pair,
             .trie_triple = trie_triple,
             .trie_base = double_array.base,
@@ -682,14 +734,61 @@ pub const Dictionary = struct {
         self.entry_index.deinit(self.allocator);
         self.unk_index.deinit(self.allocator);
         freeTrie(self.allocator, self.trie_nodes, self.trie_edges, self.trie_terms, self.trie_count_terms);
+        if (self.trie_bmp.len != 0) self.allocator.free(self.trie_bmp);
         if (self.trie_pair.len != 0) self.allocator.free(self.trie_pair);
         if (self.trie_triple.len != 0) self.allocator.free(self.trie_triple);
         freeDoubleArray(self.allocator, .{ .base = self.trie_base, .check = self.trie_check, .child = self.trie_child });
-        freeEntrySlice(self.allocator, self.entries);
+        if (self.entry_blob.len != 0) {
+            self.allocator.free(self.entry_blob);
+            self.allocator.free(self.entries);
+        } else {
+            freeEntrySlice(self.allocator, self.entries);
+        }
         freeEntrySlice(self.allocator, self.user_entries);
-        freeUnkSlice(self.allocator, self.unk_entries);
+        if (self.unk_feature_blob.len != 0) {
+            self.allocator.free(self.unk_feature_blob);
+            self.allocator.free(self.unk_entries);
+        } else {
+            freeUnkSlice(self.allocator, self.unk_entries);
+        }
         self.char_property.deinit();
         self.allocator.free(self.matrix.costs);
+    }
+
+    pub fn discardFullTokenDataForCount(self: *Dictionary) void {
+        if (self.trie_pair.len == 0) return;
+
+        // Count-only tokenization walks `trie_count_terms` and the unknown-term
+        // index, so full dictionary entries, features, word ids, and full trie
+        // terms only add allocator pressure and cache noise for large trie
+        // dictionaries. Keep this opt-in so normal tokenization remains intact.
+        if (self.entry_blob.len != 0) {
+            self.allocator.free(self.entry_blob);
+            self.allocator.free(self.entries);
+            self.entry_blob = emptyU8Slice();
+        } else {
+            freeEntrySlice(self.allocator, self.entries);
+        }
+        self.entries = emptyEntrySlice();
+
+        freeEntrySlice(self.allocator, self.user_entries);
+        self.user_entries = emptyEntrySlice();
+
+        self.allocator.free(self.trie_terms);
+        self.trie_terms = emptyTrieTermSlice();
+        for (self.trie_nodes) |*node| {
+            node.word_start = 0;
+            node.word_len = 0;
+        }
+
+        if (self.unk_feature_blob.len != 0) {
+            self.allocator.free(self.unk_feature_blob);
+            self.allocator.free(self.unk_entries);
+            self.unk_feature_blob = emptyU8Slice();
+        } else {
+            freeUnkSlice(self.allocator, self.unk_entries);
+        }
+        self.unk_entries = emptyUnkEntrySlice();
     }
 };
 
@@ -767,7 +866,7 @@ fn buildEntryIndex(allocator: Allocator, entries: []const Entry) !EntryIndex {
     return index;
 }
 
-fn buildTrie(allocator: Allocator, entries: []const Entry) !TrieBuildResult {
+fn buildTrie(allocator: Allocator, entries: []const Entry, matrix: *const ConnectionMatrix) !TrieBuildResult {
     var build_nodes: std.ArrayList(BuildTrieNode) = .empty;
     defer {
         for (build_nodes.items) |*node| {
@@ -824,7 +923,7 @@ fn buildTrie(allocator: Allocator, entries: []const Entry) !TrieBuildResult {
                 .word_cost = entry.word_cost,
             };
             terms[word_offset + j] = term;
-            try appendCountTerm(allocator, &count_terms, term, count_start);
+            try appendCountTerm(allocator, &count_terms, term, count_start, matrix);
         }
         nodes[i] = .{
             .edge_start = @intCast(edge_offset),
@@ -841,21 +940,46 @@ fn buildTrie(allocator: Allocator, entries: []const Entry) !TrieBuildResult {
     return .{ .nodes = nodes, .edges = edges, .terms = terms, .count_terms = try count_terms.toOwnedSlice(allocator) };
 }
 
-fn appendCountTerm(allocator: Allocator, terms: *std.ArrayList(TrieCountTerm), term: TrieTerm, start: usize) !void {
+fn appendCountTerm(allocator: Allocator, terms: *std.ArrayList(TrieCountTerm), term: TrieTerm, start: usize, matrix: *const ConnectionMatrix) !void {
     // Multiple entries can share the same left/right ids at one trie node. For
     // count-only tokenization those entries are equivalent except for word
     // cost, so retain only the cheapest transition.
-    for (terms.items[start..]) |*existing| {
-        if (existing.left_id == term.left_id and existing.right_id == term.right_id) {
-            if (term.word_cost < existing.word_cost) existing.word_cost = term.word_cost;
-            return;
-        }
-    }
-    try terms.append(allocator, .{
+    const candidate: TrieCountTerm = .{
         .left_id = term.left_id,
         .right_id = term.right_id,
         .word_cost = term.word_cost,
-    });
+    };
+    var index = start;
+    while (index < terms.items.len) {
+        const existing = &terms.items[index];
+        if (existing.right_id == candidate.right_id) {
+            if (existing.left_id == candidate.left_id) {
+                if (candidate.word_cost < existing.word_cost) existing.word_cost = candidate.word_cost;
+                return;
+            }
+            // For the same emitted right id, a term that is no cheaper from any
+            // predecessor right id can never be part of the best count-only
+            // path. Paying this O(matrix.right_size) check during dictionary
+            // build reduces candidate traffic in the tokenizer hot path.
+            if (countTermDominates(matrix, existing.*, candidate)) return;
+            if (countTermDominates(matrix, candidate, existing.*)) {
+                _ = terms.swapRemove(index);
+                continue;
+            }
+        }
+        index += 1;
+    }
+    try terms.append(allocator, candidate);
+}
+
+fn countTermDominates(matrix: *const ConnectionMatrix, lhs: TrieCountTerm, rhs: TrieCountTerm) bool {
+    var prev_right: usize = 0;
+    while (prev_right < matrix.right_size) : (prev_right += 1) {
+        const lhs_cost = @as(i32, matrix.costs[@as(usize, lhs.left_id) * matrix.right_size + prev_right]) + lhs.word_cost;
+        const rhs_cost = @as(i32, matrix.costs[@as(usize, rhs.left_id) * matrix.right_size + prev_right]) + rhs.word_cost;
+        if (lhs_cost > rhs_cost) return false;
+    }
+    return true;
 }
 
 fn findEdgeSlice(edges: []const TrieEdge, byte: u8) ?usize {
@@ -896,6 +1020,48 @@ fn buildTriePair(allocator: Allocator, nodes: []const TrieNode, edges: []const T
     return pair;
 }
 
+fn buildTrieBmp(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) ![]u32 {
+    // Most Japanese dictionary surfaces start with one BMP codepoint encoded as
+    // three UTF-8 bytes. This table jumps directly from that first codepoint to
+    // the trie node for 256 KiB, avoiding the 64 MiB cost of a dense raw 3-byte
+    // table while still removing the extra root traversal from the hot path.
+    const bmp = try allocator.alloc(u32, 0x10000);
+    @memset(bmp, invalid_trie_node);
+
+    const root = nodes[0];
+    const root_start: usize = @intCast(root.edge_start);
+    const root_len: usize = @intCast(root.edge_len);
+    for (edges[root_start .. root_start + root_len]) |first| {
+        if (first.byte >= 0xc2 and first.byte <= 0xdf) {
+            const child = nodes[@intCast(first.child)];
+            const child_start: usize = @intCast(child.edge_start);
+            const child_len: usize = @intCast(child.edge_len);
+            for (edges[child_start .. child_start + child_len]) |second| {
+                if (!isUtf8Continuation(second.byte)) continue;
+                const cp = (@as(u32, first.byte & 0x1f) << 6) | @as(u32, second.byte & 0x3f);
+                bmp[cp] = second.child;
+            }
+        } else if (first.byte >= 0xe0 and first.byte <= 0xef) {
+            const child = nodes[@intCast(first.child)];
+            const child_start: usize = @intCast(child.edge_start);
+            const child_len: usize = @intCast(child.edge_len);
+            for (edges[child_start .. child_start + child_len]) |second| {
+                if (!isUtf8Continuation(second.byte)) continue;
+                const grandchild = nodes[@intCast(second.child)];
+                const grandchild_start: usize = @intCast(grandchild.edge_start);
+                const grandchild_len: usize = @intCast(grandchild.edge_len);
+                for (edges[grandchild_start .. grandchild_start + grandchild_len]) |third| {
+                    if (!isUtf8Continuation(third.byte)) continue;
+                    const cp = (@as(u32, first.byte & 0x0f) << 12) | (@as(u32, second.byte & 0x3f) << 6) | @as(u32, third.byte & 0x3f);
+                    if (cp >= 0xd800 and cp <= 0xdfff) continue;
+                    bmp[cp] = third.child;
+                }
+            }
+        }
+    }
+    return bmp;
+}
+
 fn buildTrieTriple(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) ![]u32 {
     _ = allocator;
     _ = nodes;
@@ -904,6 +1070,10 @@ fn buildTrieTriple(allocator: Allocator, nodes: []const TrieNode, edges: []const
     // pushing the hot dictionary data out of cache. Pair lookup plus the
     // double-array fallback is the better default for large dictionaries.
     return emptyU32Slice();
+}
+
+inline fn isUtf8Continuation(byte: u8) bool {
+    return (byte & 0xc0) == 0x80;
 }
 
 fn buildDoubleArray(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) !DoubleArray {
@@ -1034,6 +1204,22 @@ fn emptyU32Slice() []u32 {
     return @constCast(&[_]u32{});
 }
 
+fn emptyU8Slice() []u8 {
+    return @constCast(&[_]u8{});
+}
+
+fn emptyEntrySlice() []Entry {
+    return @constCast(&[_]Entry{});
+}
+
+fn emptyUnkEntrySlice() []UnkEntry {
+    return @constCast(&[_]UnkEntry{});
+}
+
+fn emptyTrieTermSlice() []TrieTerm {
+    return @constCast(&[_]TrieTerm{});
+}
+
 pub inline fn findDoubleArray(base: []const u32, check: []const u32, child: []const u32, node_index: usize, byte: u8) ?usize {
     if (base.len == 0) return null;
     const node_base = base[node_index];
@@ -1128,6 +1314,38 @@ fn readU32(bytes: []const u8, cursor: *usize) !u32 {
 
 fn readI32(bytes: []const u8, cursor: *usize) !i32 {
     return @bitCast(try readU32(bytes, cursor));
+}
+
+fn scanBinaryEntryBlobLen(bytes: []const u8, start_cursor: usize, entry_count: usize) !usize {
+    var cursor = start_cursor;
+    var total: usize = 0;
+    for (0..entry_count) |_| {
+        const surface_len: usize = @intCast(try readU32(bytes, &cursor));
+        _ = try readU16(bytes, &cursor);
+        _ = try readU16(bytes, &cursor);
+        _ = try readI32(bytes, &cursor);
+        const feature_len: usize = @intCast(try readU32(bytes, &cursor));
+        total = try std.math.add(usize, total, surface_len);
+        total = try std.math.add(usize, total, feature_len + 1);
+        _ = try readSlice(bytes, &cursor, surface_len);
+        _ = try readSlice(bytes, &cursor, feature_len);
+    }
+    return total;
+}
+
+fn scanBinaryUnkFeatureBlobLen(bytes: []const u8, start_cursor: usize, entry_count: usize) !usize {
+    var cursor = start_cursor;
+    var total: usize = 0;
+    for (0..entry_count) |_| {
+        _ = try readU32(bytes, &cursor);
+        _ = try readU16(bytes, &cursor);
+        _ = try readU16(bytes, &cursor);
+        _ = try readI32(bytes, &cursor);
+        const feature_len: usize = @intCast(try readU32(bytes, &cursor));
+        total = try std.math.add(usize, total, feature_len + 1);
+        _ = try readSlice(bytes, &cursor, feature_len);
+    }
+    return total;
 }
 
 fn parseEntries(allocator: Allocator, input: []const u8) ![]Entry {

@@ -65,17 +65,17 @@ fn bench_zig_ffi(c: &mut Criterion) {
         return;
     };
 
-    let raw_tokenizer = delarocha::ffi::ZigTokenizer::from_raw_paths(
+    let raw_tokenizer = delarocha::ffi::ZigTokenizer::count_only_from_raw_paths(
         raw_dir.join("lex.csv"),
         raw_dir.join("matrix.def"),
         raw_dir.join("char.def"),
         raw_dir.join("unk.def"),
     )
-    .expect("Zig tokenizer loads raw ipadic dictionary");
+    .expect("Zig tokenizer loads count-only raw ipadic dictionary");
     let mut raw_worker = raw_tokenizer
         .create_worker()
         .expect("Zig raw ipadic worker is created");
-    c.bench_function("delarocha/zig-ffi-ipadic-raw", |b| {
+    c.bench_function("delarocha/zig-ffi-ipadic-raw-count-only", |b| {
         b.iter(|| {
             for sentence in SENTENCES {
                 black_box(raw_worker.tokenize_count(black_box(sentence)).unwrap());
@@ -96,12 +96,12 @@ fn bench_zig_ffi(c: &mut Criterion) {
         &binary_path,
     )
     .expect("Zig writes binary ipadic dictionary");
-    let binary_tokenizer = delarocha::ffi::ZigTokenizer::from_binary_path(&binary_path)
-        .expect("Zig tokenizer loads binary ipadic dictionary");
+    let binary_tokenizer = delarocha::ffi::ZigTokenizer::count_only_from_binary_path(&binary_path)
+        .expect("Zig tokenizer loads count-only binary ipadic dictionary");
     let mut binary_worker = binary_tokenizer
         .create_worker()
         .expect("Zig binary ipadic worker is created");
-    c.bench_function("delarocha/zig-ffi-ipadic-binary", |b| {
+    c.bench_function("delarocha/zig-ffi-ipadic-binary-count-only", |b| {
         b.iter(|| {
             for sentence in SENTENCES {
                 black_box(binary_worker.tokenize_count(black_box(sentence)).unwrap());
@@ -109,7 +109,7 @@ fn bench_zig_ffi(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("delarocha/zig-ffi-ipadic-binary-batch", |b| {
+    c.bench_function("delarocha/zig-ffi-ipadic-binary-count-only-batch", |b| {
         b.iter(|| {
             black_box(
                 binary_worker
