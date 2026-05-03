@@ -187,7 +187,7 @@ pub const Worker = struct {
             if (self.dictionary.user_entries.len != 0) {
                 try self.appendEntriesCount(input, begin, self.dictionary.user_entries, &emitted);
             }
-            if (self.dictionary.entries.len <= 32) {
+            if (self.dictionary.trie_pair.len == 0) {
                 try self.appendIndexedEntriesCount(input, begin, &emitted);
             } else {
                 try self.appendTrieEntriesCount(input, begin, &emitted);
@@ -227,7 +227,20 @@ pub const Worker = struct {
             emitted.* = true;
         }
         var pos = begin + 1;
-        if (pos < input.len) {
+        if (rootBmpNode(self.dictionary, input, begin)) |root| {
+            node_index = root.node_index;
+            for (dict_mod.trieTerms(self.dictionary.trie_nodes, self.dictionary.trie_terms, node_index)) |term| {
+                try self.appendBestNode(begin, root.end, .{
+                    .word_id = term.word_id,
+                    .left_id = term.left_id,
+                    .right_id = term.right_id,
+                    .word_cost = term.word_cost,
+                });
+                emitted.* = true;
+            }
+            pos = root.end;
+        }
+        if (pos == begin + 1 and pos < input.len) {
             const pair_index = (@as(usize, input[begin]) << 8) | @as(usize, input[begin + 1]);
             const pair_node = self.dictionary.trie_pair[pair_index];
             if (pair_node == dict_mod.invalid_trie_node) return;
@@ -243,7 +256,7 @@ pub const Worker = struct {
             }
             pos = begin + 2;
         }
-        if (self.dictionary.trie_triple.len != 0 and pos < input.len) {
+        if (self.dictionary.trie_triple.len != 0 and pos == begin + 2 and pos < input.len) {
             const triple_index = (@as(usize, input[begin]) << 16) | (@as(usize, input[begin + 1]) << 8) | @as(usize, input[begin + 2]);
             const triple_node = self.dictionary.trie_triple[triple_index];
             if (triple_node == dict_mod.invalid_trie_node) return;
@@ -327,7 +340,19 @@ pub const Worker = struct {
             emitted.* = true;
         }
         var pos = begin + 1;
-        if (pos < input.len) {
+        if (rootBmpNode(self.dictionary, input, begin)) |root| {
+            node_index = root.node_index;
+            for (dict_mod.trieCountTerms(self.dictionary.trie_nodes, self.dictionary.trie_count_terms, node_index)) |term| {
+                try self.appendBestCountNode(begin, root.end, .{
+                    .left_id = term.left_id,
+                    .right_id = term.right_id,
+                    .word_cost = term.word_cost,
+                });
+                emitted.* = true;
+            }
+            pos = root.end;
+        }
+        if (pos == begin + 1 and pos < input.len) {
             // The root pair table avoids the first trie edge lookup for the
             // common multibyte path. It is intentionally paired with the
             // compact count-term stream so count-only tokenization touches less
@@ -346,7 +371,7 @@ pub const Worker = struct {
             }
             pos = begin + 2;
         }
-        if (self.dictionary.trie_triple.len != 0 and pos < input.len) {
+        if (self.dictionary.trie_triple.len != 0 and pos == begin + 2 and pos < input.len) {
             // Kept as a conditional hook for dictionaries that may choose to
             // materialize it later. The default builder leaves it empty because
             // the dense 3-byte table costs too much memory for ipadic.
@@ -670,6 +695,44 @@ inline fn nextBoundary(input: []const u8, start: usize) ?usize {
     else
         4;
     return start + len;
+}
+
+const RootBmpNode = struct {
+    node_index: usize,
+    end: usize,
+};
+
+inline fn rootBmpNode(dictionary: *const dict_mod.Dictionary, input: []const u8, begin: usize) ?RootBmpNode {
+    if (dictionary.trie_bmp.len == 0) return null;
+    const b0 = input[begin];
+    if (b0 < 0xc2 or b0 >= 0xf0) return null;
+
+    // The table is keyed by the first complete BMP codepoint, not by raw UTF-8
+    // bytes. That keeps the memory cost at 256 KiB while skipping the pair
+    // table plus one edge lookup for common three-byte Japanese starters.
+    if (b0 < 0xe0) {
+        if (begin + 2 > input.len) return null;
+        const b1 = input[begin + 1];
+        if (!isUtf8Continuation(b1)) return null;
+        const cp = (@as(usize, b0 & 0x1f) << 6) | @as(usize, b1 & 0x3f);
+        const node = dictionary.trie_bmp[cp];
+        if (node == dict_mod.invalid_trie_node) return null;
+        return .{ .node_index = @intCast(node), .end = begin + 2 };
+    }
+
+    if (begin + 3 > input.len) return null;
+    const b1 = input[begin + 1];
+    const b2 = input[begin + 2];
+    if (!isUtf8Continuation(b1) or !isUtf8Continuation(b2)) return null;
+    const cp = (@as(usize, b0 & 0x0f) << 12) | (@as(usize, b1 & 0x3f) << 6) | @as(usize, b2 & 0x3f);
+    if (cp >= 0xd800 and cp <= 0xdfff) return null;
+    const node = dictionary.trie_bmp[cp];
+    if (node == dict_mod.invalid_trie_node) return null;
+    return .{ .node_index = @intCast(node), .end = begin + 3 };
+}
+
+inline fn isUtf8Continuation(byte: u8) bool {
+    return (byte & 0xc0) == 0x80;
 }
 
 fn nthBoundary(input: []const u8, start: usize, n: usize) !usize {

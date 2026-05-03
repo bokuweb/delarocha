@@ -24,6 +24,12 @@ fn main() {
         "delarocha-zig-ipadic-raw" => run_delarocha_zig_ipadic_raw(base),
         #[cfg(feature = "zig-ffi")]
         "delarocha-zig-ipadic-binary" => run_delarocha_zig_ipadic_binary(base),
+        #[cfg(feature = "zig-ffi")]
+        "delarocha-zig-ipadic-raw-count-only" => run_delarocha_zig_ipadic_raw_count_only(base),
+        #[cfg(feature = "zig-ffi")]
+        "delarocha-zig-ipadic-binary-count-only" => {
+            run_delarocha_zig_ipadic_binary_count_only(base)
+        }
         #[cfg(feature = "vibrato-bench")]
         "vibrato" => run_vibrato(base),
         #[cfg(feature = "vibrato-bench")]
@@ -98,6 +104,19 @@ fn run_delarocha_zig_ipadic_raw(base: usize) {
 }
 
 #[cfg(feature = "zig-ffi")]
+fn run_delarocha_zig_ipadic_raw_count_only(base: usize) {
+    let raw_dir = ipadic_raw_dir();
+    let tokenizer = delarocha::ffi::ZigTokenizer::count_only_from_raw_paths(
+        raw_dir.join("lex.csv"),
+        raw_dir.join("matrix.def"),
+        raw_dir.join("char.def"),
+        raw_dir.join("unk.def"),
+    )
+    .expect("Zig tokenizer loads count-only raw ipadic dictionary");
+    run_delarocha_zig_worker(base, "delarocha-zig-ipadic-raw-count-only", tokenizer);
+}
+
+#[cfg(feature = "zig-ffi")]
 fn run_delarocha_zig_ipadic_binary(base: usize) {
     let raw_dir = ipadic_raw_dir();
     let binary_path =
@@ -115,6 +134,26 @@ fn run_delarocha_zig_ipadic_binary(base: usize) {
     let tokenizer = delarocha::ffi::ZigTokenizer::from_binary_path(&binary_path)
         .expect("Zig tokenizer loads binary ipadic dictionary");
     run_delarocha_zig_worker(base, "delarocha-zig-ipadic-binary", tokenizer);
+}
+
+#[cfg(feature = "zig-ffi")]
+fn run_delarocha_zig_ipadic_binary_count_only(base: usize) {
+    let raw_dir = ipadic_raw_dir();
+    let binary_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/memory-zig-ipadic.dic");
+    std::fs::create_dir_all(binary_path.parent().expect("binary path has parent"))
+        .expect("create target tmp dir");
+    delarocha::ffi::ZigTokenizer::write_binary_from_raw_paths(
+        raw_dir.join("lex.csv"),
+        raw_dir.join("matrix.def"),
+        raw_dir.join("char.def"),
+        raw_dir.join("unk.def"),
+        &binary_path,
+    )
+    .expect("Zig writes binary ipadic dictionary");
+    let tokenizer = delarocha::ffi::ZigTokenizer::count_only_from_binary_path(&binary_path)
+        .expect("Zig tokenizer loads count-only binary ipadic dictionary");
+    run_delarocha_zig_worker(base, "delarocha-zig-ipadic-binary-count-only", tokenizer);
 }
 
 #[cfg(feature = "zig-ffi")]

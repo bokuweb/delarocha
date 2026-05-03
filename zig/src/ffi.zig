@@ -55,6 +55,17 @@ pub export fn delarocha_tokenizer_new_raw(
     return tokenizer;
 }
 
+pub export fn delarocha_tokenizer_new_raw_count_only(
+    lex_path: [*:0]const u8,
+    matrix_path: [*:0]const u8,
+    char_path: [*:0]const u8,
+    unk_path: [*:0]const u8,
+) ?*Tokenizer {
+    const tokenizer = delarocha_tokenizer_new_raw(lex_path, matrix_path, char_path, unk_path) orelse return null;
+    tokenizer.dictionary.discardFullTokenDataForCount();
+    return tokenizer;
+}
+
 pub export fn delarocha_tokenizer_new_binary(path: [*:0]const u8) ?*Tokenizer {
     const tokenizer = c_allocator.create(Tokenizer) catch {
         setLastError("out of memory", .{});
@@ -65,6 +76,12 @@ pub export fn delarocha_tokenizer_new_binary(path: [*:0]const u8) ?*Tokenizer {
         setLastError("failed to load binary dictionary: {s}", .{@errorName(err)});
         return null;
     };
+    return tokenizer;
+}
+
+pub export fn delarocha_tokenizer_new_binary_count_only(path: [*:0]const u8) ?*Tokenizer {
+    const tokenizer = delarocha_tokenizer_new_binary(path) orelse return null;
+    tokenizer.dictionary.discardFullTokenDataForCount();
     return tokenizer;
 }
 

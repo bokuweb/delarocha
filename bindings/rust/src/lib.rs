@@ -1053,7 +1053,16 @@ pub mod ffi {
             char_path: *const std::ffi::c_char,
             unk_path: *const std::ffi::c_char,
         ) -> *mut RawTokenizer;
+        fn delarocha_tokenizer_new_raw_count_only(
+            lex_path: *const std::ffi::c_char,
+            matrix_path: *const std::ffi::c_char,
+            char_path: *const std::ffi::c_char,
+            unk_path: *const std::ffi::c_char,
+        ) -> *mut RawTokenizer;
         fn delarocha_tokenizer_new_binary(path: *const std::ffi::c_char) -> *mut RawTokenizer;
+        fn delarocha_tokenizer_new_binary_count_only(
+            path: *const std::ffi::c_char,
+        ) -> *mut RawTokenizer;
         fn delarocha_dictionary_write_binary(
             lex_path: *const std::ffi::c_char,
             matrix_path: *const std::ffi::c_char,
@@ -1166,9 +1175,47 @@ pub mod ffi {
             Ok(Self { raw })
         }
 
+        pub fn count_only_from_raw_paths(
+            lex_path: impl AsRef<Path>,
+            matrix_path: impl AsRef<Path>,
+            char_path: impl AsRef<Path>,
+            unk_path: impl AsRef<Path>,
+        ) -> Result<Self> {
+            let lex_path =
+                CString::new(lex_path.as_ref().as_os_str().to_string_lossy().as_bytes())?;
+            let matrix_path = CString::new(
+                matrix_path
+                    .as_ref()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .as_bytes(),
+            )?;
+            let char_path =
+                CString::new(char_path.as_ref().as_os_str().to_string_lossy().as_bytes())?;
+            let unk_path =
+                CString::new(unk_path.as_ref().as_os_str().to_string_lossy().as_bytes())?;
+            let raw = unsafe {
+                delarocha_tokenizer_new_raw_count_only(
+                    lex_path.as_ptr(),
+                    matrix_path.as_ptr(),
+                    char_path.as_ptr(),
+                    unk_path.as_ptr(),
+                )
+            };
+            let raw = NonNull::new(raw).ok_or_else(last_error)?;
+            Ok(Self { raw })
+        }
+
         pub fn from_binary_path(path: impl AsRef<Path>) -> Result<Self> {
             let path = CString::new(path.as_ref().as_os_str().to_string_lossy().as_bytes())?;
             let raw = unsafe { delarocha_tokenizer_new_binary(path.as_ptr()) };
+            let raw = NonNull::new(raw).ok_or_else(last_error)?;
+            Ok(Self { raw })
+        }
+
+        pub fn count_only_from_binary_path(path: impl AsRef<Path>) -> Result<Self> {
+            let path = CString::new(path.as_ref().as_os_str().to_string_lossy().as_bytes())?;
+            let raw = unsafe { delarocha_tokenizer_new_binary_count_only(path.as_ptr()) };
             let raw = NonNull::new(raw).ok_or_else(last_error)?;
             Ok(Self { raw })
         }
