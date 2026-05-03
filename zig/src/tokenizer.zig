@@ -328,6 +328,10 @@ pub const Worker = struct {
         }
         var pos = begin + 1;
         if (pos < input.len) {
+            // The root pair table avoids the first trie edge lookup for the
+            // common multibyte path. It is intentionally paired with the
+            // compact count-term stream so count-only tokenization touches less
+            // dictionary memory than full tokenization.
             const pair_index = (@as(usize, input[begin]) << 8) | @as(usize, input[begin + 1]);
             const pair_node = self.dictionary.trie_pair[pair_index];
             if (pair_node == dict_mod.invalid_trie_node) return;
@@ -343,6 +347,9 @@ pub const Worker = struct {
             pos = begin + 2;
         }
         if (self.dictionary.trie_triple.len != 0 and pos < input.len) {
+            // Kept as a conditional hook for dictionaries that may choose to
+            // materialize it later. The default builder leaves it empty because
+            // the dense 3-byte table costs too much memory for ipadic.
             const triple_index = (@as(usize, input[begin]) << 16) | (@as(usize, input[begin + 1]) << 8) | @as(usize, input[begin + 2]);
             const triple_node = self.dictionary.trie_triple[triple_index];
             if (triple_node == dict_mod.invalid_trie_node) return;
@@ -560,6 +567,9 @@ pub const Worker = struct {
         if (first_index == invalid_node) return error.NoPath;
         const first = self.count_nodes.items[first_index];
         if (first.next_end == invalid_node) {
+            // Most positions in short Japanese input have a single best
+            // predecessor after count-term deduplication. Returning here avoids
+            // a linked-list walk on the hottest count-only transition path.
             return .{
                 .index = first_index,
                 .cost = first.min_cost + self.dictionary.matrix.trustedCost(first.right_id, candidate.left_id) + candidate.word_cost,
@@ -711,5 +721,7 @@ fn intersects(a: []const usize, b: []const usize) bool {
 inline fn surfaceMatchesIndexed(input: []const u8, begin: usize, surface: []const u8) bool {
     if (surface.len > input.len - begin) return false;
     if (surface.len <= 1) return true;
+    // Indexed buckets are keyed by the first byte, so compare only the suffix
+    // here and avoid re-reading the byte that selected the bucket.
     return std.mem.eql(u8, input[begin + 1 .. begin + surface.len], surface[1..]);
 }

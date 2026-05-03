@@ -53,6 +53,15 @@ pub const TrieTerm = struct {
     word_cost: i32,
 };
 
+// Count-only tokenization never needs the dictionary word id or feature
+// payload. Keeping this term at 8 bytes reduces the hot trie term stream for
+// `tokenizeCount` and avoids loading data that cannot affect the best path.
+pub const TrieCountTerm = struct {
+    left_id: u16,
+    right_id: u16,
+    word_cost: i32,
+};
+
 pub const UnkTerm = struct {
     unk_id: u32,
     left_id: u16,
@@ -337,7 +346,7 @@ pub const Dictionary = struct {
     trie_nodes: []TrieNode,
     trie_edges: []TrieEdge,
     trie_terms: []TrieTerm,
-    trie_count_terms: []TrieTerm,
+    trie_count_terms: []TrieCountTerm,
     trie_first: [256]u32,
     trie_pair: []u32,
     trie_triple: []u32,
@@ -693,7 +702,7 @@ const TrieBuildResult = struct {
     nodes: []TrieNode,
     edges: []TrieEdge,
     terms: []TrieTerm,
-    count_terms: []TrieTerm,
+    count_terms: []TrieCountTerm,
 };
 
 pub const DoubleArray = struct {
@@ -798,7 +807,7 @@ fn buildTrie(allocator: Allocator, entries: []const Entry) !TrieBuildResult {
     errdefer allocator.free(edges);
     const terms = try allocator.alloc(TrieTerm, word_id_count);
     errdefer allocator.free(terms);
-    var count_terms: std.ArrayList(TrieTerm) = .empty;
+    var count_terms: std.ArrayList(TrieCountTerm) = .empty;
     errdefer count_terms.deinit(allocator);
 
     var edge_offset: usize = 0;
@@ -832,14 +841,21 @@ fn buildTrie(allocator: Allocator, entries: []const Entry) !TrieBuildResult {
     return .{ .nodes = nodes, .edges = edges, .terms = terms, .count_terms = try count_terms.toOwnedSlice(allocator) };
 }
 
-fn appendCountTerm(allocator: Allocator, terms: *std.ArrayList(TrieTerm), term: TrieTerm, start: usize) !void {
+fn appendCountTerm(allocator: Allocator, terms: *std.ArrayList(TrieCountTerm), term: TrieTerm, start: usize) !void {
+    // Multiple entries can share the same left/right ids at one trie node. For
+    // count-only tokenization those entries are equivalent except for word
+    // cost, so retain only the cheapest transition.
     for (terms.items[start..]) |*existing| {
         if (existing.left_id == term.left_id and existing.right_id == term.right_id) {
-            if (term.word_cost < existing.word_cost) existing.* = term;
+            if (term.word_cost < existing.word_cost) existing.word_cost = term.word_cost;
             return;
         }
     }
-    try terms.append(allocator, term);
+    try terms.append(allocator, .{
+        .left_id = term.left_id,
+        .right_id = term.right_id,
+        .word_cost = term.word_cost,
+    });
 }
 
 fn findEdgeSlice(edges: []const TrieEdge, byte: u8) ?usize {
@@ -861,6 +877,9 @@ fn buildTrieFirst(nodes: []const TrieNode, edges: []const TrieEdge) [256]u32 {
 }
 
 fn buildTriePair(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) ![]u32 {
+    // The dense two-byte root table is small enough (256 KiB) to be worth it:
+    // it skips two levels of root traversal for UTF-8-heavy Japanese input and
+    // still fits comfortably in cache compared with the rejected triple table.
     const pair = try allocator.alloc(u32, 256 * 256);
     @memset(pair, invalid_trie_node);
     const root = nodes[0];
@@ -878,33 +897,21 @@ fn buildTriePair(allocator: Allocator, nodes: []const TrieNode, edges: []const T
 }
 
 fn buildTrieTriple(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) ![]u32 {
-    if (nodes.len < 1024) return &.{};
-
-    const triple = try allocator.alloc(u32, 256 * 256 * 256);
-    @memset(triple, invalid_trie_node);
-    const root = nodes[0];
-    const root_start: usize = @intCast(root.edge_start);
-    const root_len: usize = @intCast(root.edge_len);
-    for (edges[root_start .. root_start + root_len]) |first| {
-        const second_node = nodes[@intCast(first.child)];
-        const second_start: usize = @intCast(second_node.edge_start);
-        const second_len: usize = @intCast(second_node.edge_len);
-        for (edges[second_start .. second_start + second_len]) |second| {
-            const third_node = nodes[@intCast(second.child)];
-            const third_start: usize = @intCast(third_node.edge_start);
-            const third_len: usize = @intCast(third_node.edge_len);
-            for (edges[third_start .. third_start + third_len]) |third| {
-                const key = (@as(usize, first.byte) << 16) | (@as(usize, second.byte) << 8) | @as(usize, third.byte);
-                triple[key] = third.child;
-            }
-        }
-    }
-    return triple;
+    _ = allocator;
+    _ = nodes;
+    _ = edges;
+    // A dense 3-byte table costs 64 MiB and regresses ipadic tokenization by
+    // pushing the hot dictionary data out of cache. Pair lookup plus the
+    // double-array fallback is the better default for large dictionaries.
+    return emptyU32Slice();
 }
 
 fn buildDoubleArray(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) !DoubleArray {
     if (nodes.len < 65536) return .{ .base = &.{}, .check = &.{}, .child = &.{} };
 
+    // The double-array is only built for large dictionaries. Disabling it saves
+    // memory but regresses ipadic binary tokenization heavily, so it remains the
+    // fallback after the root pair table.
     const base = try allocator.alloc(u32, nodes.len);
     errdefer allocator.free(base);
     @memset(base, 0);
@@ -1043,7 +1050,7 @@ pub inline fn trieTerms(nodes: []const TrieNode, trie_terms: []const TrieTerm, n
     return trie_terms[start .. start + len];
 }
 
-pub inline fn trieCountTerms(nodes: []const TrieNode, trie_terms: []const TrieTerm, node_index: usize) []const TrieTerm {
+pub inline fn trieCountTerms(nodes: []const TrieNode, trie_terms: []const TrieCountTerm, node_index: usize) []const TrieCountTerm {
     const node = nodes[node_index];
     const start: usize = @intCast(node.count_word_start);
     const len: usize = @intCast(node.count_word_len);
@@ -1054,7 +1061,7 @@ fn trieEdgeLessThan(_: void, lhs: TrieEdge, rhs: TrieEdge) bool {
     return lhs.byte < rhs.byte;
 }
 
-fn freeTrie(allocator: Allocator, nodes: []TrieNode, edges: []TrieEdge, terms_slice: []TrieTerm, count_terms_slice: []TrieTerm) void {
+fn freeTrie(allocator: Allocator, nodes: []TrieNode, edges: []TrieEdge, terms_slice: []TrieTerm, count_terms_slice: []TrieCountTerm) void {
     allocator.free(nodes);
     allocator.free(edges);
     allocator.free(terms_slice);

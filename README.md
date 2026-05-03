@@ -113,3 +113,14 @@ cargo run -p delarocha --release --features 'zig-ffi vibrato-bench' --example me
 cargo run -p delarocha --release --features 'zig-ffi vibrato-bench' --example memory -- vibrato
 cargo run -p delarocha --release --features 'zig-ffi vibrato-bench' --example memory -- delarocha-rust
 ```
+
+For ipadic-scale dictionaries, set the dictionary paths and use the system dictionary modes:
+
+```bash
+ZIG_RAW_DIC_DIR=/path/to/raw-ipadic \
+  cargo run -p delarocha --release --features 'zig-ffi vibrato-bench' --example memory -- delarocha-zig-ipadic-raw
+ZIG_RAW_DIC_DIR=/path/to/raw-ipadic \
+  cargo run -p delarocha --release --features 'zig-ffi vibrato-bench' --example memory -- delarocha-zig-ipadic-binary
+VIBRATO_SYSTEM_DIC=/path/to/system.dic.zst \
+  cargo run -p delarocha --release --features 'zig-ffi vibrato-bench' --example memory -- vibrato-system
+```
