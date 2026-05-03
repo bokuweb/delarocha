@@ -74,6 +74,37 @@ fn zig_ffi_writes_and_reads_binary_dictionary() {
 }
 
 #[test]
+fn zig_ffi_count_only_matches_full_count() {
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let binary_path = temp_dir.path().join("fixture.dic");
+
+    ZigTokenizer::write_binary_from_raw_paths(
+        fixture_dir.join("lex.csv"),
+        fixture_dir.join("matrix.def"),
+        fixture_dir.join("char.def"),
+        fixture_dir.join("unk.def"),
+        &binary_path,
+    )
+    .expect("Zig writes binary dictionary");
+
+    let full = ZigTokenizer::from_binary_path(&binary_path).expect("Zig loads full binary");
+    let count_only = ZigTokenizer::count_only_from_binary_path(&binary_path)
+        .expect("Zig loads count-only binary");
+    let mut full_worker = full.create_worker().expect("full worker is created");
+    let mut count_worker = count_only
+        .create_worker()
+        .expect("count-only worker is created");
+
+    for sentence in ["本とカレー", "本X🍛カレー", "カレー本と本とカレー"] {
+        assert_eq!(
+            count_worker.tokenize_count(sentence).unwrap(),
+            full_worker.tokenize_count(sentence).unwrap()
+        );
+    }
+}
+
+#[test]
 fn zig_ffi_copies_token_spans_in_bulk() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
     let tokenizer = ZigTokenizer::from_raw_paths(

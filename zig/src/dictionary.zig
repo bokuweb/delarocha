@@ -87,13 +87,18 @@ pub const EntryIndex = struct {
 
 pub const UnkIndex = struct {
     buckets: [][]UnkTerm,
+    count_buckets: [][]UnkTerm,
     fallback_terms: []UnkTerm,
 
     fn deinit(self: UnkIndex, allocator: Allocator) void {
         for (self.buckets) |bucket| {
             if (bucket.len != 0) allocator.free(bucket);
         }
+        for (self.count_buckets) |bucket| {
+            if (bucket.len != 0) allocator.free(bucket);
+        }
         allocator.free(self.buckets);
+        allocator.free(self.count_buckets);
         allocator.free(self.fallback_terms);
     }
 };
@@ -410,7 +415,7 @@ pub const Dictionary = struct {
         // first-byte entry index there only consumes memory and load time.
         const entry_index = if (owned_entries.len <= 32) try buildEntryIndex(allocator, owned_entries) else EntryIndex.empty();
         errdefer entry_index.deinit(allocator);
-        const unk_index = try buildUnkIndex(allocator, char_property.categories.len, unk_entries);
+        const unk_index = try buildUnkIndex(allocator, char_property.categories.len, unk_entries, &matrix);
         errdefer unk_index.deinit(allocator);
         const trie = try buildTrie(allocator, owned_entries, &matrix);
         errdefer freeTrie(allocator, trie.nodes, trie.edges, trie.terms, trie.count_terms);
@@ -484,7 +489,7 @@ pub const Dictionary = struct {
         // first-byte entry index there only consumes memory and load time.
         const entry_index = if (entries.len <= 32) try buildEntryIndex(allocator, entries) else EntryIndex.empty();
         errdefer entry_index.deinit(allocator);
-        const unk_index = try buildUnkIndex(allocator, char_property.categories.len, unk_entries);
+        const unk_index = try buildUnkIndex(allocator, char_property.categories.len, unk_entries, &matrix);
         errdefer unk_index.deinit(allocator);
         const trie = try buildTrie(allocator, entries, &matrix);
         errdefer freeTrie(allocator, trie.nodes, trie.edges, trie.terms, trie.count_terms);
@@ -693,7 +698,7 @@ pub const Dictionary = struct {
         // first-byte entry index there only consumes memory and load time.
         const entry_index = if (entries.len <= 32) try buildEntryIndex(allocator, entries) else EntryIndex.empty();
         errdefer entry_index.deinit(allocator);
-        const unk_index = try buildUnkIndex(allocator, @intCast(category_count), unk_entries);
+        const unk_index = try buildUnkIndex(allocator, @intCast(category_count), unk_entries, &matrix);
         errdefer unk_index.deinit(allocator);
         const trie = try buildTrie(allocator, entries, &matrix);
         errdefer freeTrie(allocator, trie.nodes, trie.edges, trie.terms, trie.count_terms);
@@ -812,7 +817,7 @@ pub const DoubleArray = struct {
 
 pub const invalid_trie_node: u32 = std.math.maxInt(u32);
 
-fn buildUnkIndex(allocator: Allocator, category_count: usize, entries: []const UnkEntry) !UnkIndex {
+fn buildUnkIndex(allocator: Allocator, category_count: usize, entries: []const UnkEntry, matrix: *const ConnectionMatrix) !UnkIndex {
     var lists = try allocator.alloc(std.ArrayList(UnkTerm), category_count);
     defer allocator.free(lists);
     for (lists) |*list| list.* = .empty;
@@ -832,18 +837,59 @@ fn buildUnkIndex(allocator: Allocator, category_count: usize, entries: []const U
 
     const buckets = try allocator.alloc([]UnkTerm, category_count);
     errdefer allocator.free(buckets);
+    const count_buckets = try allocator.alloc([]UnkTerm, category_count);
+    errdefer allocator.free(count_buckets);
     const fallback_terms = try allocator.alloc(UnkTerm, category_count);
     errdefer allocator.free(fallback_terms);
 
     for (lists, 0..) |*list, category_id| {
         buckets[category_id] = try list.toOwnedSlice(allocator);
+        var count_terms: std.ArrayList(UnkTerm) = .empty;
+        defer count_terms.deinit(allocator);
+        for (buckets[category_id]) |term| {
+            try appendUnkCountTerm(allocator, &count_terms, term, matrix);
+        }
+        count_buckets[category_id] = try count_terms.toOwnedSlice(allocator);
         fallback_terms[category_id] = if (buckets[category_id].len == 0)
             .{ .unk_id = 0, .left_id = entries[0].left_id, .right_id = entries[0].right_id, .word_cost = entries[0].word_cost }
         else
             buckets[category_id][0];
     }
 
-    return .{ .buckets = buckets, .fallback_terms = fallback_terms };
+    return .{ .buckets = buckets, .count_buckets = count_buckets, .fallback_terms = fallback_terms };
+}
+
+fn appendUnkCountTerm(allocator: Allocator, terms: *std.ArrayList(UnkTerm), candidate: UnkTerm, matrix: *const ConnectionMatrix) !void {
+    // Count-only unknown terms for one category emit the same spans. If two
+    // candidates also emit the same right id, the one that is no cheaper from
+    // any predecessor right id cannot change the best path or token count.
+    var index: usize = 0;
+    while (index < terms.items.len) {
+        const existing = &terms.items[index];
+        if (existing.right_id == candidate.right_id) {
+            if (existing.left_id == candidate.left_id) {
+                if (candidate.word_cost < existing.word_cost) existing.* = candidate;
+                return;
+            }
+            if (unkTermDominates(matrix, existing.*, candidate)) return;
+            if (unkTermDominates(matrix, candidate, existing.*)) {
+                _ = terms.swapRemove(index);
+                continue;
+            }
+        }
+        index += 1;
+    }
+    try terms.append(allocator, candidate);
+}
+
+fn unkTermDominates(matrix: *const ConnectionMatrix, lhs: UnkTerm, rhs: UnkTerm) bool {
+    var prev_right: usize = 0;
+    while (prev_right < matrix.right_size) : (prev_right += 1) {
+        const lhs_cost = @as(i32, matrix.costs[@as(usize, lhs.left_id) * matrix.right_size + prev_right]) + lhs.word_cost;
+        const rhs_cost = @as(i32, matrix.costs[@as(usize, rhs.left_id) * matrix.right_size + prev_right]) + rhs.word_cost;
+        if (lhs_cost > rhs_cost) return false;
+    }
+    return true;
 }
 
 fn buildEntryIndex(allocator: Allocator, entries: []const Entry) !EntryIndex {
@@ -1103,7 +1149,11 @@ fn buildDoubleArray(allocator: Allocator, nodes: []const TrieNode, edges: []cons
     for (order) |node_index| {
         const node = nodes[node_index];
         const edge_len: usize = @intCast(node.edge_len);
-        if (edge_len < 4) continue;
+        // Three-way and larger branches are faster through the double-array
+        // probe than through per-node binary search on ipadic hot paths. One-
+        // and two-way branches stay in the compact edge slice to avoid the
+        // memory blow-up that regressed the count-only benchmark.
+        if (edge_len < 3) continue;
         const edge_start: usize = @intCast(node.edge_start);
         const node_edges = edges[edge_start .. edge_start + edge_len];
         const first_byte: usize = node_edges[0].byte;
