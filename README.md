@@ -104,6 +104,28 @@ VIBRATO_SYSTEM_DIC="$PWD/target/vibrato-dic/ipadic-mecab-2_7_0/system.dic.zst" \
 
 The Vibrato project and dictionary release information are available at <https://github.com/daac-tools/vibrato>.
 
+### Yokohama Ordinance Text Benchmark
+
+To reproduce the long-text comparison used for the Yokohama City tax ordinance, download the HTML, extract normalized visible text, and run the dedicated example:
+
+```bash
+mkdir -p target/yokohama
+curl -L \
+  https://cgi.city.yokohama.lg.jp/somu/reiki/reiki_honbun/g202RG00000570.html \
+  -o target/yokohama/g202RG00000570.html
+python3 scripts/extract_yokohama_reiki_text.py \
+  target/yokohama/g202RG00000570.html \
+  target/yokohama/g202RG00000570.txt
+YOKOHAMA_TEXT="$PWD/target/yokohama/g202RG00000570.txt" \
+YOKOHAMA_BENCH_WARMUP=5 \
+YOKOHAMA_BENCH_ITERATIONS=50 \
+ZIG_RAW_DIC_DIR=/path/to/raw-ipadic \
+VIBRATO_SYSTEM_DIC=/path/to/system.dic.zst \
+  cargo run -p delarocha --release --features 'zig-ffi vibrato-bench' --example yokohama_text_bench
+```
+
+The example prints per-iteration wall-clock time and token count for `delarocha/binary-count-only`, `delarocha/raw-count-only`, and `vibrato/system-dic` on the same extracted text.
+
 ## Memory Comparison
 
 The Rust example below reports RSS after dictionary load and after repeated tokenization for the fixture dictionary.

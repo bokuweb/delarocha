@@ -405,12 +405,12 @@ pub const Worker = struct {
     fn appendUnknown(self: *Worker, input: []const u8, begin: usize, has_matched: bool) !void {
         if (has_matched and !self.dictionary.char_property.has_invoke) return;
 
-        const ch = nextCodepoint(input, begin) orelse return error.InvalidDictionary;
-        if (has_matched and !self.dictionary.char_property.mayInvoke(ch)) return;
-        const info = self.dictionary.char_property.info(ch);
+        const first = nextCodepointWithEnd(input, begin) orelse return error.InvalidDictionary;
+        if (has_matched and !self.dictionary.char_property.mayInvoke(first.ch)) return;
+        const info = self.dictionary.char_property.info(first.ch);
 
         var emitted = false;
-        const group_span = groupSpan(input, begin, &self.dictionary.char_property, info);
+        const group_span = groupSpanAfterFirst(input, first.end, &self.dictionary.char_property, info);
         const end_group = group_span.end;
         const group_len = if (info.category.group or info.category.length != 0) group_span.count else 0;
         for (self.dictionary.unk_index.buckets[info.base_id]) |unk| {
@@ -444,9 +444,8 @@ pub const Worker = struct {
         }
 
         if (!has_matched and !emitted) {
-            const end = nextBoundary(input, begin) orelse return error.InvalidDictionary;
             const fallback = self.dictionary.unk_index.fallback_terms[info.base_id];
-            try self.appendBestNode(begin, end, .{
+            try self.appendBestNode(begin, first.end, .{
                 .word_id = unknown_word_base + fallback.unk_id,
                 .left_id = fallback.left_id,
                 .right_id = fallback.right_id,
@@ -456,12 +455,12 @@ pub const Worker = struct {
     }
 
     inline fn appendUnknownCount(self: *Worker, input: []const u8, begin: usize, has_matched: bool) !void {
-        const ch = codepointAtAssumeValid(input, begin) orelse return error.InvalidDictionary;
-        if (has_matched and !self.dictionary.char_property.mayInvoke(ch)) return;
-        const info = self.dictionary.char_property.info(ch);
+        const first = codepointWithEndAssumeValid(input, begin) orelse return error.InvalidDictionary;
+        if (has_matched and !self.dictionary.char_property.mayInvoke(first.ch)) return;
+        const info = self.dictionary.char_property.info(first.ch);
 
         var emitted = false;
-        const group_span = groupSpan(input, begin, &self.dictionary.char_property, info);
+        const group_span = groupSpanAfterFirst(input, first.end, &self.dictionary.char_property, info);
         const end_group = group_span.end;
         const group_len = if (info.category.group or info.category.length != 0) group_span.count else 0;
         const max_len = @min(info.category.length, group_len);
@@ -497,9 +496,8 @@ pub const Worker = struct {
         }
 
         if (!has_matched and !emitted) {
-            const end = nextBoundary(input, begin) orelse return error.InvalidDictionary;
             const fallback = self.dictionary.unk_index.fallback_terms[info.base_id];
-            self.appendBestCountNode(begin, end, fallback.left_id, fallback.right_id, fallback.word_cost);
+            self.appendBestCountNode(begin, first.end, fallback.left_id, fallback.right_id, fallback.word_cost);
         }
     }
 
@@ -774,35 +772,58 @@ fn nthBoundary(input: []const u8, start: usize, n: usize) !usize {
 }
 
 inline fn nextCodepoint(input: []const u8, start: usize) ?u21 {
+    return (nextCodepointWithEnd(input, start) orelse return null).ch;
+}
+
+const CodepointWithEnd = struct {
+    ch: u21,
+    end: usize,
+};
+
+inline fn nextCodepointWithEnd(input: []const u8, start: usize) ?CodepointWithEnd {
     if (start >= input.len) return null;
     const b0 = input[start];
-    if (b0 < 0x80) return b0;
+    if (b0 < 0x80) return .{ .ch = b0, .end = start + 1 };
 
     const end = nextBoundary(input, start) orelse return null;
     if (end > input.len) return null;
     const bytes = input[start..end];
-    return switch (bytes.len) {
+    const ch: u21 = switch (bytes.len) {
         2 => (@as(u21, b0 & 0x1f) << 6) | @as(u21, bytes[1] & 0x3f),
         3 => (@as(u21, b0 & 0x0f) << 12) | (@as(u21, bytes[1] & 0x3f) << 6) | @as(u21, bytes[2] & 0x3f),
         4 => (@as(u21, b0 & 0x07) << 18) | (@as(u21, bytes[1] & 0x3f) << 12) | (@as(u21, bytes[2] & 0x3f) << 6) | @as(u21, bytes[3] & 0x3f),
-        else => null,
+        else => return null,
     };
+    return .{ .ch = ch, .end = end };
 }
 
 inline fn codepointAtAssumeValid(input: []const u8, start: usize) ?u21 {
+    return (codepointWithEndAssumeValid(input, start) orelse return null).ch;
+}
+
+inline fn codepointWithEndAssumeValid(input: []const u8, start: usize) ?CodepointWithEnd {
     if (start >= input.len) return null;
     const b0 = input[start];
-    if (b0 < 0x80) return b0;
+    if (b0 < 0x80) return .{ .ch = b0, .end = start + 1 };
     if (b0 < 0xe0) {
         if (start + 2 > input.len) return null;
-        return (@as(u21, b0 & 0x1f) << 6) | @as(u21, input[start + 1] & 0x3f);
+        return .{
+            .ch = (@as(u21, b0 & 0x1f) << 6) | @as(u21, input[start + 1] & 0x3f),
+            .end = start + 2,
+        };
     }
     if (b0 < 0xf0) {
         if (start + 3 > input.len) return null;
-        return (@as(u21, b0 & 0x0f) << 12) | (@as(u21, input[start + 1] & 0x3f) << 6) | @as(u21, input[start + 2] & 0x3f);
+        return .{
+            .ch = (@as(u21, b0 & 0x0f) << 12) | (@as(u21, input[start + 1] & 0x3f) << 6) | @as(u21, input[start + 2] & 0x3f),
+            .end = start + 3,
+        };
     }
     if (start + 4 > input.len) return null;
-    return (@as(u21, b0 & 0x07) << 18) | (@as(u21, input[start + 1] & 0x3f) << 12) | (@as(u21, input[start + 2] & 0x3f) << 6) | @as(u21, input[start + 3] & 0x3f);
+    return .{
+        .ch = (@as(u21, b0 & 0x07) << 18) | (@as(u21, input[start + 1] & 0x3f) << 12) | (@as(u21, input[start + 2] & 0x3f) << 6) | @as(u21, input[start + 3] & 0x3f),
+        .end = start + 4,
+    };
 }
 
 const GroupSpan = struct {
@@ -810,9 +831,12 @@ const GroupSpan = struct {
     count: usize,
 };
 
-fn groupSpan(input: []const u8, start: usize, char_property: *const dict_mod.CharProperty, start_info: dict_mod.CharInfo) GroupSpan {
-    var end = start;
-    var count: usize = 0;
+fn groupSpanAfterFirst(input: []const u8, first_end: usize, char_property: *const dict_mod.CharProperty, start_info: dict_mod.CharInfo) GroupSpan {
+    // The caller has already decoded and classified the first character.
+    // Start from the next UTF-8 boundary to avoid repeating that work while
+    // preserving MeCab-style grouping semantics.
+    var end = first_end;
+    var count: usize = 1;
     while (end < input.len) {
         const ch = nextCodepoint(input, end) orelse break;
         const info = char_property.info(ch);
