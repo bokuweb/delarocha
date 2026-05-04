@@ -150,8 +150,8 @@ fn zig_ffi_seeded_fuzz_count_only_matches_full_tokenization() {
         .create_worker()
         .expect("count-only worker is created");
 
-    for seed in 0..512 {
-        let input = fuzz_string(seed);
+    for seed in 0..fuzz_seed_count() {
+        let input = fuzz_string(seed, fuzz_max_len());
         let spans = full_worker.tokenize_spans(&input).unwrap_or_else(|err| {
             panic!("full tokenization succeeds for seed {seed}: {input:?}: {err}")
         });
@@ -166,14 +166,34 @@ fn zig_ffi_seeded_fuzz_count_only_matches_full_tokenization() {
     }
 }
 
-fn fuzz_string(seed: u64) -> String {
+fn fuzz_seed_count() -> u64 {
+    std::env::var("DELAROCHA_FUZZ_SEEDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(512)
+}
+
+fn fuzz_max_len() -> usize {
+    std::env::var("DELAROCHA_FUZZ_MAX_LEN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(80)
+}
+
+fn fuzz_string(seed: u64, max_len: usize) -> String {
     const POOL: &[char] = &[
         '本', 'と', 'カ', 'レ', 'ー', '東', '京', '都', 'に', '行', 'く', '0', '1', 'a', ' ', '\n',
         '。', 'X', '🍛',
     ];
 
     let mut rng = XorShift64(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x1234_abcd_55aa_aa55);
-    let len = (rng.next() % 80) as usize;
+    // Keep CI deterministic and small by default, while allowing local stress
+    // runs to widen the generated input length with DELAROCHA_FUZZ_MAX_LEN.
+    let len = if max_len == 0 {
+        0
+    } else {
+        (rng.next() % max_len as u64) as usize
+    };
     let mut out = String::new();
     for _ in 0..len {
         out.push(POOL[(rng.next() as usize) % POOL.len()]);

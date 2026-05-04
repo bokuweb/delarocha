@@ -58,6 +58,14 @@ cargo test -p delarocha
 cargo test -p delarocha --features zig-ffi
 ```
 
+Stress them with more generated inputs by overriding the deterministic seed
+count and maximum generated input length:
+
+```bash
+DELAROCHA_FUZZ_SEEDS=100000 DELAROCHA_FUZZ_MAX_LEN=256 cargo test -p delarocha --test fuzz_tokenizer
+DELAROCHA_FUZZ_SEEDS=100000 DELAROCHA_FUZZ_MAX_LEN=256 cargo test -p delarocha --features zig-ffi --test zig_ffi
+```
+
 ## CLI
 
 ```bash
