@@ -1225,6 +1225,7 @@ fn parse_i32(field: &str, line_no: usize, name: &str) -> Result<i32> {
 pub mod ffi {
     use super::*;
     use std::ffi::{CStr, CString};
+    use std::fs::File;
     use std::marker::PhantomData;
     use std::path::Path;
     use std::ptr::NonNull;
@@ -1253,8 +1254,11 @@ pub mod ffi {
             char_path: *const std::ffi::c_char,
             unk_path: *const std::ffi::c_char,
         ) -> *mut RawTokenizer;
-        fn delarocha_tokenizer_new_binary(path: *const std::ffi::c_char) -> *mut RawTokenizer;
         fn delarocha_tokenizer_new_binary_bytes(
+            bytes_ptr: *const u8,
+            bytes_len: usize,
+        ) -> *mut RawTokenizer;
+        fn delarocha_tokenizer_new_binary_borrowed_bytes(
             bytes_ptr: *const u8,
             bytes_len: usize,
         ) -> *mut RawTokenizer;
@@ -1299,11 +1303,13 @@ pub mod ffi {
             worker: *const RawWorker,
             index: usize,
         ) -> *const std::ffi::c_char;
+        fn delarocha_token_feature_len(worker: *const RawWorker, index: usize) -> usize;
         fn delarocha_last_error() -> *const std::ffi::c_char;
     }
 
     pub struct ZigTokenizer {
         raw: NonNull<RawTokenizer>,
+        _mmap: Option<memmap2::Mmap>,
     }
 
     pub struct ZigWorker<'tokenizer> {
@@ -1347,7 +1353,7 @@ pub mod ffi {
             let path = CString::new(path.as_ref().as_os_str().to_string_lossy().as_bytes())?;
             let raw = unsafe { delarocha_tokenizer_new(path.as_ptr()) };
             let raw = NonNull::new(raw).ok_or_else(last_error)?;
-            Ok(Self { raw })
+            Ok(Self { raw, _mmap: None })
         }
 
         pub fn from_raw_paths(
@@ -1378,7 +1384,7 @@ pub mod ffi {
                 )
             };
             let raw = NonNull::new(raw).ok_or_else(last_error)?;
-            Ok(Self { raw })
+            Ok(Self { raw, _mmap: None })
         }
 
         pub fn count_only_from_raw_paths(
@@ -1409,14 +1415,22 @@ pub mod ffi {
                 )
             };
             let raw = NonNull::new(raw).ok_or_else(last_error)?;
-            Ok(Self { raw })
+            Ok(Self { raw, _mmap: None })
         }
 
         pub fn from_binary_path(path: impl AsRef<Path>) -> Result<Self> {
-            let path = CString::new(path.as_ref().as_os_str().to_string_lossy().as_bytes())?;
-            let raw = unsafe { delarocha_tokenizer_new_binary(path.as_ptr()) };
+            let file = File::open(path)?;
+            // Keep the mmap alive for the tokenizer lifetime. The Zig loader
+            // borrows feature/surface slices from these bytes and only copies
+            // the hot lookup tables needed during Viterbi search.
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            let raw =
+                unsafe { delarocha_tokenizer_new_binary_borrowed_bytes(mmap.as_ptr(), mmap.len()) };
             let raw = NonNull::new(raw).ok_or_else(last_error)?;
-            Ok(Self { raw })
+            Ok(Self {
+                raw,
+                _mmap: Some(mmap),
+            })
         }
 
         pub fn from_binary_bytes(bytes: &[u8]) -> Result<Self> {
@@ -1424,14 +1438,14 @@ pub mod ffi {
             // so the caller may drop the byte slice after construction.
             let raw = unsafe { delarocha_tokenizer_new_binary_bytes(bytes.as_ptr(), bytes.len()) };
             let raw = NonNull::new(raw).ok_or_else(last_error)?;
-            Ok(Self { raw })
+            Ok(Self { raw, _mmap: None })
         }
 
         pub fn count_only_from_binary_path(path: impl AsRef<Path>) -> Result<Self> {
             let path = CString::new(path.as_ref().as_os_str().to_string_lossy().as_bytes())?;
             let raw = unsafe { delarocha_tokenizer_new_binary_count_only(path.as_ptr()) };
             let raw = NonNull::new(raw).ok_or_else(last_error)?;
-            Ok(Self { raw })
+            Ok(Self { raw, _mmap: None })
         }
 
         pub fn write_binary_from_raw_paths(
@@ -1528,12 +1542,14 @@ pub mod ffi {
 
         pub fn token_feature(&self, index: usize) -> &str {
             let feature_ptr = unsafe { delarocha_token_feature(self.raw.as_ptr(), index) };
+            let feature_len = unsafe { delarocha_token_feature_len(self.raw.as_ptr(), index) };
             if feature_ptr.is_null() {
                 ""
             } else {
-                unsafe { CStr::from_ptr(feature_ptr) }
-                    .to_str()
-                    .unwrap_or_default()
+                std::str::from_utf8(unsafe {
+                    std::slice::from_raw_parts(feature_ptr.cast::<u8>(), feature_len)
+                })
+                .unwrap_or_default()
             }
         }
 
@@ -1551,12 +1567,14 @@ pub mod ffi {
                 let end = unsafe { delarocha_token_surface_end(self.raw.as_ptr(), index) };
                 let word_id = unsafe { delarocha_token_word_id(self.raw.as_ptr(), index) };
                 let feature_ptr = unsafe { delarocha_token_feature(self.raw.as_ptr(), index) };
+                let feature_len = unsafe { delarocha_token_feature_len(self.raw.as_ptr(), index) };
                 let feature = if feature_ptr.is_null() {
                     ""
                 } else {
-                    unsafe { CStr::from_ptr(feature_ptr) }
-                        .to_str()
-                        .unwrap_or_default()
+                    std::str::from_utf8(unsafe {
+                        std::slice::from_raw_parts(feature_ptr.cast::<u8>(), feature_len)
+                    })
+                    .unwrap_or_default()
                 };
                 tokens.push(Token {
                     surface: input[start..end].to_owned(),

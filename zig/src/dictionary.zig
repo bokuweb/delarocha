@@ -9,7 +9,7 @@ pub const Entry = struct {
     left_id: u16,
     right_id: u16,
     word_cost: i32,
-    feature: [:0]const u8,
+    feature: []const u8,
 };
 
 pub const UnkEntry = struct {
@@ -17,7 +17,7 @@ pub const UnkEntry = struct {
     left_id: u16,
     right_id: u16,
     word_cost: i32,
-    feature: [:0]const u8,
+    feature: []const u8,
 };
 
 pub const CharCategory = struct {
@@ -68,6 +68,10 @@ pub const UnkTerm = struct {
     left_id: u16,
     right_id: u16,
     word_cost: i32,
+};
+
+pub const FeatureRef = struct {
+    feature: []const u8,
 };
 
 pub const EntryIndex = struct {
@@ -343,13 +347,16 @@ pub const ConnectionMatrix = struct {
 pub const Dictionary = struct {
     allocator: Allocator,
     entries: []Entry,
+    entry_features: []FeatureRef,
     // Binary dictionaries store entry surfaces and features in one contiguous
     // blob. Raw dictionaries leave this empty and keep per-entry ownership.
-    entry_blob: []u8,
+    entry_blob: []const u8,
+    owns_entry_blob: bool,
     user_entries: []Entry,
     unk_entries: []UnkEntry,
     // Mirrors `entry_blob` for unknown-word features loaded from binary files.
-    unk_feature_blob: []u8,
+    unk_feature_blob: []const u8,
+    owns_unk_feature_blob: bool,
     unk_index: UnkIndex,
     char_property: CharProperty,
     matrix: ConnectionMatrix,
@@ -431,10 +438,13 @@ pub const Dictionary = struct {
         return .{
             .allocator = allocator,
             .entries = owned_entries,
+            .entry_features = emptyFeatureRefSlice(),
             .entry_blob = emptyU8Slice(),
+            .owns_entry_blob = false,
             .user_entries = &.{},
             .unk_entries = unk_entries,
             .unk_feature_blob = emptyU8Slice(),
+            .owns_unk_feature_blob = false,
             .unk_index = unk_index,
             .char_property = char_property,
             .matrix = matrix,
@@ -505,10 +515,13 @@ pub const Dictionary = struct {
         return .{
             .allocator = allocator,
             .entries = entries,
+            .entry_features = emptyFeatureRefSlice(),
             .entry_blob = emptyU8Slice(),
+            .owns_entry_blob = false,
             .user_entries = &.{},
             .unk_entries = unk_entries,
             .unk_feature_blob = emptyU8Slice(),
+            .owns_unk_feature_blob = false,
             .unk_index = unk_index,
             .char_property = char_property,
             .matrix = matrix,
@@ -623,6 +636,14 @@ pub const Dictionary = struct {
     }
 
     pub fn fromBinaryBytes(allocator: Allocator, bytes: []const u8) !Dictionary {
+        return fromBinaryBytesInternal(allocator, bytes, true);
+    }
+
+    pub fn fromBorrowedBinaryBytes(allocator: Allocator, bytes: []const u8) !Dictionary {
+        return fromBinaryBytesInternal(allocator, bytes, false);
+    }
+
+    fn fromBinaryBytesInternal(allocator: Allocator, bytes: []const u8, copy_feature_blob: bool) !Dictionary {
         var cursor: usize = 0;
         const magic = try readSlice(bytes, &cursor, binary_magic.len);
         const has_prebuilt_trie = if (std.mem.eql(u8, magic, binary_magic))
@@ -639,39 +660,74 @@ pub const Dictionary = struct {
         const right_size = try readU32(bytes, &cursor);
         const left_size = try readU32(bytes, &cursor);
 
-        const entry_blob_len = try scanBinaryEntryBlobLen(bytes, cursor, @intCast(entry_count));
-        const entries = try allocator.alloc(Entry, @intCast(entry_count));
-        errdefer allocator.free(entries);
-        const entry_blob = try allocator.alloc(u8, entry_blob_len);
-        errdefer allocator.free(entry_blob);
+        const compact_entry_features = has_prebuilt_trie and entry_count > 32;
+        const entries = if (compact_entry_features)
+            emptyEntrySlice()
+        else
+            try allocator.alloc(Entry, @intCast(entry_count));
+        errdefer if (!compact_entry_features) allocator.free(entries);
+        const entry_features = if (compact_entry_features)
+            try allocator.alloc(FeatureRef, @intCast(entry_count))
+        else
+            emptyFeatureRefSlice();
+        errdefer if (compact_entry_features) allocator.free(entry_features);
+        const entry_blob_owned = if (copy_feature_blob)
+            try allocator.alloc(u8, if (compact_entry_features)
+                try scanBinaryEntryFeatureBlobLen(bytes, cursor, @intCast(entry_count))
+            else
+                try scanBinaryEntryBlobLen(bytes, cursor, @intCast(entry_count)))
+        else
+            emptyU8Slice();
+        const entry_blob: []const u8 = if (copy_feature_blob) entry_blob_owned else bytes;
+        errdefer if (copy_feature_blob) allocator.free(entry_blob_owned);
         var entry_blob_cursor: usize = 0;
-        for (entries) |*entry| {
+        for (0..@intCast(entry_count)) |entry_index| {
             const surface_len: usize = @intCast(try readU32(bytes, &cursor));
             const left_id = try readU16(bytes, &cursor);
             const right_id = try readU16(bytes, &cursor);
             const word_cost = try readI32(bytes, &cursor);
             const feature_len: usize = @intCast(try readU32(bytes, &cursor));
-            const surface_start = entry_blob_cursor;
-            @memcpy(entry_blob[surface_start .. surface_start + surface_len], try readSlice(bytes, &cursor, surface_len));
-            entry_blob_cursor += surface_len;
-            const feature_start = entry_blob_cursor;
-            @memcpy(entry_blob[feature_start .. feature_start + feature_len], try readSlice(bytes, &cursor, feature_len));
-            entry_blob[feature_start + feature_len] = 0;
-            entry_blob_cursor += feature_len + 1;
-            entry.* = .{
-                .surface = entry_blob[surface_start .. surface_start + surface_len],
+            const surface = try readSlice(bytes, &cursor, surface_len);
+            const feature = try readSlice(bytes, &cursor, feature_len);
+            if (compact_entry_features) {
+                const entry_feature = if (copy_feature_blob) copied: {
+                    const feature_start = entry_blob_cursor;
+                    @memcpy(entry_blob_owned[feature_start .. feature_start + feature_len], feature);
+                    entry_blob_cursor += feature_len;
+                    break :copied entry_blob_owned[feature_start .. feature_start + feature_len];
+                } else feature;
+                entry_features[entry_index] = .{ .feature = entry_feature };
+                continue;
+            }
+            const entry_surface, const entry_feature = if (copy_feature_blob) copied: {
+                const surface_start = entry_blob_cursor;
+                @memcpy(entry_blob_owned[surface_start .. surface_start + surface_len], surface);
+                entry_blob_cursor += surface_len;
+                const feature_start = entry_blob_cursor;
+                @memcpy(entry_blob_owned[feature_start .. feature_start + feature_len], feature);
+                entry_blob_cursor += feature_len;
+                break :copied .{
+                    entry_blob_owned[surface_start .. surface_start + surface_len],
+                    entry_blob_owned[feature_start .. feature_start + feature_len],
+                };
+            } else .{ surface, feature };
+            entries[entry_index] = .{
+                .surface = entry_surface,
                 .left_id = left_id,
                 .right_id = right_id,
                 .word_cost = word_cost,
-                .feature = entry_blob[feature_start .. feature_start + feature_len :0],
+                .feature = entry_feature,
             };
         }
 
-        const unk_feature_blob_len = try scanBinaryUnkFeatureBlobLen(bytes, cursor, @intCast(unk_count));
         const unk_entries = try allocator.alloc(UnkEntry, @intCast(unk_count));
         errdefer allocator.free(unk_entries);
-        const unk_feature_blob = try allocator.alloc(u8, unk_feature_blob_len);
-        errdefer allocator.free(unk_feature_blob);
+        const unk_feature_blob_owned = if (copy_feature_blob)
+            try allocator.alloc(u8, try scanBinaryUnkFeatureBlobLen(bytes, cursor, @intCast(unk_count)))
+        else
+            emptyU8Slice();
+        const unk_feature_blob: []const u8 = if (copy_feature_blob) unk_feature_blob_owned else bytes;
+        errdefer if (copy_feature_blob) allocator.free(unk_feature_blob_owned);
         var unk_feature_blob_cursor: usize = 0;
         for (unk_entries) |*entry| {
             const category_id = try readU32(bytes, &cursor);
@@ -679,16 +735,19 @@ pub const Dictionary = struct {
             const right_id = try readU16(bytes, &cursor);
             const word_cost = try readI32(bytes, &cursor);
             const feature_len: usize = @intCast(try readU32(bytes, &cursor));
-            const feature_start = unk_feature_blob_cursor;
-            @memcpy(unk_feature_blob[feature_start .. feature_start + feature_len], try readSlice(bytes, &cursor, feature_len));
-            unk_feature_blob[feature_start + feature_len] = 0;
-            unk_feature_blob_cursor += feature_len + 1;
+            const feature = try readSlice(bytes, &cursor, feature_len);
+            const entry_feature = if (copy_feature_blob) copied: {
+                const feature_start = unk_feature_blob_cursor;
+                @memcpy(unk_feature_blob_owned[feature_start .. feature_start + feature_len], feature);
+                unk_feature_blob_cursor += feature_len;
+                break :copied unk_feature_blob_owned[feature_start .. feature_start + feature_len];
+            } else feature;
             entry.* = .{
                 .category_id = category_id,
                 .left_id = left_id,
                 .right_id = right_id,
                 .word_cost = word_cost,
-                .feature = unk_feature_blob[feature_start .. feature_start + feature_len :0],
+                .feature = entry_feature,
             };
         }
 
@@ -820,10 +879,13 @@ pub const Dictionary = struct {
         return .{
             .allocator = allocator,
             .entries = entries,
+            .entry_features = entry_features,
             .entry_blob = entry_blob,
+            .owns_entry_blob = copy_feature_blob,
             .user_entries = &.{},
             .unk_entries = unk_entries,
             .unk_feature_blob = unk_feature_blob,
+            .owns_unk_feature_blob = copy_feature_blob,
             .unk_index = unk_index,
             .char_property = char_property,
             .matrix = matrix,
@@ -850,15 +912,18 @@ pub const Dictionary = struct {
         if (self.trie_pair.len != 0) self.allocator.free(self.trie_pair);
         if (self.trie_triple.len != 0) self.allocator.free(self.trie_triple);
         freeDoubleArray(self.allocator, .{ .base = self.trie_base, .check = self.trie_check, .child = self.trie_child });
-        if (self.entry_blob.len != 0) {
-            self.allocator.free(self.entry_blob);
+        if (self.entry_features.len != 0) {
+            self.allocator.free(self.entry_features);
+            if (self.owns_entry_blob) self.allocator.free(self.entry_blob);
+        } else if (self.entry_blob.len != 0) {
+            if (self.owns_entry_blob) self.allocator.free(self.entry_blob);
             self.allocator.free(self.entries);
         } else {
             freeEntrySlice(self.allocator, self.entries);
         }
         freeEntrySlice(self.allocator, self.user_entries);
         if (self.unk_feature_blob.len != 0) {
-            self.allocator.free(self.unk_feature_blob);
+            if (self.owns_unk_feature_blob) self.allocator.free(self.unk_feature_blob);
             self.allocator.free(self.unk_entries);
         } else {
             freeUnkSlice(self.allocator, self.unk_entries);
@@ -874,10 +939,17 @@ pub const Dictionary = struct {
         // index, so full dictionary entries, features, word ids, and full trie
         // terms only add allocator pressure and cache noise for large trie
         // dictionaries. Keep this opt-in so normal tokenization remains intact.
-        if (self.entry_blob.len != 0) {
-            self.allocator.free(self.entry_blob);
+        if (self.entry_features.len != 0) {
+            self.allocator.free(self.entry_features);
+            self.entry_features = emptyFeatureRefSlice();
+            if (self.owns_entry_blob) self.allocator.free(self.entry_blob);
+            self.entry_blob = emptyU8Slice();
+            self.owns_entry_blob = false;
+        } else if (self.entry_blob.len != 0) {
+            if (self.owns_entry_blob) self.allocator.free(self.entry_blob);
             self.allocator.free(self.entries);
             self.entry_blob = emptyU8Slice();
+            self.owns_entry_blob = false;
         } else {
             freeEntrySlice(self.allocator, self.entries);
         }
@@ -894,9 +966,10 @@ pub const Dictionary = struct {
         }
 
         if (self.unk_feature_blob.len != 0) {
-            self.allocator.free(self.unk_feature_blob);
+            if (self.owns_unk_feature_blob) self.allocator.free(self.unk_feature_blob);
             self.allocator.free(self.unk_entries);
             self.unk_feature_blob = emptyU8Slice();
+            self.owns_unk_feature_blob = false;
         } else {
             freeUnkSlice(self.allocator, self.unk_entries);
         }
@@ -1369,6 +1442,10 @@ fn emptyEntrySlice() []Entry {
     return @constCast(&[_]Entry{});
 }
 
+fn emptyFeatureRefSlice() []FeatureRef {
+    return @constCast(&[_]FeatureRef{});
+}
+
 fn emptyUnkEntrySlice() []UnkEntry {
     return @constCast(&[_]UnkEntry{});
 }
@@ -1550,7 +1627,23 @@ fn scanBinaryEntryBlobLen(bytes: []const u8, start_cursor: usize, entry_count: u
         _ = try readI32(bytes, &cursor);
         const feature_len: usize = @intCast(try readU32(bytes, &cursor));
         total = try std.math.add(usize, total, surface_len);
-        total = try std.math.add(usize, total, feature_len + 1);
+        total = try std.math.add(usize, total, feature_len);
+        _ = try readSlice(bytes, &cursor, surface_len);
+        _ = try readSlice(bytes, &cursor, feature_len);
+    }
+    return total;
+}
+
+fn scanBinaryEntryFeatureBlobLen(bytes: []const u8, start_cursor: usize, entry_count: usize) !usize {
+    var cursor = start_cursor;
+    var total: usize = 0;
+    for (0..entry_count) |_| {
+        const surface_len: usize = @intCast(try readU32(bytes, &cursor));
+        _ = try readU16(bytes, &cursor);
+        _ = try readU16(bytes, &cursor);
+        _ = try readI32(bytes, &cursor);
+        const feature_len: usize = @intCast(try readU32(bytes, &cursor));
+        total = try std.math.add(usize, total, feature_len);
         _ = try readSlice(bytes, &cursor, surface_len);
         _ = try readSlice(bytes, &cursor, feature_len);
     }
@@ -1566,7 +1659,7 @@ fn scanBinaryUnkFeatureBlobLen(bytes: []const u8, start_cursor: usize, entry_cou
         _ = try readU16(bytes, &cursor);
         _ = try readI32(bytes, &cursor);
         const feature_len: usize = @intCast(try readU32(bytes, &cursor));
-        total = try std.math.add(usize, total, feature_len + 1);
+        total = try std.math.add(usize, total, feature_len);
         _ = try readSlice(bytes, &cursor, feature_len);
     }
     return total;
@@ -1599,7 +1692,7 @@ fn appendCompatibilityEntries(allocator: Allocator, entries: *std.ArrayList(Entr
         .left_id = 5,
         .right_id = 5,
         .word_cost = 4769,
-        .feature = try allocator.dupeZ(u8, "記号,一般,*,*,*,*,―,―,―"),
+        .feature = try allocator.dupe(u8, "記号,一般,*,*,*,*,―,―,―"),
     });
 }
 
@@ -1650,7 +1743,7 @@ fn parseEntryFields(allocator: Allocator, fields: *std.mem.SplitIterator(u8, .sc
     };
 }
 
-fn collectRestCsv(allocator: Allocator, fields: *std.mem.SplitIterator(u8, .scalar)) ![:0]u8 {
+fn collectRestCsv(allocator: Allocator, fields: *std.mem.SplitIterator(u8, .scalar)) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     var first = true;
@@ -1659,9 +1752,7 @@ fn collectRestCsv(allocator: Allocator, fields: *std.mem.SplitIterator(u8, .scal
         try buf.appendSlice(allocator, field);
         first = false;
     }
-    try buf.append(allocator, 0);
-    const owned = try buf.toOwnedSlice(allocator);
-    return owned[0 .. owned.len - 1 :0];
+    return buf.toOwnedSlice(allocator);
 }
 
 fn defaultUnkEntries(allocator: Allocator) ![]UnkEntry {
@@ -1671,7 +1762,7 @@ fn defaultUnkEntries(allocator: Allocator) ![]UnkEntry {
         .left_id = 0,
         .right_id = 0,
         .word_cost = 10_000,
-        .feature = try allocator.dupeZ(u8, "UNK"),
+        .feature = try allocator.dupe(u8, "UNK"),
     };
     return entries;
 }

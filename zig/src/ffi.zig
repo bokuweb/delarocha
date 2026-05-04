@@ -95,6 +95,22 @@ pub export fn delarocha_tokenizer_new_binary_bytes(bytes_ptr: [*]const u8, bytes
     return tokenizer;
 }
 
+pub export fn delarocha_tokenizer_new_binary_borrowed_bytes(bytes_ptr: [*]const u8, bytes_len: usize) ?*Tokenizer {
+    const tokenizer = c_allocator.create(Tokenizer) catch {
+        setLastError("out of memory", .{});
+        return null;
+    };
+    tokenizer.* = .{
+        .allocator = c_allocator,
+        .dictionary = Dictionary.fromBorrowedBinaryBytes(c_allocator, bytes_ptr[0..bytes_len]) catch |err| {
+            c_allocator.destroy(tokenizer);
+            setLastError("failed to load borrowed binary dictionary bytes: {s}", .{@errorName(err)});
+            return null;
+        },
+    };
+    return tokenizer;
+}
+
 pub export fn delarocha_tokenizer_new_binary_count_only(path: [*:0]const u8) ?*Tokenizer {
     const tokenizer = delarocha_tokenizer_new_binary(path) orelse return null;
     tokenizer.dictionary.discardFullTokenDataForCount();
@@ -276,6 +292,10 @@ pub export fn delarocha_tokens_copy_spans(
     return tokens.len;
 }
 
-pub export fn delarocha_token_feature(worker: ?*const Worker, index: usize) [*:0]const u8 {
-    return if (worker) |ptr| ptr.tokens.items[index].feature else "UNK";
+pub export fn delarocha_token_feature(worker: ?*const Worker, index: usize) [*]const u8 {
+    return if (worker) |ptr| ptr.tokens.items[index].feature.ptr else "UNK";
+}
+
+pub export fn delarocha_token_feature_len(worker: ?*const Worker, index: usize) usize {
+    return if (worker) |ptr| ptr.tokens.items[index].feature.len else 3;
 }

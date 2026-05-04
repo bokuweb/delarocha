@@ -96,6 +96,35 @@ fn zig_ffi_reads_binary_dictionary_from_bytes() {
 }
 
 #[test]
+fn zig_ffi_mmap_binary_dictionary_keeps_compact_features() {
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let lex_path = temp_dir.path().join("lex.csv");
+    let binary_path = temp_dir.path().join("compact.dic");
+    let mut lexicon = String::new();
+    for index in 0..33 {
+        lexicon.push_str(&format!("語{index},0,0,10,feature-{index}\n"));
+    }
+    std::fs::write(&lex_path, lexicon).expect("write large enough lexicon");
+
+    ZigTokenizer::write_binary_from_raw_paths(
+        &lex_path,
+        fixture_dir.join("matrix.def"),
+        fixture_dir.join("char.def"),
+        fixture_dir.join("unk.def"),
+        &binary_path,
+    )
+    .expect("Zig writes compact binary dictionary");
+    let tokenizer =
+        ZigTokenizer::from_binary_path(&binary_path).expect("Zig tokenizer mmaps binary fixture");
+    let mut worker = tokenizer.create_worker().expect("Zig worker is created");
+
+    let tokens = worker.tokenize("語32").expect("Zig tokenize succeeds");
+    assert_eq!(tokens[0].surface, "語32");
+    assert_eq!(tokens[0].feature, "feature-32");
+}
+
+#[test]
 fn zig_ffi_count_only_matches_full_count() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
     let temp_dir = tempfile::tempdir().expect("create temp dir");
