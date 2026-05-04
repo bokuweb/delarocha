@@ -125,7 +125,20 @@ zig build bench -Doptimize=ReleaseFast
 
 ## Rust Binding To Zig C ABI
 
-The `zig-ffi` feature compiles `zig/src/lib.zig` into a static library from `bindings/rust/build.rs`.
+The `zig-ffi` feature links a prebuilt static Zig library for common Rust
+targets, so downstream crates can use the Rust crate without installing Zig.
+The bundled targets are:
+
+- `aarch64-apple-darwin`
+- `x86_64-apple-darwin`
+- `aarch64-unknown-linux-gnu`
+- `x86_64-unknown-linux-gnu`
+- `i686-pc-windows-msvc`
+- `x86_64-pc-windows-msvc`
+
+Set `DELAROCHA_BUILD_ZIG=1` to rebuild the static library from
+`zig/src/lib.zig`. Unsupported targets also fall back to building from Zig
+sources, so those environments still need Zig installed.
 
 ```bash
 cargo test -p delarocha --features zig-ffi
