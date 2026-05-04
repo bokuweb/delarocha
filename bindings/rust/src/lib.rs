@@ -7,6 +7,9 @@ use std::ops::Range;
 #[cfg(feature = "vibrato-system")]
 use std::path::Path;
 
+#[cfg(feature = "vibrato-system")]
+pub use vibrato;
+
 const UNKNOWN_WORD_BASE: u32 = 1 << 31;
 const USER_WORD_BASE: u32 = 1 << 30;
 
@@ -293,6 +296,7 @@ impl VibratoSystemDictionary {
     }
 
     /// Creates a tokenizer backed by the loaded Vibrato system dictionary.
+    #[inline]
     pub fn into_tokenizer(self) -> VibratoSystemTokenizer {
         VibratoSystemTokenizer {
             inner: vibrato::Tokenizer::new(self.inner),
@@ -303,6 +307,7 @@ impl VibratoSystemDictionary {
 #[cfg(feature = "vibrato-system")]
 impl VibratoSystemTokenizer {
     /// Creates a tokenizer backed by a loaded Vibrato system dictionary.
+    #[inline]
     pub fn new(dictionary: VibratoSystemDictionary) -> Self {
         dictionary.into_tokenizer()
     }
@@ -317,12 +322,14 @@ impl VibratoSystemTokenizer {
     }
 
     /// Mirrors Vibrato's maximum unknown grouping length option.
+    #[inline]
     pub fn max_grouping_len(mut self, max_grouping_len: usize) -> Self {
         self.inner = self.inner.max_grouping_len(max_grouping_len);
         self
     }
 
     /// Creates a reusable worker for repeated tokenization with stable scratch buffers.
+    #[inline]
     pub fn new_worker(&self) -> VibratoSystemWorker<'_> {
         VibratoSystemWorker {
             inner: self.inner.new_worker(),
@@ -342,30 +349,68 @@ impl VibratoSystemTokenizer {
 
 #[cfg(feature = "vibrato-system")]
 impl<'a> VibratoSystemWorker<'a> {
+    /// Borrows the underlying Vibrato worker for callers that need exact Vibrato hot-path access.
+    #[inline]
+    pub fn as_vibrato_worker(&self) -> &vibrato::tokenizer::worker::Worker<'a> {
+        &self.inner
+    }
+
+    /// Mutably borrows the underlying Vibrato worker for callers that need exact Vibrato hot-path access.
+    #[inline]
+    pub fn as_vibrato_worker_mut(&mut self) -> &mut vibrato::tokenizer::worker::Worker<'a> {
+        &mut self.inner
+    }
+
     /// Resets the reusable worker to a new UTF-8 input sentence.
+    #[inline]
     pub fn reset_sentence(&mut self, input: &str) {
         self.inner.reset_sentence(input);
     }
 
     /// Runs tokenization for the sentence currently set on this worker.
+    #[inline]
     pub fn tokenize_current(&mut self) {
         self.inner.tokenize();
     }
 
     /// Resets this worker to `input`, tokenizes it, and keeps borrowed tokens available.
+    #[inline]
     pub fn tokenize(&mut self, input: &str) {
         self.reset_sentence(input);
         self.tokenize_current();
     }
 
     /// Returns borrowed tokens without allocating an owned token vector.
+    #[inline]
     pub fn token_iter(&self) -> impl Iterator<Item = VibratoSystemToken<'_, 'a>> + '_ {
         self.inner
             .token_iter()
             .map(|inner| VibratoSystemToken { inner })
     }
 
+    /// Calls `f` for each borrowed token without constructing an intermediate iterator chain.
+    #[inline]
+    pub fn for_each_token<F>(&self, mut f: F)
+    where
+        F: FnMut(usize, VibratoSystemToken<'_, 'a>),
+    {
+        for (index, inner) in self.inner.token_iter().enumerate() {
+            f(index, VibratoSystemToken { inner });
+        }
+    }
+
+    /// Tokenizes `input` and calls `f` for each borrowed token.
+    #[inline]
+    pub fn tokenize_with<F>(&mut self, input: &str, f: F)
+    where
+        F: FnMut(usize, VibratoSystemToken<'_, 'a>),
+    {
+        self.tokenize(input);
+        self.for_each_token(f);
+    }
+
     /// Returns the number of tokens produced by the last tokenization.
+    #[inline]
     pub fn num_tokens(&self) -> usize {
         self.inner.num_tokens()
     }
@@ -374,26 +419,37 @@ impl<'a> VibratoSystemWorker<'a> {
 #[cfg(feature = "vibrato-system")]
 impl VibratoSystemToken<'_, '_> {
     /// Gets the token surface as a borrowed slice of the input sentence.
+    #[inline]
     pub fn surface(&self) -> &str {
         self.inner.surface()
     }
 
     /// Gets the token feature string borrowed from the dictionary.
+    #[inline]
     pub fn feature(&self) -> &str {
         self.inner.feature()
     }
 
     /// Gets the token byte range in the input sentence.
+    #[inline]
     pub fn range_byte(&self) -> Range<usize> {
         self.inner.range_byte()
     }
 
     /// Gets the token character range in the input sentence.
+    #[inline]
     pub fn range_char(&self) -> Range<usize> {
         self.inner.range_char()
     }
 
+    /// Gets the raw Vibrato word id without delarocha lexical-type high bits.
+    #[inline]
+    pub fn raw_word_id(&self) -> u32 {
+        self.inner.word_idx().word_id
+    }
+
     /// Gets the encoded delarocha word id, including lexical-type high bits.
+    #[inline]
     pub fn word_id(&self) -> u32 {
         let word_idx = self.inner.word_idx();
         match word_idx.lex_type {
@@ -404,11 +460,13 @@ impl VibratoSystemToken<'_, '_> {
     }
 
     /// Returns true when this token comes from an unknown-word entry.
+    #[inline]
     pub fn is_unknown(&self) -> bool {
         self.inner.lex_type() == vibrato::dictionary::LexType::Unknown
     }
 
     /// Gets the total path cost from BOS to this token.
+    #[inline]
     pub fn total_cost(&self) -> i32 {
         self.inner.total_cost()
     }
@@ -586,6 +644,7 @@ pub struct Token {
 
 impl Token {
     #[cfg(feature = "vibrato-system")]
+    #[inline]
     fn from_vibrato_system(token: VibratoSystemToken<'_, '_>) -> Self {
         let range_byte = token.range_byte();
         let range_char = token.range_char();

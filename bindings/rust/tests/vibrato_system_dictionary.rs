@@ -73,6 +73,54 @@ fn reusable_worker_exposes_borrowed_tokens() {
 }
 
 #[test]
+fn reusable_worker_can_visit_tokens_with_raw_word_ids() {
+    let tokenizer = VibratoSystemDictionary::read_zstd(compressed_vibrato_dictionary().as_slice())
+        .expect("read compressed Vibrato system dictionary")
+        .into_tokenizer();
+    let mut worker = tokenizer.new_worker();
+
+    let mut visited = Vec::new();
+    worker.tokenize_with("京都東京都", |index, token| {
+        visited.push((
+            index,
+            token.surface().to_owned(),
+            token.raw_word_id(),
+            token.word_id(),
+        ));
+    });
+
+    assert_eq!(worker.num_tokens(), 2);
+    assert_eq!(visited[0].0, 0);
+    assert_eq!(visited[0].1, "京都");
+    assert_eq!(visited[0].2, visited[0].3);
+    assert_eq!(visited[1].0, 1);
+    assert_eq!(visited[1].1, "東京都");
+    assert_eq!(visited[1].2, visited[1].3);
+}
+
+#[test]
+fn reusable_worker_can_expose_underlying_vibrato_worker() {
+    let tokenizer = VibratoSystemDictionary::read_zstd(compressed_vibrato_dictionary().as_slice())
+        .expect("read compressed Vibrato system dictionary")
+        .into_tokenizer();
+    let mut worker = tokenizer.new_worker();
+
+    let vibrato_worker = worker.as_vibrato_worker_mut();
+    vibrato_worker.reset_sentence("京都東京都");
+    vibrato_worker.tokenize();
+
+    assert_eq!(worker.as_vibrato_worker().num_tokens(), 2);
+    assert_eq!(
+        worker
+            .as_vibrato_worker()
+            .token_iter()
+            .map(|token| token.surface().to_owned())
+            .collect::<Vec<_>>(),
+        ["京都", "東京都"]
+    );
+}
+
+#[test]
 fn reads_real_vibrato_system_dic_zst_when_env_set() {
     let Ok(path) = std::env::var("VIBRATO_SYSTEM_DIC") else {
         return;
