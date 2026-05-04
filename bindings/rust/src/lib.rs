@@ -251,6 +251,16 @@ pub struct VibratoSystemTokenizer {
 }
 
 #[cfg(feature = "vibrato-system")]
+pub struct VibratoSystemWorker<'a> {
+    inner: vibrato::tokenizer::worker::Worker<'a>,
+}
+
+#[cfg(feature = "vibrato-system")]
+pub struct VibratoSystemToken<'w, 't> {
+    inner: vibrato::token::Token<'w, 't>,
+}
+
+#[cfg(feature = "vibrato-system")]
 impl VibratoSystemDictionary {
     /// Reads an uncompressed Vibrato `system.dic` stream.
     pub fn read<R>(reader: R) -> Result<Self>
@@ -312,33 +322,95 @@ impl VibratoSystemTokenizer {
         self
     }
 
+    /// Creates a reusable worker for repeated tokenization with stable scratch buffers.
+    pub fn new_worker(&self) -> VibratoSystemWorker<'_> {
+        VibratoSystemWorker {
+            inner: self.inner.new_worker(),
+        }
+    }
+
     /// Tokenizes valid UTF-8 input and maps Vibrato tokens into delarocha tokens.
     pub fn tokenize(&self, input: &str) -> Result<Vec<Token>> {
-        let mut worker = self.inner.new_worker();
-        worker.reset_sentence(input);
-        worker.tokenize();
-
+        let mut worker = self.new_worker();
+        worker.tokenize(input);
         Ok(worker
             .token_iter()
-            .map(|token| {
-                let word_idx = token.word_idx();
-                let word_id = match word_idx.lex_type {
-                    vibrato::dictionary::LexType::System => word_idx.word_id,
-                    vibrato::dictionary::LexType::User => USER_WORD_BASE + word_idx.word_id,
-                    vibrato::dictionary::LexType::Unknown => UNKNOWN_WORD_BASE + word_idx.word_id,
-                };
-                Token {
-                    surface: token.surface().to_owned(),
-                    start: token.range_byte().start,
-                    end: token.range_byte().end,
-                    start_char: token.range_char().start,
-                    end_char: token.range_char().end,
-                    word_id,
-                    feature: token.feature().to_owned(),
-                    total_cost: token.total_cost(),
-                }
-            })
+            .map(Token::from_vibrato_system)
             .collect())
+    }
+}
+
+#[cfg(feature = "vibrato-system")]
+impl<'a> VibratoSystemWorker<'a> {
+    /// Resets the reusable worker to a new UTF-8 input sentence.
+    pub fn reset_sentence(&mut self, input: &str) {
+        self.inner.reset_sentence(input);
+    }
+
+    /// Runs tokenization for the sentence currently set on this worker.
+    pub fn tokenize_current(&mut self) {
+        self.inner.tokenize();
+    }
+
+    /// Resets this worker to `input`, tokenizes it, and keeps borrowed tokens available.
+    pub fn tokenize(&mut self, input: &str) {
+        self.reset_sentence(input);
+        self.tokenize_current();
+    }
+
+    /// Returns borrowed tokens without allocating an owned token vector.
+    pub fn token_iter(&self) -> impl Iterator<Item = VibratoSystemToken<'_, 'a>> + '_ {
+        self.inner
+            .token_iter()
+            .map(|inner| VibratoSystemToken { inner })
+    }
+
+    /// Returns the number of tokens produced by the last tokenization.
+    pub fn num_tokens(&self) -> usize {
+        self.inner.num_tokens()
+    }
+}
+
+#[cfg(feature = "vibrato-system")]
+impl VibratoSystemToken<'_, '_> {
+    /// Gets the token surface as a borrowed slice of the input sentence.
+    pub fn surface(&self) -> &str {
+        self.inner.surface()
+    }
+
+    /// Gets the token feature string borrowed from the dictionary.
+    pub fn feature(&self) -> &str {
+        self.inner.feature()
+    }
+
+    /// Gets the token byte range in the input sentence.
+    pub fn range_byte(&self) -> Range<usize> {
+        self.inner.range_byte()
+    }
+
+    /// Gets the token character range in the input sentence.
+    pub fn range_char(&self) -> Range<usize> {
+        self.inner.range_char()
+    }
+
+    /// Gets the encoded delarocha word id, including lexical-type high bits.
+    pub fn word_id(&self) -> u32 {
+        let word_idx = self.inner.word_idx();
+        match word_idx.lex_type {
+            vibrato::dictionary::LexType::System => word_idx.word_id,
+            vibrato::dictionary::LexType::User => USER_WORD_BASE + word_idx.word_id,
+            vibrato::dictionary::LexType::Unknown => UNKNOWN_WORD_BASE + word_idx.word_id,
+        }
+    }
+
+    /// Returns true when this token comes from an unknown-word entry.
+    pub fn is_unknown(&self) -> bool {
+        self.inner.lex_type() == vibrato::dictionary::LexType::Unknown
+    }
+
+    /// Gets the total path cost from BOS to this token.
+    pub fn total_cost(&self) -> i32 {
+        self.inner.total_cost()
     }
 }
 
@@ -513,6 +585,22 @@ pub struct Token {
 }
 
 impl Token {
+    #[cfg(feature = "vibrato-system")]
+    fn from_vibrato_system(token: VibratoSystemToken<'_, '_>) -> Self {
+        let range_byte = token.range_byte();
+        let range_char = token.range_char();
+        Self {
+            surface: token.surface().to_owned(),
+            start: range_byte.start,
+            end: range_byte.end,
+            start_char: range_char.start,
+            end_char: range_char.end,
+            word_id: token.word_id(),
+            feature: token.feature().to_owned(),
+            total_cost: token.total_cost(),
+        }
+    }
+
     pub fn byte_range(&self) -> Range<usize> {
         self.start..self.end
     }
