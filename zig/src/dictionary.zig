@@ -34,18 +34,18 @@ pub const CharRange = struct {
     category_ids: []usize,
 };
 
-pub const TrieEdge = struct {
-    byte: u8,
-    child: u32,
+pub const TrieEdge = extern struct {
+    byte: u8 align(1),
+    child: u32 align(1),
 };
 
-pub const TrieNode = struct {
-    edge_start: u32,
-    edge_len: u16,
-    word_start: u32,
-    word_len: u32,
-    count_word_start: u32,
-    count_word_len: u32,
+pub const TrieNode = extern struct {
+    edge_start: u32 align(1),
+    edge_len: u16 align(1),
+    word_start: u32 align(1),
+    word_len: u32 align(1),
+    count_word_start: u32 align(1),
+    count_word_len: u32 align(1),
 };
 
 pub const TrieTerm = struct {
