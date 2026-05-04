@@ -107,7 +107,7 @@ enum OutputMode {
     Wakati,
 }
 
-fn required<'a>(name: &str, value: Option<String>) -> Result<String> {
+fn required(name: &str, value: Option<String>) -> Result<String> {
     value.ok_or_else(|| delarocha::Error::InvalidDictionary(format!("{name} is required")))
 }
 

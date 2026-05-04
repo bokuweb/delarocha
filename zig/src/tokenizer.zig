@@ -12,7 +12,7 @@ pub const Token = struct {
     start: usize,
     end: usize,
     word_id: u32,
-    feature: [:0]const u8,
+    feature: []const u8,
     total_cost: i32,
 
     pub fn isUnknown(self: Token) bool {
@@ -173,7 +173,7 @@ pub const Worker = struct {
             if (self.dictionary.user_entries.len != 0) {
                 try self.appendEntries(input, begin, self.dictionary.user_entries, 1 << 30, &emitted);
             }
-            if (self.dictionary.entries.len <= 32) {
+            if (self.dictionary.trie_pair.len == 0) {
                 try self.appendIndexedEntries(input, begin, &emitted);
             } else {
                 try self.appendTrieEntries(input, begin, &emitted);
@@ -686,9 +686,10 @@ pub const Worker = struct {
         }
     }
 
-    fn featureFor(self: *const Worker, word_id: u32) [:0]const u8 {
+    fn featureFor(self: *const Worker, word_id: u32) []const u8 {
         if (word_id >= unknown_word_base) return self.dictionary.unk_entries[word_id - unknown_word_base].feature;
         if (word_id >= (1 << 30)) return self.dictionary.user_entries[word_id - (1 << 30)].feature;
+        if (self.dictionary.entry_features.len != 0) return self.dictionary.entry_features[word_id].feature;
         return self.dictionary.entries[word_id].feature;
     }
 };
