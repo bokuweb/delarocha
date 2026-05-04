@@ -8,8 +8,9 @@ build = "build.rs"
 
 [features]
 default = []
+vibrato-system = ["dep:vibrato", "dep:zstd"]
 zig-ffi = []
-vibrato-bench = ["dep:vibrato", "dep:zstd"]
+vibrato-bench = ["vibrato-system"]
 
 [dependencies]
 csv = "1"

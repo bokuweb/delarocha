@@ -1,7 +1,11 @@
 use std::cmp::Ordering;
 use std::ffi::NulError;
+#[cfg(feature = "vibrato-system")]
+use std::io::BufReader;
 use std::io::Read;
 use std::ops::Range;
+#[cfg(feature = "vibrato-system")]
+use std::path::Path;
 
 const UNKNOWN_WORD_BASE: u32 = 1 << 31;
 const USER_WORD_BASE: u32 = 1 << 30;
@@ -233,6 +237,108 @@ impl Dictionary {
             Vec::new()
         };
         Ok(self)
+    }
+}
+
+#[cfg(feature = "vibrato-system")]
+pub struct VibratoSystemDictionary {
+    inner: vibrato::Dictionary,
+}
+
+#[cfg(feature = "vibrato-system")]
+pub struct VibratoSystemTokenizer {
+    inner: vibrato::Tokenizer,
+}
+
+#[cfg(feature = "vibrato-system")]
+impl VibratoSystemDictionary {
+    /// Reads an uncompressed Vibrato `system.dic` stream.
+    pub fn read<R>(reader: R) -> Result<Self>
+    where
+        R: Read,
+    {
+        let inner = vibrato::Dictionary::read(BufReader::new(reader))
+            .map_err(|err| Error::InvalidDictionary(err.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Reads a zstd-compressed Vibrato `system.dic.zst` stream.
+    pub fn read_zstd<R>(reader: R) -> Result<Self>
+    where
+        R: Read,
+    {
+        let decoder = zstd::Decoder::new(reader)?;
+        Self::read(decoder)
+    }
+
+    /// Reads `system.dic` or `system.dic.zst`, selected by the file extension.
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let file = std::fs::File::open(path)?;
+        if path.extension().is_some_and(|extension| extension == "zst") {
+            Self::read_zstd(file)
+        } else {
+            Self::read(file)
+        }
+    }
+
+    /// Creates a tokenizer backed by the loaded Vibrato system dictionary.
+    pub fn into_tokenizer(self) -> VibratoSystemTokenizer {
+        VibratoSystemTokenizer {
+            inner: vibrato::Tokenizer::new(self.inner),
+        }
+    }
+}
+
+#[cfg(feature = "vibrato-system")]
+impl VibratoSystemTokenizer {
+    /// Creates a tokenizer backed by a loaded Vibrato system dictionary.
+    pub fn new(dictionary: VibratoSystemDictionary) -> Self {
+        dictionary.into_tokenizer()
+    }
+
+    /// Mirrors Vibrato's MeCab-compatible space skipping option.
+    pub fn ignore_space(mut self, yes: bool) -> Result<Self> {
+        self.inner = self
+            .inner
+            .ignore_space(yes)
+            .map_err(|err| Error::InvalidDictionary(err.to_string()))?;
+        Ok(self)
+    }
+
+    /// Mirrors Vibrato's maximum unknown grouping length option.
+    pub fn max_grouping_len(mut self, max_grouping_len: usize) -> Self {
+        self.inner = self.inner.max_grouping_len(max_grouping_len);
+        self
+    }
+
+    /// Tokenizes valid UTF-8 input and maps Vibrato tokens into delarocha tokens.
+    pub fn tokenize(&self, input: &str) -> Result<Vec<Token>> {
+        let mut worker = self.inner.new_worker();
+        worker.reset_sentence(input);
+        worker.tokenize();
+
+        Ok(worker
+            .token_iter()
+            .map(|token| {
+                let word_idx = token.word_idx();
+                let word_id = match word_idx.lex_type {
+                    vibrato::dictionary::LexType::System => word_idx.word_id,
+                    vibrato::dictionary::LexType::User => USER_WORD_BASE + word_idx.word_id,
+                    vibrato::dictionary::LexType::Unknown => UNKNOWN_WORD_BASE + word_idx.word_id,
+                };
+                Token {
+                    surface: token.surface().to_owned(),
+                    start: token.range_byte().start,
+                    end: token.range_byte().end,
+                    start_char: token.range_char().start,
+                    end_char: token.range_char().end,
+                    word_id,
+                    feature: token.feature().to_owned(),
+                    total_cost: token.total_cost(),
+                }
+            })
+            .collect())
     }
 }
 
