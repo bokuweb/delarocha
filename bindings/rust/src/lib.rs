@@ -1254,6 +1254,10 @@ pub mod ffi {
             unk_path: *const std::ffi::c_char,
         ) -> *mut RawTokenizer;
         fn delarocha_tokenizer_new_binary(path: *const std::ffi::c_char) -> *mut RawTokenizer;
+        fn delarocha_tokenizer_new_binary_bytes(
+            bytes_ptr: *const u8,
+            bytes_len: usize,
+        ) -> *mut RawTokenizer;
         fn delarocha_tokenizer_new_binary_count_only(
             path: *const std::ffi::c_char,
         ) -> *mut RawTokenizer;
@@ -1306,6 +1310,14 @@ pub mod ffi {
         raw: NonNull<RawWorker>,
         _tokenizer: PhantomData<&'tokenizer ZigTokenizer>,
     }
+
+    // The Zig handles are opaque pointers to native tokenizer/worker state.
+    // Rust never aliases mutable access across threads: callers need `&mut
+    // ZigWorker` to tokenize, and tokenizer data is immutable after loading.
+    unsafe impl Send for ZigTokenizer {}
+    unsafe impl Sync for ZigTokenizer {}
+    unsafe impl Send for ZigWorker<'_> {}
+    unsafe impl Sync for ZigWorker<'_> {}
 
     pub struct ZigBatch<'input> {
         ptrs: Vec<*const u8>,
@@ -1407,6 +1419,14 @@ pub mod ffi {
             Ok(Self { raw })
         }
 
+        pub fn from_binary_bytes(bytes: &[u8]) -> Result<Self> {
+            // The native loader copies dictionary data into Zig-owned storage,
+            // so the caller may drop the byte slice after construction.
+            let raw = unsafe { delarocha_tokenizer_new_binary_bytes(bytes.as_ptr(), bytes.len()) };
+            let raw = NonNull::new(raw).ok_or_else(last_error)?;
+            Ok(Self { raw })
+        }
+
         pub fn count_only_from_binary_path(path: impl AsRef<Path>) -> Result<Self> {
             let path = CString::new(path.as_ref().as_os_str().to_string_lossy().as_bytes())?;
             let raw = unsafe { delarocha_tokenizer_new_binary_count_only(path.as_ptr()) };
@@ -1473,6 +1493,50 @@ pub mod ffi {
     }
 
     impl ZigWorker<'_> {
+        pub fn tokenize_raw(&mut self, input: &str) -> Result<usize> {
+            // Use the byte-oriented entry point so inputs containing NUL bytes
+            // remain valid and no temporary CString allocation is required.
+            let status =
+                unsafe { delarocha_tokenize_bytes(self.raw.as_ptr(), input.as_ptr(), input.len()) };
+            if status != 0 {
+                return Err(last_error());
+            }
+            Ok(unsafe { delarocha_token_count(self.raw.as_ptr()) })
+        }
+
+        pub fn copy_token_spans(
+            &self,
+            starts: &mut [usize],
+            ends: &mut [usize],
+            word_ids: &mut [u32],
+        ) -> Result<usize> {
+            let cap = starts.len().min(ends.len()).min(word_ids.len());
+            let copied = unsafe {
+                delarocha_tokens_copy_spans(
+                    self.raw.as_ptr(),
+                    starts.as_mut_ptr(),
+                    ends.as_mut_ptr(),
+                    word_ids.as_mut_ptr(),
+                    cap,
+                )
+            };
+            if copied == usize::MAX {
+                return Err(last_error());
+            }
+            Ok(copied)
+        }
+
+        pub fn token_feature(&self, index: usize) -> &str {
+            let feature_ptr = unsafe { delarocha_token_feature(self.raw.as_ptr(), index) };
+            if feature_ptr.is_null() {
+                ""
+            } else {
+                unsafe { CStr::from_ptr(feature_ptr) }
+                    .to_str()
+                    .unwrap_or_default()
+            }
+        }
+
         pub fn tokenize(&mut self, input: &str) -> Result<Vec<Token>> {
             let input_c = CString::new(input)?;
             let status = unsafe { delarocha_tokenize(self.raw.as_ptr(), input_c.as_ptr()) };

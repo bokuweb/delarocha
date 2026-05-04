@@ -74,6 +74,28 @@ fn zig_ffi_writes_and_reads_binary_dictionary() {
 }
 
 #[test]
+fn zig_ffi_reads_binary_dictionary_from_bytes() {
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let binary_path = temp_dir.path().join("fixture.dic");
+
+    ZigTokenizer::write_binary_from_raw_paths(
+        fixture_dir.join("lex.csv"),
+        fixture_dir.join("matrix.def"),
+        fixture_dir.join("char.def"),
+        fixture_dir.join("unk.def"),
+        &binary_path,
+    )
+    .expect("Zig writes binary dictionary");
+    let bytes = std::fs::read(&binary_path).expect("read binary fixture");
+    let tokenizer =
+        ZigTokenizer::from_binary_bytes(&bytes).expect("Zig tokenizer loads binary bytes");
+    let mut worker = tokenizer.create_worker().expect("Zig worker is created");
+
+    assert_eq!(worker.tokenize_count("本とカレー").unwrap(), 2);
+}
+
+#[test]
 fn zig_ffi_count_only_matches_full_count() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
     let temp_dir = tempfile::tempdir().expect("create temp dir");
