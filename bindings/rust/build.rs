@@ -85,6 +85,7 @@ fn zig_target(rust_target: &str) -> &str {
         "aarch64-unknown-linux-gnu" => "aarch64-linux-gnu",
         "x86_64-pc-windows-msvc" => "x86_64-windows-msvc",
         "i686-pc-windows-msvc" => "x86-windows-msvc",
+        "wasm32-unknown-unknown" => "wasm32-freestanding",
         _ => rust_target,
     }
 }
