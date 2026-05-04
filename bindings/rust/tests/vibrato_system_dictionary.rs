@@ -49,6 +49,30 @@ fn reads_vibrato_system_dic_zst_from_reader() {
 }
 
 #[test]
+fn reusable_worker_exposes_borrowed_tokens() {
+    let tokenizer = VibratoSystemDictionary::read_zstd(compressed_vibrato_dictionary().as_slice())
+        .expect("read compressed Vibrato system dictionary")
+        .into_tokenizer();
+    let mut worker = tokenizer.new_worker();
+
+    worker.tokenize("京都東京都");
+    assert_eq!(
+        worker
+            .token_iter()
+            .map(|token| token.surface().to_owned())
+            .collect::<Vec<_>>(),
+        ["京都", "東京都"]
+    );
+
+    worker.tokenize("東京都");
+    let tokens = worker.token_iter().collect::<Vec<_>>();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].surface(), "東京都");
+    assert_eq!(tokens[0].range_byte(), 0..9);
+    assert!(!tokens[0].is_unknown());
+}
+
+#[test]
 fn reads_real_vibrato_system_dic_zst_when_env_set() {
     let Ok(path) = std::env::var("VIBRATO_SYSTEM_DIC") else {
         return;
