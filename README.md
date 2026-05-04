@@ -1,5 +1,7 @@
 # delarocha
 
+[![CI](https://github.com/bokuweb/delarocha/actions/workflows/ci.yml/badge.svg)](https://github.com/bokuweb/delarocha/actions/workflows/ci.yml)
+
 - runtime dictionary loader
 - `Tokenizer` / reusable `Worker`
 - AoS nodes
@@ -31,6 +33,29 @@ This matches the input shape of `vibrato::SystemDictionaryBuilder::from_readers`
 
 ```bash
 cargo test
+```
+
+The CI workflow runs the Rust and Zig unit tests on Linux, macOS, and Windows.
+It also runs `zig-ffi` tests and compiles the Yokohama text benchmark on Linux
+and macOS; Windows currently exercises the pure Rust and Zig test suites while
+the MSVC Zig FFI link path is kept out of the matrix.
+
+## Fuzz-Style Regression Tests
+
+The repository currently uses deterministic seeded fuzz-style tests rather than
+coverage-guided `cargo fuzz` targets. They generate mixed Japanese, ASCII,
+whitespace, punctuation, and emoji inputs on every CI run:
+
+- `bindings/rust/tests/fuzz_tokenizer.rs` verifies Rust tokenization does not
+  fail and that emitted token spans rebuild the original UTF-8 input.
+- `bindings/rust/tests/zig_ffi.rs` verifies Zig binary count-only tokenization
+  returns the same token count as full Zig tokenization for seeded random inputs.
+
+Run them locally with:
+
+```bash
+cargo test -p delarocha
+cargo test -p delarocha --features zig-ffi
 ```
 
 ## CLI

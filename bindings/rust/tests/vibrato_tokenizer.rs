@@ -1,20 +1,10 @@
 use delarocha::{SystemDictionaryBuilder, Tokenizer};
 
-const LEX_CSV: &str = include_str!(
-    "/Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vibrato-0.5.2/src/tests/resources/lex.csv"
-);
-const USER_CSV: &str = include_str!(
-    "/Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vibrato-0.5.2/src/tests/resources/user.csv"
-);
-const MATRIX_DEF: &str = include_str!(
-    "/Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vibrato-0.5.2/src/tests/resources/matrix.def"
-);
-const CHAR_DEF: &str = include_str!(
-    "/Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vibrato-0.5.2/src/tests/resources/char.def"
-);
-const UNK_DEF: &str = include_str!(
-    "/Users/bokuweb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vibrato-0.5.2/src/tests/resources/unk.def"
-);
+const LEX_CSV: &str = include_str!("../../../fixtures/vibrato/lex.csv");
+const USER_CSV: &str = include_str!("../../../fixtures/vibrato/user.csv");
+const MATRIX_DEF: &str = include_str!("../../../fixtures/vibrato/matrix.def");
+const CHAR_DEF: &str = include_str!("../../../fixtures/vibrato/char.def");
+const UNK_DEF: &str = include_str!("../../../fixtures/vibrato/unk.def");
 
 fn dict() -> delarocha::Dictionary {
     SystemDictionaryBuilder::from_readers(

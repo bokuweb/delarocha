@@ -126,6 +126,10 @@ pub const Worker = struct {
     }
 
     pub fn tokenize(self: *Worker, input: []const u8) ![]const Token {
+        if (input.len == 0) {
+            try self.reset(0);
+            return self.tokens.items;
+        }
         const best = try self.buildBestPath(input);
         try self.backtrace(input, best);
         return self.tokens.items;
