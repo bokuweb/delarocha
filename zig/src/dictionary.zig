@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const binary_magic_v1 = "DLRDIC01";
@@ -285,7 +286,7 @@ fn buildRangeBmp(allocator: Allocator, ranges: []const CharRange) ![]u32 {
 pub const ConnectionMatrix = struct {
     left_size: usize,
     right_size: usize,
-    costs: []i16,
+    costs: []align(1) const i16,
 
     pub fn parseMinimal(allocator: Allocator, right_size: usize, left_size: usize, rows: []const []const u8) !ConnectionMatrix {
         var costs: std.ArrayList(i16) = .empty;
@@ -360,18 +361,20 @@ pub const Dictionary = struct {
     unk_index: UnkIndex,
     char_property: CharProperty,
     matrix: ConnectionMatrix,
+    owns_matrix_costs: bool,
     entry_index: EntryIndex,
     trie_nodes: []TrieNode,
     trie_edges: []TrieEdge,
     trie_terms: []TrieTerm,
     trie_count_terms: []TrieCountTerm,
     trie_first: [256]u32,
-    trie_bmp: []u32,
-    trie_pair: []u32,
-    trie_triple: []u32,
-    trie_base: []u32,
-    trie_check: []u32,
-    trie_child: []u32,
+    trie_bmp: []align(1) const u32,
+    trie_pair: []align(1) const u32,
+    trie_triple: []align(1) const u32,
+    trie_base: []align(1) const u32,
+    trie_check: []align(1) const u32,
+    trie_child: []align(1) const u32,
+    owns_trie_u32_tables: bool,
 
     pub fn parseMinimal(allocator: Allocator, input: []const u8) !Dictionary {
         var entries: std.ArrayList(Entry) = .empty;
@@ -418,7 +421,7 @@ pub const Dictionary = struct {
             mutable.deinit();
         }
         const matrix = try ConnectionMatrix.parseMinimal(allocator, right_size, left_size, rows.items);
-        errdefer allocator.free(matrix.costs);
+        errdefer freeI16Slice(allocator, matrix.costs);
         // Large dictionaries use the trie path exclusively; building the
         // first-byte entry index there only consumes memory and load time.
         const entry_index = if (owned_entries.len <= 32) try buildEntryIndex(allocator, owned_entries) else EntryIndex.empty();
@@ -428,11 +431,11 @@ pub const Dictionary = struct {
         const trie = try buildTrie(allocator, owned_entries, &matrix);
         errdefer freeTrie(allocator, trie.nodes, trie.edges, trie.terms, trie.count_terms);
         const trie_pair = if (owned_entries.len <= 32) emptyU32Slice() else try buildTriePair(allocator, trie.nodes, trie.edges);
-        errdefer if (trie_pair.len != 0) allocator.free(trie_pair);
+        errdefer if (trie_pair.len != 0) freeU32Slice(allocator, trie_pair);
         const trie_bmp = if (owned_entries.len <= 32) emptyU32Slice() else try buildTrieBmp(allocator, trie.nodes, trie.edges);
-        errdefer if (trie_bmp.len != 0) allocator.free(trie_bmp);
+        errdefer if (trie_bmp.len != 0) freeU32Slice(allocator, trie_bmp);
         const trie_triple = try buildTrieTriple(allocator, trie.nodes, trie.edges);
-        errdefer if (trie_triple.len != 0) allocator.free(trie_triple);
+        errdefer if (trie_triple.len != 0) freeU32Slice(allocator, trie_triple);
         const double_array = try buildDoubleArray(allocator, trie.nodes, trie.edges);
         errdefer freeDoubleArray(allocator, double_array);
         return .{
@@ -448,6 +451,7 @@ pub const Dictionary = struct {
             .unk_index = unk_index,
             .char_property = char_property,
             .matrix = matrix,
+            .owns_matrix_costs = true,
             .entry_index = entry_index,
             .trie_nodes = trie.nodes,
             .trie_edges = trie.edges,
@@ -460,6 +464,7 @@ pub const Dictionary = struct {
             .trie_base = double_array.base,
             .trie_check = double_array.check,
             .trie_child = double_array.child,
+            .owns_trie_u32_tables = true,
         };
     }
 
@@ -495,7 +500,7 @@ pub const Dictionary = struct {
         const unk_entries = try parseUnkEntries(allocator, unk_def, &char_property);
         errdefer freeUnkSlice(allocator, unk_entries);
         const matrix = try ConnectionMatrix.parseMecab(allocator, matrix_def);
-        errdefer allocator.free(matrix.costs);
+        errdefer freeI16Slice(allocator, matrix.costs);
         // Large dictionaries use the trie path exclusively; building the
         // first-byte entry index there only consumes memory and load time.
         const entry_index = if (entries.len <= 32) try buildEntryIndex(allocator, entries) else EntryIndex.empty();
@@ -505,11 +510,11 @@ pub const Dictionary = struct {
         const trie = try buildTrie(allocator, entries, &matrix);
         errdefer freeTrie(allocator, trie.nodes, trie.edges, trie.terms, trie.count_terms);
         const trie_pair = if (entries.len <= 32) emptyU32Slice() else try buildTriePair(allocator, trie.nodes, trie.edges);
-        errdefer if (trie_pair.len != 0) allocator.free(trie_pair);
+        errdefer if (trie_pair.len != 0) freeU32Slice(allocator, trie_pair);
         const trie_bmp = if (entries.len <= 32) emptyU32Slice() else try buildTrieBmp(allocator, trie.nodes, trie.edges);
-        errdefer if (trie_bmp.len != 0) allocator.free(trie_bmp);
+        errdefer if (trie_bmp.len != 0) freeU32Slice(allocator, trie_bmp);
         const trie_triple = try buildTrieTriple(allocator, trie.nodes, trie.edges);
-        errdefer if (trie_triple.len != 0) allocator.free(trie_triple);
+        errdefer if (trie_triple.len != 0) freeU32Slice(allocator, trie_triple);
         const double_array = try buildDoubleArray(allocator, trie.nodes, trie.edges);
         errdefer freeDoubleArray(allocator, double_array);
         return .{
@@ -525,6 +530,7 @@ pub const Dictionary = struct {
             .unk_index = unk_index,
             .char_property = char_property,
             .matrix = matrix,
+            .owns_matrix_costs = true,
             .entry_index = entry_index,
             .trie_nodes = trie.nodes,
             .trie_edges = trie.edges,
@@ -537,6 +543,7 @@ pub const Dictionary = struct {
             .trie_base = double_array.base,
             .trie_check = double_array.check,
             .trie_child = double_array.child,
+            .owns_trie_u32_tables = true,
         };
     }
 
@@ -659,6 +666,7 @@ pub const Dictionary = struct {
         const range_count = try readU32(bytes, &cursor);
         const right_size = try readU32(bytes, &cursor);
         const left_size = try readU32(bytes, &cursor);
+        const borrow_binary_tables = !copy_feature_blob and builtin.cpu.arch.endian() == .little;
 
         const compact_entry_features = has_prebuilt_trie and entry_count > 32;
         const entries = if (compact_entry_features)
@@ -786,9 +794,8 @@ pub const Dictionary = struct {
         }
 
         const matrix_len = @as(usize, @intCast(right_size)) * @as(usize, @intCast(left_size));
-        const costs = try allocator.alloc(i16, matrix_len);
-        errdefer allocator.free(costs);
-        for (costs) |*cost| cost.* = try readI16(bytes, &cursor);
+        const costs = try readI16Slice(allocator, bytes, &cursor, matrix_len, borrow_binary_tables);
+        errdefer if (!borrow_binary_tables) allocator.free(costs);
         const matrix: ConnectionMatrix = .{ .left_size = @intCast(left_size), .right_size = @intCast(right_size), .costs = costs };
 
         const invoke_bmp = try buildInvokeBmp(allocator, categories, ranges);
@@ -813,12 +820,13 @@ pub const Dictionary = struct {
         var trie_edges: []TrieEdge = &.{};
         var trie_terms: []TrieTerm = &.{};
         var trie_count_terms: []TrieCountTerm = &.{};
-        var trie_pair: []u32 = &.{};
-        var trie_bmp: []u32 = &.{};
-        var trie_triple: []u32 = &.{};
-        var trie_base: []u32 = &.{};
-        var trie_check: []u32 = &.{};
-        var trie_child: []u32 = &.{};
+        var trie_pair: []align(1) const u32 = &.{};
+        var trie_bmp: []align(1) const u32 = &.{};
+        var trie_triple: []align(1) const u32 = &.{};
+        var trie_base: []align(1) const u32 = &.{};
+        var trie_check: []align(1) const u32 = &.{};
+        var trie_child: []align(1) const u32 = &.{};
+        var owns_trie_u32_tables = true;
 
         if (has_prebuilt_trie) {
             const trie_node_count = try readU32(bytes, &cursor);
@@ -840,18 +848,19 @@ pub const Dictionary = struct {
             errdefer allocator.free(trie_terms);
             trie_count_terms = try readTrieCountTerms(allocator, bytes, &cursor, @intCast(trie_count_term_count));
             errdefer allocator.free(trie_count_terms);
-            trie_pair = try readU32SliceAlloc(allocator, bytes, &cursor, @intCast(trie_pair_count));
-            errdefer if (trie_pair.len != 0) allocator.free(trie_pair);
-            trie_bmp = try readU32SliceAlloc(allocator, bytes, &cursor, @intCast(trie_bmp_count));
-            errdefer if (trie_bmp.len != 0) allocator.free(trie_bmp);
-            trie_triple = try readU32SliceAlloc(allocator, bytes, &cursor, @intCast(trie_triple_count));
-            errdefer if (trie_triple.len != 0) allocator.free(trie_triple);
-            trie_base = try readU32SliceAlloc(allocator, bytes, &cursor, @intCast(trie_base_count));
-            errdefer if (trie_base.len != 0) allocator.free(trie_base);
-            trie_check = try readU32SliceAlloc(allocator, bytes, &cursor, @intCast(trie_check_count));
-            errdefer if (trie_check.len != 0) allocator.free(trie_check);
-            trie_child = try readU32SliceAlloc(allocator, bytes, &cursor, @intCast(trie_child_count));
-            errdefer if (trie_child.len != 0) allocator.free(trie_child);
+            owns_trie_u32_tables = !borrow_binary_tables;
+            trie_pair = try readU32Slice(allocator, bytes, &cursor, @intCast(trie_pair_count), borrow_binary_tables);
+            errdefer if (owns_trie_u32_tables and trie_pair.len != 0) freeU32Slice(allocator, trie_pair);
+            trie_bmp = try readU32Slice(allocator, bytes, &cursor, @intCast(trie_bmp_count), borrow_binary_tables);
+            errdefer if (owns_trie_u32_tables and trie_bmp.len != 0) freeU32Slice(allocator, trie_bmp);
+            trie_triple = try readU32Slice(allocator, bytes, &cursor, @intCast(trie_triple_count), borrow_binary_tables);
+            errdefer if (owns_trie_u32_tables and trie_triple.len != 0) freeU32Slice(allocator, trie_triple);
+            trie_base = try readU32Slice(allocator, bytes, &cursor, @intCast(trie_base_count), borrow_binary_tables);
+            errdefer if (owns_trie_u32_tables and trie_base.len != 0) freeU32Slice(allocator, trie_base);
+            trie_check = try readU32Slice(allocator, bytes, &cursor, @intCast(trie_check_count), borrow_binary_tables);
+            errdefer if (owns_trie_u32_tables and trie_check.len != 0) freeU32Slice(allocator, trie_check);
+            trie_child = try readU32Slice(allocator, bytes, &cursor, @intCast(trie_child_count), borrow_binary_tables);
+            errdefer if (owns_trie_u32_tables and trie_child.len != 0) freeU32Slice(allocator, trie_child);
         } else {
             // Backward compatibility for DLRDIC01 files. New dictionaries write
             // DLRDIC02 and skip this rebuild path entirely.
@@ -862,16 +871,17 @@ pub const Dictionary = struct {
             trie_count_terms = trie.count_terms;
             errdefer freeTrie(allocator, trie_nodes, trie_edges, trie_terms, trie_count_terms);
             trie_pair = if (entries.len <= 32) emptyU32Slice() else try buildTriePair(allocator, trie_nodes, trie_edges);
-            errdefer if (trie_pair.len != 0) allocator.free(trie_pair);
+            errdefer if (trie_pair.len != 0) freeU32Slice(allocator, trie_pair);
             trie_bmp = if (entries.len <= 32) emptyU32Slice() else try buildTrieBmp(allocator, trie_nodes, trie_edges);
-            errdefer if (trie_bmp.len != 0) allocator.free(trie_bmp);
+            errdefer if (trie_bmp.len != 0) freeU32Slice(allocator, trie_bmp);
             trie_triple = try buildTrieTriple(allocator, trie_nodes, trie_edges);
-            errdefer if (trie_triple.len != 0) allocator.free(trie_triple);
+            errdefer if (trie_triple.len != 0) freeU32Slice(allocator, trie_triple);
             const double_array = try buildDoubleArray(allocator, trie_nodes, trie_edges);
             trie_base = double_array.base;
             trie_check = double_array.check;
             trie_child = double_array.child;
             errdefer freeDoubleArray(allocator, double_array);
+            owns_trie_u32_tables = true;
         }
 
         if (cursor != bytes.len) return error.InvalidDictionary;
@@ -889,6 +899,7 @@ pub const Dictionary = struct {
             .unk_index = unk_index,
             .char_property = char_property,
             .matrix = matrix,
+            .owns_matrix_costs = !borrow_binary_tables,
             .entry_index = entry_index,
             .trie_nodes = trie_nodes,
             .trie_edges = trie_edges,
@@ -901,6 +912,7 @@ pub const Dictionary = struct {
             .trie_base = trie_base,
             .trie_check = trie_check,
             .trie_child = trie_child,
+            .owns_trie_u32_tables = owns_trie_u32_tables,
         };
     }
 
@@ -908,10 +920,12 @@ pub const Dictionary = struct {
         self.entry_index.deinit(self.allocator);
         self.unk_index.deinit(self.allocator);
         freeTrie(self.allocator, self.trie_nodes, self.trie_edges, self.trie_terms, self.trie_count_terms);
-        if (self.trie_bmp.len != 0) self.allocator.free(self.trie_bmp);
-        if (self.trie_pair.len != 0) self.allocator.free(self.trie_pair);
-        if (self.trie_triple.len != 0) self.allocator.free(self.trie_triple);
-        freeDoubleArray(self.allocator, .{ .base = self.trie_base, .check = self.trie_check, .child = self.trie_child });
+        if (self.owns_trie_u32_tables) {
+            if (self.trie_bmp.len != 0) freeU32Slice(self.allocator, self.trie_bmp);
+            if (self.trie_pair.len != 0) freeU32Slice(self.allocator, self.trie_pair);
+            if (self.trie_triple.len != 0) freeU32Slice(self.allocator, self.trie_triple);
+            freeDoubleArray(self.allocator, .{ .base = self.trie_base, .check = self.trie_check, .child = self.trie_child });
+        }
         if (self.entry_features.len != 0) {
             self.allocator.free(self.entry_features);
             if (self.owns_entry_blob) self.allocator.free(self.entry_blob);
@@ -929,7 +943,7 @@ pub const Dictionary = struct {
             freeUnkSlice(self.allocator, self.unk_entries);
         }
         self.char_property.deinit();
-        self.allocator.free(self.matrix.costs);
+        if (self.owns_matrix_costs) freeI16Slice(self.allocator, self.matrix.costs);
     }
 
     pub fn discardFullTokenDataForCount(self: *Dictionary) void {
@@ -990,9 +1004,9 @@ const TrieBuildResult = struct {
 };
 
 pub const DoubleArray = struct {
-    base: []u32,
-    check: []u32,
-    child: []u32,
+    base: []align(1) const u32,
+    check: []align(1) const u32,
+    child: []align(1) const u32,
 };
 
 pub const invalid_trie_node: u32 = std.math.maxInt(u32);
@@ -1226,7 +1240,7 @@ fn buildTrieFirst(nodes: []const TrieNode, edges: []const TrieEdge) [256]u32 {
     return first;
 }
 
-fn buildTriePair(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) ![]u32 {
+fn buildTriePair(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) ![]align(1) const u32 {
     // The dense two-byte root table is small enough (256 KiB) to be worth it:
     // it skips two levels of root traversal for UTF-8-heavy Japanese input and
     // still fits comfortably in cache compared with the rejected triple table.
@@ -1246,7 +1260,7 @@ fn buildTriePair(allocator: Allocator, nodes: []const TrieNode, edges: []const T
     return pair;
 }
 
-fn buildTrieBmp(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) ![]u32 {
+fn buildTrieBmp(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) ![]align(1) const u32 {
     // Most Japanese dictionary surfaces start with one BMP codepoint encoded as
     // three UTF-8 bytes. This table jumps directly from that first codepoint to
     // the trie node for 256 KiB, avoiding the 64 MiB cost of a dense raw 3-byte
@@ -1288,7 +1302,7 @@ fn buildTrieBmp(allocator: Allocator, nodes: []const TrieNode, edges: []const Tr
     return bmp;
 }
 
-fn buildTrieTriple(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) ![]u32 {
+fn buildTrieTriple(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge) ![]align(1) const u32 {
     _ = allocator;
     _ = nodes;
     _ = edges;
@@ -1399,9 +1413,9 @@ fn ensureDoubleArrayCapacity(
 }
 
 fn freeDoubleArray(allocator: Allocator, double_array: DoubleArray) void {
-    if (double_array.base.len != 0) allocator.free(double_array.base);
-    if (double_array.check.len != 0) allocator.free(double_array.check);
-    if (double_array.child.len != 0) allocator.free(double_array.child);
+    if (double_array.base.len != 0) freeU32Slice(allocator, double_array.base);
+    if (double_array.check.len != 0) freeU32Slice(allocator, double_array.check);
+    if (double_array.child.len != 0) freeU32Slice(allocator, double_array.child);
 }
 
 pub inline fn findEdge(nodes: []const TrieNode, edges: []const TrieEdge, node_index: usize, byte: u8) ?usize {
@@ -1430,8 +1444,12 @@ pub inline fn findEdge(nodes: []const TrieNode, edges: []const TrieEdge, node_in
     return null;
 }
 
-fn emptyU32Slice() []u32 {
+fn emptyU32Slice() []align(1) const u32 {
     return @constCast(&[_]u32{});
+}
+
+fn emptyI16Slice() []align(1) const i16 {
+    return @constCast(&[_]i16{});
 }
 
 fn emptyU8Slice() []u8 {
@@ -1454,7 +1472,7 @@ fn emptyTrieTermSlice() []TrieTerm {
     return @constCast(&[_]TrieTerm{});
 }
 
-pub inline fn findDoubleArray(base: []const u32, check: []const u32, child: []const u32, node_index: usize, byte: u8) ?usize {
+pub inline fn findDoubleArray(base: []align(1) const u32, check: []align(1) const u32, child: []align(1) const u32, node_index: usize, byte: u8) ?usize {
     if (base.len == 0) return null;
     const node_base = base[node_index];
     if (node_base == 0) return null;
@@ -1488,6 +1506,16 @@ fn freeTrie(allocator: Allocator, nodes: []TrieNode, edges: []TrieEdge, terms_sl
     allocator.free(count_terms_slice);
 }
 
+fn freeU32Slice(allocator: Allocator, values: []align(1) const u32) void {
+    const aligned: []const u32 = @alignCast(values);
+    allocator.free(@constCast(aligned));
+}
+
+fn freeI16Slice(allocator: Allocator, values: []align(1) const i16) void {
+    const aligned: []const i16 = @alignCast(values);
+    allocator.free(@constCast(aligned));
+}
+
 pub fn readFileAlloc(allocator: Allocator, path: []const u8) ![]u8 {
     var io_instance: std.Io.Threaded = .init(allocator, .{});
     defer io_instance.deinit();
@@ -1518,7 +1546,7 @@ fn appendI32(allocator: Allocator, bytes: *std.ArrayList(u8), value: i32) !void 
     try appendU32(allocator, bytes, @bitCast(value));
 }
 
-fn appendU32Slice(allocator: Allocator, bytes: *std.ArrayList(u8), values: []const u32) !void {
+fn appendU32Slice(allocator: Allocator, bytes: *std.ArrayList(u8), values: []align(1) const u32) !void {
     for (values) |value| try appendU32(allocator, bytes, value);
 }
 
@@ -1540,6 +1568,18 @@ fn readU16(bytes: []const u8, cursor: *usize) !u16 {
 
 fn readI16(bytes: []const u8, cursor: *usize) !i16 {
     return @bitCast(try readU16(bytes, cursor));
+}
+
+fn readI16Slice(allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize, borrow: bool) ![]align(1) const i16 {
+    if (count == 0) return emptyI16Slice();
+    if (borrow) {
+        const raw = try readSlice(bytes, cursor, try std.math.mul(usize, count, 2));
+        return std.mem.bytesAsSlice(i16, raw);
+    }
+    const values = try allocator.alloc(i16, count);
+    errdefer allocator.free(values);
+    for (values) |*value| value.* = try readI16(bytes, cursor);
+    return values;
 }
 
 fn readU32(bytes: []const u8, cursor: *usize) !u32 {
@@ -1609,8 +1649,12 @@ fn readTrieCountTerms(allocator: Allocator, bytes: []const u8, cursor: *usize, c
     return terms;
 }
 
-fn readU32SliceAlloc(allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize) ![]u32 {
+fn readU32Slice(allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize, borrow: bool) ![]align(1) const u32 {
     if (count == 0) return emptyU32Slice();
+    if (borrow) {
+        const raw = try readSlice(bytes, cursor, try std.math.mul(usize, count, 4));
+        return std.mem.bytesAsSlice(u32, raw);
+    }
     const values = try allocator.alloc(u32, count);
     errdefer allocator.free(values);
     for (values) |*value| value.* = try readU32(bytes, cursor);
