@@ -71,8 +71,12 @@ pub const UnkTerm = struct {
     word_cost: i32,
 };
 
-pub const FeatureRef = struct {
-    feature: []const u8,
+// Binary dictionaries keep all known-word features in one blob. Storing an
+// offset and length avoids one slice pointer per entry while preserving cheap
+// feature lookup during full token backtrace.
+pub const FeatureRef = extern struct {
+    offset: u32 align(1),
+    len: u32 align(1),
 };
 
 pub const EntryIndex = struct {
@@ -698,13 +702,14 @@ pub const Dictionary = struct {
             const surface = try readSlice(bytes, &cursor, surface_len);
             const feature = try readSlice(bytes, &cursor, feature_len);
             if (compact_entry_features) {
-                const entry_feature = if (copy_feature_blob) copied: {
+                const feature_offset = if (copy_feature_blob) copied: {
                     const feature_start = entry_blob_cursor;
                     @memcpy(entry_blob_owned[feature_start .. feature_start + feature_len], feature);
                     entry_blob_cursor += feature_len;
-                    break :copied entry_blob_owned[feature_start .. feature_start + feature_len];
-                } else feature;
-                entry_features[entry_index] = .{ .feature = entry_feature };
+                    break :copied feature_start;
+                } else @intFromPtr(feature.ptr) - @intFromPtr(entry_blob.ptr);
+                if (feature_offset > std.math.maxInt(u32) or feature_len > std.math.maxInt(u32)) return error.InvalidDictionary;
+                entry_features[entry_index] = .{ .offset = @intCast(feature_offset), .len = @intCast(feature_len) };
                 continue;
             }
             const entry_surface, const entry_feature = if (copy_feature_blob) copied: {
@@ -974,11 +979,6 @@ pub const Dictionary = struct {
 
         self.allocator.free(self.trie_terms);
         self.trie_terms = emptyTrieTermSlice();
-        for (self.trie_nodes) |*node| {
-            node.word_start = 0;
-            node.word_len = 0;
-        }
-
         if (self.unk_feature_blob.len != 0) {
             if (self.owns_unk_feature_blob) self.allocator.free(self.unk_feature_blob);
             self.allocator.free(self.unk_entries);
@@ -988,6 +988,15 @@ pub const Dictionary = struct {
             freeUnkSlice(self.allocator, self.unk_entries);
         }
         self.unk_entries = emptyUnkEntrySlice();
+    }
+
+    // Rebuild the feature slice only for the final best-path tokens. The hot
+    // lattice expansion path does not need known-word feature text.
+    pub inline fn entryFeature(self: *const Dictionary, word_id: u32) []const u8 {
+        const ref = self.entry_features[word_id];
+        const start: usize = @intCast(ref.offset);
+        const len: usize = @intCast(ref.len);
+        return self.entry_blob[start .. start + len];
     }
 };
 
