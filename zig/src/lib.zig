@@ -15,6 +15,7 @@ comptime {
     _ = ffi.delarocha_tokenizer_new_raw;
     _ = ffi.delarocha_tokenizer_new_raw_count_only;
     _ = ffi.delarocha_tokenizer_new_binary;
+    _ = ffi.delarocha_tokenizer_new_binary_bytes;
     _ = ffi.delarocha_tokenizer_new_binary_count_only;
     _ = ffi.delarocha_dictionary_write_binary;
     _ = ffi.delarocha_tokenizer_free;

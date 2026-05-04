@@ -580,7 +580,7 @@ pub const Worker = struct {
         while (prev_index != invalid_node) : (prev_index = self.nodes.items[prev_index].next_end) {
             const prev = self.nodes.items[prev_index];
             const cost = prev.min_cost + self.dictionary.matrix.trustedCost(prev.right_id, candidate.left_id) + candidate.word_cost;
-            if (best_index == null or cost <= best_cost) {
+            if (best_index == null or cost < best_cost) {
                 best_index = prev_index;
                 best_cost = cost;
             }
