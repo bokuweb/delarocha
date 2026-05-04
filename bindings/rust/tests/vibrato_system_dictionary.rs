@@ -72,11 +72,15 @@ fn reads_real_vibrato_system_dic_zst_when_env_set() {
 }
 
 fn compressed_vibrato_dictionary() -> Vec<u8> {
+    let lex_csv = normalize_lf(LEX_CSV);
+    let matrix_def = normalize_lf(MATRIX_DEF);
+    let char_def = normalize_lf(CHAR_DEF);
+    let unk_def = normalize_lf(UNK_DEF);
     let dictionary = vibrato::SystemDictionaryBuilder::from_readers(
-        LEX_CSV.as_bytes(),
-        MATRIX_DEF.as_bytes(),
-        CHAR_DEF.as_bytes(),
-        UNK_DEF.as_bytes(),
+        lex_csv.as_bytes(),
+        matrix_def.as_bytes(),
+        char_def.as_bytes(),
+        unk_def.as_bytes(),
     )
     .expect("build Vibrato fixture dictionary");
     let mut raw = Vec::new();
@@ -84,4 +88,8 @@ fn compressed_vibrato_dictionary() -> Vec<u8> {
         .write(&mut raw)
         .expect("write Vibrato dictionary");
     zstd::stream::encode_all(raw.as_slice(), 0).expect("compress Vibrato dictionary")
+}
+
+fn normalize_lf(input: &str) -> String {
+    input.replace("\r\n", "\n")
 }
