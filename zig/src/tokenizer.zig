@@ -689,7 +689,7 @@ pub const Worker = struct {
     fn featureFor(self: *const Worker, word_id: u32) []const u8 {
         if (word_id >= unknown_word_base) return self.dictionary.unk_entries[word_id - unknown_word_base].feature;
         if (word_id >= (1 << 30)) return self.dictionary.user_entries[word_id - (1 << 30)].feature;
-        if (self.dictionary.entry_features.len != 0) return self.dictionary.entry_features[word_id].feature;
+        if (self.dictionary.entry_features.len != 0) return self.dictionary.entryFeature(word_id);
         return self.dictionary.entries[word_id].feature;
     }
 };
