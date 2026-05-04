@@ -16,8 +16,8 @@ fn seeded_fuzz_tokenize_preserves_input_spans() {
     .expect("fixture dictionary builds");
     let tokenizer = Tokenizer::new(dictionary);
 
-    for seed in 0..512 {
-        let input = fuzz_string(seed);
+    for seed in 0..fuzz_seed_count() {
+        let input = fuzz_string(seed, fuzz_max_len());
         let tokens = tokenizer.tokenize(&input).expect("tokenization succeeds");
         let mut rebuilt = String::new();
         let mut previous_end = 0;
@@ -43,14 +43,34 @@ fn seeded_fuzz_tokenize_preserves_input_spans() {
     }
 }
 
-fn fuzz_string(seed: u64) -> String {
+fn fuzz_seed_count() -> u64 {
+    std::env::var("DELAROCHA_FUZZ_SEEDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(512)
+}
+
+fn fuzz_max_len() -> usize {
+    std::env::var("DELAROCHA_FUZZ_MAX_LEN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(96)
+}
+
+fn fuzz_string(seed: u64, max_len: usize) -> String {
     const POOL: &[char] = &[
         '本', 'と', 'カ', 'レ', 'ー', '東', '京', '都', 'に', '行', 'く', '一', '橋', '大', '学',
         '院', '0', '1', '9', 'a', 'Z', ' ', '\n', '。', '、', '・', 'X', '🍛', '😀',
     ];
 
     let mut rng = XorShift64(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xa5a5_5a5a_dead_beef);
-    let len = (rng.next() % 96) as usize;
+    // Keep CI deterministic and small by default, while allowing local stress
+    // runs to widen the generated input length with DELAROCHA_FUZZ_MAX_LEN.
+    let len = if max_len == 0 {
+        0
+    } else {
+        (rng.next() % max_len as u64) as usize
+    };
     let mut out = String::new();
     for _ in 0..len {
         let ch = POOL[(rng.next() as usize) % POOL.len()];
