@@ -40,11 +40,10 @@ It also runs `zig-ffi` tests and compiles the Yokohama text benchmark on Linux
 and macOS; Windows currently exercises the pure Rust and Zig test suites while
 the MSVC Zig FFI link path is kept out of the matrix.
 
-## Fuzz-Style Regression Tests
+## Fuzzing
 
-The repository currently uses deterministic seeded fuzz-style tests rather than
-coverage-guided `cargo fuzz` targets. They generate mixed Japanese, ASCII,
-whitespace, punctuation, and emoji inputs on every CI run:
+The repository has deterministic seeded fuzz-style tests that generate mixed
+Japanese, ASCII, whitespace, punctuation, and emoji inputs on every CI run:
 
 - `bindings/rust/tests/fuzz_tokenizer.rs` verifies Rust tokenization does not
   fail and that emitted token spans rebuild the original UTF-8 input.
@@ -64,6 +63,17 @@ count and maximum generated input length:
 ```bash
 DELAROCHA_FUZZ_SEEDS=100000 DELAROCHA_FUZZ_MAX_LEN=256 cargo test -p delarocha --test fuzz_tokenizer
 DELAROCHA_FUZZ_SEEDS=100000 DELAROCHA_FUZZ_MAX_LEN=256 cargo test -p delarocha --features zig-ffi --test zig_ffi
+```
+
+Coverage-guided fuzzing uses `cargo-fuzz` with libFuzzer. The `tokenize`
+target fuzzes valid UTF-8 input against token span and surface invariants, and
+the `dictionary` target fuzzes the compact dictionary parser for panic-free
+error handling.
+
+```bash
+cargo install cargo-fuzz
+cargo +nightly fuzz run tokenize -- -max_total_time=30
+cargo +nightly fuzz run dictionary -- -max_total_time=30
 ```
 
 ## CLI
