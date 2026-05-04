@@ -29,16 +29,28 @@ The Rust binding now also accepts MeCab/Vibrato-style raw dictionary readers:
 
 This matches the input shape of `vibrato::SystemDictionaryBuilder::from_readers` and is the current compatibility path for differential tests and the CLI.
 
+The `vibrato-system` feature can also load precompiled Vibrato dictionaries
+directly from `system.dic` or zstd-compressed `system.dic.zst`:
+
+```rust
+let tokenizer = delarocha::VibratoSystemDictionary::from_path("system.dic.zst")?
+    .into_tokenizer()
+    .ignore_space(true)?
+    .max_grouping_len(24);
+let tokens = tokenizer.tokenize("これはテストです。")?;
+```
+
 ## Rust Tests
 
 ```bash
 cargo test
 ```
 
-The CI workflow runs the Rust and Zig unit tests on Linux, macOS, and Windows.
-It also runs `zig-ffi` tests and compiles the Yokohama text benchmark on Linux
-and macOS; Windows currently exercises the pure Rust and Zig test suites while
-the MSVC Zig FFI link path is kept out of the matrix.
+The CI workflow runs the Rust, Vibrato system dictionary, and Zig unit tests on
+Linux, macOS, and Windows. It also runs `zig-ffi` tests and compiles the
+Yokohama text benchmark on Linux and macOS; Windows currently exercises the
+pure Rust, `vibrato-system`, and Zig test suites while the MSVC Zig FFI link
+path is kept out of the matrix.
 
 ## Fuzzing
 

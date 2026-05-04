@@ -32,6 +32,9 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace --all-targets
 
+      - name: Rust tests with Vibrato system dictionary support
+        run: cargo test -p delarocha --features "vibrato-system" --test vibrato_system_dictionary
+
       - name: Rust tests with Zig FFI
         if: runner.os != 'Windows'
         run: cargo test -p delarocha --features "zig-ffi"
