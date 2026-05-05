@@ -34,6 +34,7 @@ pub struct Dictionary {
     matrix: ConnectionMatrix,
     char_property: CharProperty,
     unk_entries: Vec<UnkEntry>,
+    unk_index: Vec<Vec<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +57,7 @@ struct ConnectionMatrix {
 struct CharProperty {
     categories: Vec<CharCategory>,
     ranges: Vec<CharRange>,
+    range_bmp: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +177,7 @@ impl Dictionary {
                 word_cost: 10_000,
                 feature: "UNK".to_owned(),
             }],
+            unk_index: vec![vec![0]],
         })
     }
 }
@@ -216,6 +219,7 @@ impl SystemDictionaryBuilder {
         let char_property = CharProperty::parse(&char_buf)?;
         let unk_entries = parse_unk_entries(&unk_buf, &char_property)?;
         validate_connection_ids(&entries, &unk_entries, &matrix)?;
+        let unk_index = build_unk_index(char_property.categories.len(), &unk_entries);
 
         Ok(Dictionary {
             entry_index: build_entry_index(&entries),
@@ -225,6 +229,7 @@ impl SystemDictionaryBuilder {
             matrix,
             char_property,
             unk_entries,
+            unk_index,
         })
     }
 }
@@ -492,6 +497,7 @@ impl CharProperty {
                 length: 0,
             }],
             ranges: Vec::new(),
+            range_bmp: build_range_bmp(&[]),
         }
     }
 
@@ -554,6 +560,7 @@ impl CharProperty {
                 "char.def must define DEFAULT".into(),
             ));
         }
+        property.range_bmp = build_range_bmp(&property.ranges);
         Ok(property)
     }
 
@@ -565,11 +572,16 @@ impl CharProperty {
 
     fn category_for(&self, ch: char) -> CharInfo<'_> {
         let cp = u32::from(ch);
-        let range = self
-            .ranges
-            .iter()
-            .rev()
-            .find(|range| range.start <= cp && cp < range.end);
+        let range = if cp < 0x10000 {
+            self.range_bmp
+                .get(cp as usize)
+                .and_then(|&index| self.ranges.get(index))
+        } else {
+            self.ranges
+                .iter()
+                .rev()
+                .find(|range| range.start <= cp && cp < range.end)
+        };
         let category_ids = range.map_or(&[0][..], |range| range.category_ids.as_slice());
         let base_id = category_ids[0];
         CharInfo {
@@ -897,13 +909,8 @@ impl<'dict> Worker<'dict> {
         let mut emitted = false;
         let group_end = group_end(input, begin, &self.dictionary.char_property, &info);
         let group_len = input[begin..group_end].chars().count();
-        for (unk_id, unk) in self
-            .dictionary
-            .unk_entries
-            .iter()
-            .enumerate()
-            .filter(|(_, unk)| unk.category_id == info.base_id)
-        {
+        for &unk_id in &self.dictionary.unk_index[info.base_id] {
+            let unk = &self.dictionary.unk_entries[unk_id];
             let mut grouped = false;
             if info.category.group
                 && self
@@ -945,12 +952,9 @@ impl<'dict> Worker<'dict> {
 
         if !has_matched && !emitted {
             let end = next_char_boundary(input, begin)?;
-            let fallback = self
-                .dictionary
-                .unk_entries
-                .iter()
-                .enumerate()
-                .find(|(_, unk)| unk.category_id == info.base_id);
+            let fallback = self.dictionary.unk_index[info.base_id]
+                .first()
+                .map(|&unk_id| (unk_id, &self.dictionary.unk_entries[unk_id]));
             let (word_id, left_id, right_id, word_cost) =
                 fallback.map_or((UNKNOWN_WORD_BASE, 0, 0, 10_000), |(unk_id, unk)| {
                     (
@@ -1180,6 +1184,21 @@ fn build_entry_index(entries: &[Entry]) -> EntryIndex {
     index
 }
 
+const INVALID_CHAR_RANGE: usize = usize::MAX;
+
+fn build_range_bmp(ranges: &[CharRange]) -> Vec<usize> {
+    let mut range_bmp = vec![INVALID_CHAR_RANGE; 0x10000];
+    for (range_index, range) in ranges.iter().enumerate() {
+        if range.start >= 0x10000 {
+            continue;
+        }
+        let start = range.start as usize;
+        let end = range.end.min(0x10000) as usize;
+        range_bmp[start..end].fill(range_index);
+    }
+    range_bmp
+}
+
 fn parse_unk_entries(bytes: &[u8], char_property: &CharProperty) -> Result<Vec<UnkEntry>> {
     let mut entries = Vec::new();
     for entry in parse_mecab_entries(bytes, "unk.def")? {
@@ -1198,6 +1217,14 @@ fn parse_unk_entries(bytes: &[u8], char_property: &CharProperty) -> Result<Vec<U
         });
     }
     Ok(entries)
+}
+
+fn build_unk_index(category_count: usize, entries: &[UnkEntry]) -> Vec<Vec<usize>> {
+    let mut index = vec![Vec::new(); category_count];
+    for (unk_id, entry) in entries.iter().enumerate() {
+        index[entry.category_id].push(unk_id);
+    }
+    index
 }
 
 fn validate_connection_ids(
