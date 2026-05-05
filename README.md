@@ -172,6 +172,24 @@ VIBRATO_SYSTEM_DIC="$PWD/target/vibrato-dic/ipadic-mecab-2_7_0/system.dic.zst" \
 
 The Vibrato project and dictionary release information are available at <https://github.com/daac-tools/vibrato>.
 
+### Vibrato-Style Benchmark
+
+The `vibrato_style_benchmark` example mirrors the benchmark runner used by
+`daac-tools/vibrato`: it reads newline-separated sentences from stdin, runs
+10 warm runs per trial, repeats 10 trials, discards each trial's fastest and
+slowest run, and prints `Elapsed_seconds_to_tokenize_all_sentences`.
+
+```bash
+cargo run -p delarocha --release --features zig-ffi \
+  --example vibrato_style_benchmark -- \
+  -i /path/to/delarocha.dic < test.txt
+```
+
+Use `--full` to benchmark full token materialization instead of the count-only
+path. The default count-only mode matches Vibrato's benchmark loop shape by
+tokenizing each sentence and accumulating token counts without formatting
+token output.
+
 ### Yokohama Ordinance Text Benchmark
 
 To reproduce the long-text comparison used for the Yokohama City tax ordinance, download the HTML, extract normalized visible text, and run the dedicated example:
