@@ -1275,7 +1275,6 @@ pub mod ffi {
         fn delarocha_tokenizer_free(tokenizer: *mut RawTokenizer);
         fn delarocha_worker_new(tokenizer: *mut RawTokenizer) -> *mut RawWorker;
         fn delarocha_worker_free(worker: *mut RawWorker);
-        fn delarocha_tokenize(worker: *mut RawWorker, input: *const std::ffi::c_char) -> i32;
         fn delarocha_tokenize_bytes(worker: *mut RawWorker, input: *const u8, len: usize) -> i32;
         fn delarocha_tokenize_count_bytes_nonnull(
             worker: *mut RawWorker,
@@ -1554,8 +1553,9 @@ pub mod ffi {
         }
 
         pub fn tokenize(&mut self, input: &str) -> Result<Vec<Token>> {
-            let input_c = CString::new(input)?;
-            let status = unsafe { delarocha_tokenize(self.raw.as_ptr(), input_c.as_ptr()) };
+            let status = unsafe {
+                delarocha_tokenize_bytes(self.raw.as_ptr(), input.as_ptr(), input.len())
+            };
             if status != 0 {
                 return Err(last_error());
             }

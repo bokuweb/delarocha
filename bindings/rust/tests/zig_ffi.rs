@@ -25,6 +25,26 @@ fn zig_ffi_tokenizes_fixture_dictionary() {
 }
 
 #[test]
+fn zig_ffi_full_tokenize_accepts_interior_nul() {
+    let dict_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/minimal.dict");
+    let tokenizer = ZigTokenizer::from_path(dict_path).expect("Zig tokenizer loads fixture");
+    let mut worker = tokenizer.create_worker().expect("Zig worker is created");
+
+    let tokens = worker
+        .tokenize("本\0カレー")
+        .expect("Zig bytes tokenize succeeds");
+
+    assert_eq!(
+        tokens
+            .iter()
+            .map(|token| token.surface.as_str())
+            .collect::<Vec<_>>(),
+        ["本", "\0", "カレー"]
+    );
+}
+
+#[test]
 fn zig_ffi_tokenizes_raw_dictionary() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
     let tokenizer = ZigTokenizer::from_raw_paths(
