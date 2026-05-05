@@ -5,6 +5,7 @@ const tokenizer_mod = @import("tokenizer.zig");
 const Dictionary = dict_mod.Dictionary;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Worker = tokenizer_mod.Worker;
+const is_wasm = @import("builtin").target.cpu.arch.isWasm();
 
 var c_allocator = std.heap.page_allocator;
 threadlocal var last_error_buf: [256]u8 = [_]u8{0} ** 256;
@@ -19,6 +20,10 @@ pub export fn delarocha_last_error() [*:0]const u8 {
 }
 
 pub export fn delarocha_tokenizer_new(path: [*:0]const u8) ?*Tokenizer {
+    if (comptime is_wasm) {
+        setLastError("path-based dictionary loading is not available on wasm", .{});
+        return null;
+    }
     const tokenizer = c_allocator.create(Tokenizer) catch {
         setLastError("out of memory", .{});
         return null;
@@ -37,6 +42,10 @@ pub export fn delarocha_tokenizer_new_raw(
     char_path: [*:0]const u8,
     unk_path: [*:0]const u8,
 ) ?*Tokenizer {
+    if (comptime is_wasm) {
+        setLastError("raw file dictionary loading is not available on wasm", .{});
+        return null;
+    }
     const tokenizer = c_allocator.create(Tokenizer) catch {
         setLastError("out of memory", .{});
         return null;
@@ -67,6 +76,10 @@ pub export fn delarocha_tokenizer_new_raw_count_only(
 }
 
 pub export fn delarocha_tokenizer_new_binary(path: [*:0]const u8) ?*Tokenizer {
+    if (comptime is_wasm) {
+        setLastError("path-based binary dictionary loading is not available on wasm", .{});
+        return null;
+    }
     const tokenizer = c_allocator.create(Tokenizer) catch {
         setLastError("out of memory", .{});
         return null;
@@ -124,6 +137,10 @@ pub export fn delarocha_dictionary_write_binary(
     unk_path: [*:0]const u8,
     output_path: [*:0]const u8,
 ) i32 {
+    if (comptime is_wasm) {
+        setLastError("dictionary binary writing is not available on wasm", .{});
+        return -1;
+    }
     var dict = Dictionary.fromRawFiles(
         c_allocator,
         std.mem.span(lex_path),
