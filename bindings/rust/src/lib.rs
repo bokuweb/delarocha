@@ -692,6 +692,11 @@ impl Tokenizer {
         worker.tokenize(input).map(ToOwned::to_owned)
     }
 
+    pub fn tokenize_count(&self, input: &str) -> Result<usize> {
+        let mut worker = self.create_worker();
+        worker.tokenize_count(input)
+    }
+
     pub fn create_worker(&self) -> Worker<'_> {
         Worker {
             dictionary: &self.dictionary,
@@ -776,9 +781,24 @@ struct EndLink {
 
 impl<'dict> Worker<'dict> {
     pub fn tokenize(&mut self, input: &str) -> Result<&[Token]> {
+        let Some(best) = self.build_best_path(input)? else {
+            return Ok(&self.tokens);
+        };
+        self.backtrace(input, best)?;
+        Ok(&self.tokens)
+    }
+
+    pub fn tokenize_count(&mut self, input: &str) -> Result<usize> {
+        let Some(best) = self.build_best_path(input)? else {
+            return Ok(0);
+        };
+        Ok(self.count_path(best))
+    }
+
+    fn build_best_path(&mut self, input: &str) -> Result<Option<usize>> {
         self.reset(input.len());
         if input.is_empty() {
-            return Ok(&self.tokens);
+            return Ok(None);
         }
 
         self.nodes.push(Node::bos());
@@ -856,8 +876,7 @@ impl<'dict> Worker<'dict> {
             .map(|link| link.node)
             .min_by(|left, right| compare_node_cost(&self.nodes[*left], &self.nodes[*right]))
             .ok_or_else(|| Error::Tokenization("no path reached the end of input".into()))?;
-        self.backtrace(input, best)?;
-        Ok(&self.tokens)
+        Ok(Some(best))
     }
 
     fn reset(&mut self, len: usize) {
@@ -996,6 +1015,15 @@ impl<'dict> Worker<'dict> {
         })
         .min_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
         .ok_or_else(|| Error::Tokenization("candidate has no previous node".into()))
+    }
+
+    fn count_path(&self, mut index: usize) -> usize {
+        let mut count = 0usize;
+        while let Some(prev) = self.nodes[index].prev_node {
+            count += 1;
+            index = prev;
+        }
+        count
     }
 
     fn backtrace(&mut self, input: &str, mut index: usize) -> Result<()> {
