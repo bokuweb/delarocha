@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 
 pub const unknown_word_base: u32 = 1 << 31;
 pub const unknown_word_id: u32 = std.math.maxInt(u32);
-const invalid_node: usize = std.math.maxInt(usize);
+const invalid_node: u32 = std.math.maxInt(u32);
 const invalid_count_node: u32 = std.math.maxInt(u32);
 
 pub const Token = struct {
@@ -22,12 +22,15 @@ pub const Token = struct {
 
 const Node = struct {
     word_id: u32,
-    start: usize,
-    end: usize,
+    // Full-token lattice nodes are transient and can become numerous on long
+    // documents. Keep byte offsets and linked-list indexes at 32 bits while
+    // widening back to usize only when producing public Token values.
+    start: u32,
+    end: u32,
     right_id: u16,
     min_cost: i32,
-    prev_node: ?usize,
-    next_end: usize,
+    prev_node: u32,
+    next_end: u32,
 
     fn bos() Node {
         return .{
@@ -36,7 +39,7 @@ const Node = struct {
             .end = 0,
             .right_id = 0,
             .min_cost = 0,
-            .prev_node = null,
+            .prev_node = invalid_node,
             .next_end = invalid_node,
         };
     }
@@ -99,7 +102,7 @@ pub const Worker = struct {
     dictionary: *const dict_mod.Dictionary,
     max_grouping_len: ?usize,
     nodes: std.ArrayList(Node),
-    end_heads: std.ArrayList(usize),
+    end_heads: std.ArrayList(u32),
     count_nodes: std.ArrayList(CountNode),
     count_end_heads: std.ArrayList(u32),
     tokens: std.ArrayList(Token),
@@ -158,7 +161,8 @@ pub const Worker = struct {
         return self.count_nodes.items[best].token_count;
     }
 
-    fn buildBestPath(self: *Worker, input: []const u8) !usize {
+    fn buildBestPath(self: *Worker, input: []const u8) !u32 {
+        if (input.len > std.math.maxInt(u32)) return error.InputTooLarge;
         try self.reset(input.len);
         if (input.len == 0) return error.NoPath;
 
@@ -523,16 +527,17 @@ pub const Worker = struct {
     fn appendBestNode(self: *Worker, begin: usize, end: usize, candidate: Candidate) !void {
         const best = try self.findBestPrev(begin, candidate);
         const index = self.nodes.items.len;
+        if (index >= invalid_node) return error.InputTooLarge;
         try self.nodes.append(self.allocator, .{
             .word_id = candidate.word_id,
-            .start = begin,
-            .end = end,
+            .start = try narrowInputOffset(begin),
+            .end = try narrowInputOffset(end),
             .right_id = candidate.right_id,
             .min_cost = best.cost,
             .prev_node = best.index,
             .next_end = self.end_heads.items[end],
         });
-        self.end_heads.items[end] = index;
+        self.end_heads.items[end] = @intCast(index);
     }
 
     inline fn appendBestCountNode(self: *Worker, begin: usize, end: usize, left_id: u16, right_id: u16, word_cost: i32) void {
@@ -573,19 +578,20 @@ pub const Worker = struct {
         try self.count_nodes.append(self.allocator, node);
     }
 
-    fn findBestPrev(self: *Worker, begin: usize, candidate: Candidate) !struct { index: usize, cost: i32 } {
-        var best_index: ?usize = null;
+    fn findBestPrev(self: *Worker, begin: usize, candidate: Candidate) !struct { index: u32, cost: i32 } {
+        var best_index: u32 = invalid_node;
         var best_cost: i32 = std.math.maxInt(i32);
         var prev_index = self.end_heads.items[begin];
         while (prev_index != invalid_node) : (prev_index = self.nodes.items[prev_index].next_end) {
             const prev = self.nodes.items[prev_index];
             const cost = prev.min_cost + self.dictionary.matrix.trustedCost(prev.right_id, candidate.left_id) + candidate.word_cost;
-            if (best_index == null or cost < best_cost) {
+            if (best_index == invalid_node or cost < best_cost) {
                 best_index = prev_index;
                 best_cost = cost;
             }
         }
-        return .{ .index = best_index orelse return error.NoPath, .cost = best_cost };
+        if (best_index == invalid_node) return error.NoPath;
+        return .{ .index = best_index, .cost = best_cost };
     }
 
     inline fn findBestCountPrev(self: *Worker, begin: usize, left_id: u16, word_cost: i32) struct { index: u32, cost: i32 } {
@@ -618,18 +624,19 @@ pub const Worker = struct {
         return .{ .index = best_index, .cost = best_cost };
     }
 
-    fn bestEndNode(self: *Worker, end: usize) !usize {
-        var best_index: ?usize = null;
+    fn bestEndNode(self: *Worker, end: usize) !u32 {
+        var best_index: u32 = invalid_node;
         var best_cost: i32 = std.math.maxInt(i32);
         var index = self.end_heads.items[end];
         while (index != invalid_node) : (index = self.nodes.items[index].next_end) {
             const cost = self.nodes.items[index].min_cost;
-            if (best_index == null or cost < best_cost) {
+            if (best_index == invalid_node or cost < best_cost) {
                 best_index = index;
                 best_cost = cost;
             }
         }
-        return best_index orelse error.NoPath;
+        if (best_index == invalid_node) return error.NoPath;
+        return best_index;
     }
 
     fn bestCountEndNode(self: *Worker, end: usize) !u32 {
@@ -654,35 +661,35 @@ pub const Worker = struct {
         return best_index;
     }
 
-    fn countPath(self: *const Worker, start_index: usize) usize {
+    fn countPath(self: *const Worker, start_index: u32) usize {
         var count: usize = 0;
         var index = start_index;
-        while (self.nodes.items[index].prev_node) |prev| {
+        while (self.nodes.items[index].prev_node != invalid_node) {
             count += 1;
-            index = prev;
+            index = self.nodes.items[index].prev_node;
         }
         return count;
     }
 
-    fn backtrace(self: *Worker, input: []const u8, start_index: usize) !void {
+    fn backtrace(self: *Worker, input: []const u8, start_index: u32) !void {
         const count = self.countPath(start_index);
 
         try self.tokens.resize(self.allocator, count);
         var index = start_index;
         var out = count;
-        while (self.nodes.items[index].prev_node) |prev| {
+        while (self.nodes.items[index].prev_node != invalid_node) {
             out -= 1;
             const node = self.nodes.items[index];
             const feature = self.featureFor(node.word_id);
             self.tokens.items[out] = .{
-                .start = node.start,
-                .end = node.end,
+                .start = @intCast(node.start),
+                .end = @intCast(node.end),
                 .word_id = node.word_id,
                 .feature = feature,
                 .total_cost = node.min_cost,
             };
             _ = input;
-            index = prev;
+            index = node.prev_node;
         }
     }
 
@@ -693,6 +700,11 @@ pub const Worker = struct {
         return self.dictionary.entries[word_id].feature;
     }
 };
+
+fn narrowInputOffset(offset: usize) !u32 {
+    if (offset > std.math.maxInt(u32)) return error.InputTooLarge;
+    return @intCast(offset);
+}
 
 inline fn nextBoundary(input: []const u8, start: usize) ?usize {
     if (start >= input.len) return null;

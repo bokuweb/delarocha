@@ -39,13 +39,17 @@ pub const TrieEdge = extern struct {
     child: u32 align(1),
 };
 
-pub const TrieNode = extern struct {
-    edge_start: u32 align(1),
-    edge_len: u16 align(1),
-    word_start: u32 align(1),
-    word_len: u32 align(1),
-    count_word_start: u32 align(1),
-    count_word_len: u32 align(1),
+// Each trie node stores offsets into global edge/term streams. IPADIC stays far
+// below 24-bit offsets and 16-bit per-node term counts, so the in-memory node
+// can be packed to reduce resident memory while the binary file layout remains
+// unchanged and backward-compatible.
+pub const TrieNode = packed struct {
+    edge_start: u24,
+    edge_len: u16,
+    word_start: u24,
+    word_len: u16,
+    count_word_start: u24,
+    count_word_len: u16,
 };
 
 pub const TrieTerm = struct {
@@ -1175,12 +1179,12 @@ fn buildTrie(allocator: Allocator, entries: []const Entry, matrix: *const Connec
             try appendCountTerm(allocator, &count_terms, term, count_start, matrix);
         }
         nodes[i] = .{
-            .edge_start = @intCast(edge_offset),
+            .edge_start = try narrowTrieOffset(edge_offset),
             .edge_len = @intCast(node.edges.items.len),
-            .word_start = @intCast(word_offset),
-            .word_len = @intCast(node.word_ids.items.len),
-            .count_word_start = @intCast(count_start),
-            .count_word_len = @intCast(count_terms.items.len - count_start),
+            .word_start = try narrowTrieOffset(word_offset),
+            .word_len = try narrowTrieTermLen(node.word_ids.items.len),
+            .count_word_start = try narrowTrieOffset(count_start),
+            .count_word_len = try narrowTrieTermLen(count_terms.items.len - count_start),
         };
         edge_offset += node.edges.items.len;
         word_offset += node.word_ids.items.len;
@@ -1391,6 +1395,16 @@ fn buildDoubleArray(allocator: Allocator, nodes: []const TrieNode, edges: []cons
 
 fn trieNodeFanoutGreater(nodes: []const TrieNode, lhs: usize, rhs: usize) bool {
     return nodes[lhs].edge_len > nodes[rhs].edge_len;
+}
+
+fn narrowTrieTermLen(len: usize) !u16 {
+    if (len > std.math.maxInt(u16)) return error.InvalidDictionary;
+    return @intCast(len);
+}
+
+fn narrowTrieOffset(offset: usize) !u24 {
+    if (offset > std.math.maxInt(u24)) return error.InvalidDictionary;
+    return @intCast(offset);
 }
 
 fn doubleArrayBaseFits(used: []const u8, node_edges: []const TrieEdge, candidate: usize) bool {
@@ -1608,12 +1622,12 @@ fn readTrieNodes(allocator: Allocator, bytes: []const u8, cursor: *usize, count:
     errdefer allocator.free(nodes);
     for (nodes) |*node| {
         node.* = .{
-            .edge_start = try readU32(bytes, cursor),
+            .edge_start = try narrowTrieOffset(try readU32(bytes, cursor)),
             .edge_len = try readU16(bytes, cursor),
-            .word_start = try readU32(bytes, cursor),
-            .word_len = try readU32(bytes, cursor),
-            .count_word_start = try readU32(bytes, cursor),
-            .count_word_len = try readU32(bytes, cursor),
+            .word_start = try narrowTrieOffset(try readU32(bytes, cursor)),
+            .word_len = try narrowTrieTermLen(try readU32(bytes, cursor)),
+            .count_word_start = try narrowTrieOffset(try readU32(bytes, cursor)),
+            .count_word_len = try narrowTrieTermLen(try readU32(bytes, cursor)),
         };
     }
     return nodes;
