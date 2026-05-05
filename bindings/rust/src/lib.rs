@@ -23,11 +23,14 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+type EntryIndex = [Vec<usize>; 256];
 
 #[derive(Clone, Debug)]
 pub struct Dictionary {
     entries: Vec<Entry>,
+    entry_index: EntryIndex,
     user_entries: Vec<Entry>,
+    user_entry_index: EntryIndex,
     matrix: ConnectionMatrix,
     char_property: CharProperty,
     unk_entries: Vec<UnkEntry>,
@@ -159,7 +162,9 @@ impl Dictionary {
         }
 
         Ok(Self {
+            entry_index: build_entry_index(&entries),
             entries,
+            user_entry_index: empty_entry_index(),
             user_entries: Vec::new(),
             matrix,
             char_property: CharProperty::default(),
@@ -213,7 +218,9 @@ impl SystemDictionaryBuilder {
         validate_connection_ids(&entries, &unk_entries, &matrix)?;
 
         Ok(Dictionary {
+            entry_index: build_entry_index(&entries),
             entries,
+            user_entry_index: empty_entry_index(),
             user_entries: Vec::new(),
             matrix,
             char_property,
@@ -236,6 +243,7 @@ impl Dictionary {
         } else {
             Vec::new()
         };
+        self.user_entry_index = build_entry_index(&self.user_entries);
         Ok(self)
     }
 }
@@ -679,6 +687,7 @@ impl Tokenizer {
             max_grouping_len: self.max_grouping_len,
             nodes: Vec::new(),
             ends: Vec::new(),
+            end_links: Vec::new(),
             tokens: Vec::new(),
         }
     }
@@ -729,7 +738,8 @@ pub struct Worker<'dict> {
     ignore_space_category: Option<usize>,
     max_grouping_len: Option<usize>,
     nodes: Vec<Node>,
-    ends: Vec<Vec<usize>>,
+    ends: Vec<Option<usize>>,
+    end_links: Vec<EndLink>,
     tokens: Vec<Token>,
 }
 
@@ -746,6 +756,12 @@ struct Node {
     prev_node: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EndLink {
+    node: usize,
+    next: Option<usize>,
+}
+
 impl<'dict> Worker<'dict> {
     pub fn tokenize(&mut self, input: &str) -> Result<&[Token]> {
         self.reset(input.len());
@@ -754,10 +770,11 @@ impl<'dict> Worker<'dict> {
         }
 
         self.nodes.push(Node::bos());
-        self.ends[0].push(0);
+        self.push_end_link(0, 0);
+        let input_bytes = input.as_bytes();
 
         for begin in char_boundaries(input) {
-            if begin == input.len() || self.ends[begin].is_empty() {
+            if begin == input.len() || self.ends[begin].is_none() {
                 continue;
             }
             if let Some(space_category) = self.ignore_space_category {
@@ -768,19 +785,21 @@ impl<'dict> Worker<'dict> {
                 let info = self.dictionary.char_property.category_for(ch);
                 if info.category_ids.contains(&space_category) {
                     let end = group_end(input, begin, &self.dictionary.char_property, &info);
-                    let prev_nodes = self.ends[begin].clone();
-                    self.ends[end].extend(prev_nodes);
+                    let mut link = self.ends[begin];
+                    while let Some(link_index) = link {
+                        let end_link = self.end_links[link_index];
+                        self.push_end_link(end, end_link.node);
+                        link = end_link.next;
+                    }
                     continue;
                 }
             }
 
             let mut emitted = false;
-            for (word_id, entry) in self.dictionary.user_entries.iter().enumerate() {
-                if input[begin..].starts_with(&entry.surface) {
+            for &word_id in &self.dictionary.user_entry_index[input_bytes[begin] as usize] {
+                let entry = &self.dictionary.user_entries[word_id];
+                if input_bytes[begin..].starts_with(entry.surface.as_bytes()) {
                     let end = begin + entry.surface.len();
-                    if !input.is_char_boundary(end) {
-                        continue;
-                    }
                     self.append_best_node(
                         begin,
                         end,
@@ -794,12 +813,10 @@ impl<'dict> Worker<'dict> {
                     emitted = true;
                 }
             }
-            for (word_id, entry) in self.dictionary.entries.iter().enumerate() {
-                if input[begin..].starts_with(&entry.surface) {
+            for &word_id in &self.dictionary.entry_index[input_bytes[begin] as usize] {
+                let entry = &self.dictionary.entries[word_id];
+                if input_bytes[begin..].starts_with(entry.surface.as_bytes()) {
                     let end = begin + entry.surface.len();
-                    if !input.is_char_boundary(end) {
-                        continue;
-                    }
                     self.append_best_node(
                         begin,
                         end,
@@ -818,8 +835,13 @@ impl<'dict> Worker<'dict> {
         }
 
         let best = self.ends[input.len()]
-            .iter()
-            .copied()
+            .map(|first_link| EndLinkIter {
+                links: &self.end_links,
+                next: Some(first_link),
+            })
+            .into_iter()
+            .flatten()
+            .map(|link| link.node)
             .min_by(|left, right| compare_node_cost(&self.nodes[*left], &self.nodes[*right]))
             .ok_or_else(|| Error::Tokenization("no path reached the end of input".into()))?;
         self.backtrace(input, best)?;
@@ -829,8 +851,11 @@ impl<'dict> Worker<'dict> {
     fn reset(&mut self, len: usize) {
         self.nodes.clear();
         self.tokens.clear();
-        self.ends.clear();
-        self.ends.resize_with(len + 1, Vec::new);
+        self.end_links.clear();
+        if self.ends.len() < len + 1 {
+            self.ends.resize(len + 1, None);
+        }
+        self.ends[..=len].fill(None);
     }
 
     fn append_best_node(&mut self, begin: usize, end: usize, candidate: Candidate) -> Result<()> {
@@ -846,8 +871,17 @@ impl<'dict> Worker<'dict> {
             min_cost,
             prev_node: Some(prev_node),
         });
-        self.ends[end].push(index);
+        self.push_end_link(end, index);
         Ok(())
+    }
+
+    fn push_end_link(&mut self, end: usize, node: usize) {
+        let link = self.end_links.len();
+        self.end_links.push(EndLink {
+            node,
+            next: self.ends[end],
+        });
+        self.ends[end] = Some(link);
     }
 
     fn append_unknown_nodes(&mut self, input: &str, begin: usize, has_matched: bool) -> Result<()> {
@@ -861,6 +895,8 @@ impl<'dict> Worker<'dict> {
         }
 
         let mut emitted = false;
+        let group_end = group_end(input, begin, &self.dictionary.char_property, &info);
+        let group_len = input[begin..group_end].chars().count();
         for (unk_id, unk) in self
             .dictionary
             .unk_entries
@@ -868,8 +904,6 @@ impl<'dict> Worker<'dict> {
             .enumerate()
             .filter(|(_, unk)| unk.category_id == info.base_id)
         {
-            let group_end = group_end(input, begin, &self.dictionary.char_property, &info);
-            let group_len = input[begin..group_end].chars().count();
             let mut grouped = false;
             if info.category.group
                 && self
@@ -941,25 +975,26 @@ impl<'dict> Worker<'dict> {
     }
 
     fn find_best_prev(&self, begin: usize, candidate: Candidate) -> Result<(usize, i32)> {
-        self.ends[begin]
-            .iter()
-            .copied()
-            .map(|prev_index| {
-                let prev = &self.nodes[prev_index];
-                let cost = prev.min_cost
-                    + self
-                        .dictionary
-                        .matrix
-                        .cost(prev.right_id, candidate.left_id)
-                    + candidate.word_cost;
-                (prev_index, cost)
-            })
-            .min_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
-            .ok_or_else(|| Error::Tokenization("candidate has no previous node".into()))
+        EndLinkIter {
+            links: &self.end_links,
+            next: self.ends[begin],
+        }
+        .map(|link| link.node)
+        .map(|prev_index| {
+            let prev = &self.nodes[prev_index];
+            let cost = prev.min_cost
+                + self
+                    .dictionary
+                    .matrix
+                    .cost(prev.right_id, candidate.left_id)
+                + candidate.word_cost;
+            (prev_index, cost)
+        })
+        .min_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+        .ok_or_else(|| Error::Tokenization("candidate has no previous node".into()))
     }
 
     fn backtrace(&mut self, input: &str, mut index: usize) -> Result<()> {
-        let mut reversed = Vec::new();
         while let Some(prev) = self.nodes[index].prev_node {
             let node = &self.nodes[index];
             let (surface, feature) = if node.word_id >= UNKNOWN_WORD_BASE {
@@ -985,7 +1020,7 @@ impl<'dict> Worker<'dict> {
                     .ok_or_else(|| Error::Tokenization("word id out of range".into()))?;
                 (entry.surface.as_str(), entry.feature.as_str())
             };
-            reversed.push(Token {
+            self.tokens.push(Token {
                 surface: surface.to_owned(),
                 start: node.start,
                 end: node.end,
@@ -997,9 +1032,24 @@ impl<'dict> Worker<'dict> {
             });
             index = prev;
         }
-        reversed.reverse();
-        self.tokens = reversed;
+        self.tokens.reverse();
         Ok(())
+    }
+}
+
+struct EndLinkIter<'a> {
+    links: &'a [EndLink],
+    next: Option<usize>,
+}
+
+impl<'a> Iterator for EndLinkIter<'a> {
+    type Item = EndLink;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let index = self.next?;
+        let link = self.links[index];
+        self.next = link.next;
+        Some(link)
     }
 }
 
@@ -1114,6 +1164,20 @@ fn parse_mecab_entries(bytes: &[u8], name: &str) -> Result<Vec<Entry>> {
         });
     }
     Ok(entries)
+}
+
+fn empty_entry_index() -> EntryIndex {
+    std::array::from_fn(|_| Vec::new())
+}
+
+fn build_entry_index(entries: &[Entry]) -> EntryIndex {
+    let mut index = empty_entry_index();
+    for (word_id, entry) in entries.iter().enumerate() {
+        if let Some(&first) = entry.surface.as_bytes().first() {
+            index[usize::from(first)].push(word_id);
+        }
+    }
+    index
 }
 
 fn parse_unk_entries(bytes: &[u8], char_property: &CharProperty) -> Result<Vec<UnkEntry>> {
@@ -1553,9 +1617,8 @@ pub mod ffi {
         }
 
         pub fn tokenize(&mut self, input: &str) -> Result<Vec<Token>> {
-            let status = unsafe {
-                delarocha_tokenize_bytes(self.raw.as_ptr(), input.as_ptr(), input.len())
-            };
+            let status =
+                unsafe { delarocha_tokenize_bytes(self.raw.as_ptr(), input.as_ptr(), input.len()) };
             if status != 0 {
                 return Err(last_error());
             }
