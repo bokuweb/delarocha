@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="delarocha WebAssembly playground for Japanese tokenization."
+    />
+    <title>delarocha playground</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">WASM tokenizer playground</p>
+          <h1>delarocha</h1>
+          <p class="lede">
+            Japanese tokenization in the browser, backed by the Rust core and a
+            full MeCab ipadic dictionary loaded at startup.
+          </p>
+        </div>
+        <div class="status-panel" aria-live="polite">
+          <span class="status-dot" id="status-dot"></span>
+          <span id="status-text">Loading WebAssembly</span>
+        </div>
+      </section>
+
+      <section class="workspace" aria-label="Tokenizer playground">
+        <div class="input-pane">
+          <div class="pane-heading">
+            <div>
+              <p class="label">Input</p>
+              <h2>Sentence</h2>
+            </div>
+            <button class="icon-button" id="sample-button" type="button" title="Load sample">
+              <span aria-hidden="true">↺</span>
+              <span class="sr-only">Load sample</span>
+            </button>
+          </div>
+          <textarea
+            id="input"
+            spellcheck="false"
+            aria-label="Sentence to tokenize"
+          >本とカレー 本X🍛カレー</textarea>
+
+          <div class="controls" aria-label="Tokenizer options">
+            <label class="switch">
+              <input id="ignore-space" type="checkbox" />
+              <span>Ignore spaces</span>
+            </label>
+            <label class="number-field">
+              <span>Max grouping</span>
+              <input id="max-grouping" type="number" min="0" max="128" value="24" />
+            </label>
+          </div>
+
+          <div class="metrics" aria-label="Tokenization metrics">
+            <div>
+              <span class="metric-value" id="token-count">0</span>
+              <span class="metric-label">tokens</span>
+            </div>
+            <div>
+              <span class="metric-value" id="byte-count">0</span>
+              <span class="metric-label">bytes</span>
+            </div>
+            <div>
+              <span class="metric-value" id="elapsed">0.00</span>
+              <span class="metric-label">ms</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="output-pane">
+          <div class="pane-heading">
+            <div>
+              <p class="label">Output</p>
+              <h2>Tokens</h2>
+            </div>
+            <div class="tabs" role="tablist" aria-label="Output view">
+              <button class="tab active" type="button" data-view="tokens">Table</button>
+              <button class="tab" type="button" data-view="wakati">Wakati</button>
+              <button class="tab" type="button" data-view="json">JSON</button>
+            </div>
+          </div>
+
+          <div class="token-strip" id="token-strip" aria-label="Token surfaces"></div>
+
+          <div class="view active" id="tokens-view">
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Surface</th>
+                    <th>POS</th>
+                    <th>Reading</th>
+                    <th>Bytes</th>
+                    <th>Cost</th>
+                  </tr>
+                </thead>
+                <tbody id="token-rows"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="view" id="wakati-view">
+            <pre id="wakati-output"></pre>
+          </div>
+
+          <div class="view" id="json-view">
+            <pre id="json-output"></pre>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
