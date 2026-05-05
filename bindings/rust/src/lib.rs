@@ -1275,7 +1275,6 @@ pub mod ffi {
         fn delarocha_tokenizer_free(tokenizer: *mut RawTokenizer);
         fn delarocha_worker_new(tokenizer: *mut RawTokenizer) -> *mut RawWorker;
         fn delarocha_worker_free(worker: *mut RawWorker);
-        fn delarocha_tokenize(worker: *mut RawWorker, input: *const std::ffi::c_char) -> i32;
         fn delarocha_tokenize_bytes(worker: *mut RawWorker, input: *const u8, len: usize) -> i32;
         fn delarocha_tokenize_count_bytes_nonnull(
             worker: *mut RawWorker,
@@ -1554,14 +1553,20 @@ pub mod ffi {
         }
 
         pub fn tokenize(&mut self, input: &str) -> Result<Vec<Token>> {
-            let input_c = CString::new(input)?;
-            let status = unsafe { delarocha_tokenize(self.raw.as_ptr(), input_c.as_ptr()) };
+            let status = unsafe {
+                delarocha_tokenize_bytes(self.raw.as_ptr(), input.as_ptr(), input.len())
+            };
             if status != 0 {
                 return Err(last_error());
             }
 
             let count = unsafe { delarocha_token_count(self.raw.as_ptr()) };
             let mut tokens = Vec::with_capacity(count);
+            // Token byte ranges are emitted in sentence order. Keep the
+            // character cursor moving forward so long inputs do not rescan the
+            // whole prefix for every token.
+            let mut previous_byte = 0usize;
+            let mut current_char = 0usize;
             for index in 0..count {
                 let start = unsafe { delarocha_token_surface_start(self.raw.as_ptr(), index) };
                 let end = unsafe { delarocha_token_surface_end(self.raw.as_ptr(), index) };
@@ -1576,12 +1581,17 @@ pub mod ffi {
                     })
                     .unwrap_or_default()
                 };
+                current_char += input[previous_byte..start].chars().count();
+                let start_char = current_char;
+                current_char += input[start..end].chars().count();
+                let end_char = current_char;
+                previous_byte = end;
                 tokens.push(Token {
                     surface: input[start..end].to_owned(),
                     start,
                     end,
-                    start_char: input[..start].chars().count(),
-                    end_char: input[..end].chars().count(),
+                    start_char,
+                    end_char,
                     word_id,
                     feature: feature.to_owned(),
                     total_cost: 0,

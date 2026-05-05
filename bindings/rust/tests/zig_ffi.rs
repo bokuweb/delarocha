@@ -22,6 +22,31 @@ fn zig_ffi_tokenizes_fixture_dictionary() {
     );
     assert_eq!(tokens[0].byte_range(), 0..6);
     assert_eq!(tokens[1].byte_range(), 6..15);
+    assert_eq!(tokens[0].range_char(), 0..2);
+    assert_eq!(tokens[1].range_char(), 2..5);
+}
+
+#[test]
+fn zig_ffi_full_tokenize_accepts_interior_nul() {
+    let dict_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/minimal.dict");
+    let tokenizer = ZigTokenizer::from_path(dict_path).expect("Zig tokenizer loads fixture");
+    let mut worker = tokenizer.create_worker().expect("Zig worker is created");
+
+    let tokens = worker
+        .tokenize("本\0カレー")
+        .expect("Zig bytes tokenize succeeds");
+
+    assert_eq!(
+        tokens
+            .iter()
+            .map(|token| token.surface.as_str())
+            .collect::<Vec<_>>(),
+        ["本", "\0", "カレー"]
+    );
+    assert_eq!(tokens[0].range_char(), 0..1);
+    assert_eq!(tokens[1].range_char(), 1..2);
+    assert_eq!(tokens[2].range_char(), 2..5);
 }
 
 #[test]
