@@ -31,6 +31,14 @@ fn bench_delarocha(c: &mut Criterion) {
             }
         });
     });
+
+    c.bench_function("delarocha/rust-count-only", |b| {
+        b.iter(|| {
+            for sentence in SENTENCES {
+                black_box(worker.tokenize_count(black_box(sentence)).unwrap());
+            }
+        });
+    });
 }
 
 #[cfg(feature = "zig-ffi")]

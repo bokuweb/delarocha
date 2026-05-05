@@ -57,6 +57,29 @@ fn worker_reuses_capacity_without_leaking_previous_tokens() {
 }
 
 #[test]
+fn count_only_matches_full_tokenization() {
+    let dictionary = Dictionary::parse(DICT).expect("dictionary parses");
+    let tokenizer = Tokenizer::new(dictionary);
+    let mut worker = tokenizer.create_worker();
+
+    for input in ["", "本とカレー", "本X🍛カレー", "カレー本と本とカレー"] {
+        let full_count = tokenizer.tokenize(input).expect("tokenize succeeds").len();
+        assert_eq!(
+            tokenizer
+                .tokenize_count(input)
+                .expect("count tokenization succeeds"),
+            full_count
+        );
+        assert_eq!(
+            worker
+                .tokenize_count(input)
+                .expect("worker count tokenization succeeds"),
+            full_count
+        );
+    }
+}
+
+#[test]
 fn builds_from_mecab_style_readers() {
     let lexicon_csv = "自然,0,0,1,sizen
 言語,0,0,4,gengo

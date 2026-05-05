@@ -692,6 +692,11 @@ impl Tokenizer {
         worker.tokenize(input).map(ToOwned::to_owned)
     }
 
+    pub fn tokenize_count(&self, input: &str) -> Result<usize> {
+        let mut worker = self.create_worker();
+        worker.tokenize_count(input)
+    }
+
     pub fn create_worker(&self) -> Worker<'_> {
         Worker {
             dictionary: &self.dictionary,
@@ -776,9 +781,24 @@ struct EndLink {
 
 impl<'dict> Worker<'dict> {
     pub fn tokenize(&mut self, input: &str) -> Result<&[Token]> {
+        let Some(best) = self.build_best_path(input)? else {
+            return Ok(&self.tokens);
+        };
+        self.backtrace(input, best)?;
+        Ok(&self.tokens)
+    }
+
+    pub fn tokenize_count(&mut self, input: &str) -> Result<usize> {
+        let Some(best) = self.build_best_path(input)? else {
+            return Ok(0);
+        };
+        Ok(self.count_path(best))
+    }
+
+    fn build_best_path(&mut self, input: &str) -> Result<Option<usize>> {
         self.reset(input.len());
         if input.is_empty() {
-            return Ok(&self.tokens);
+            return Ok(None);
         }
 
         self.nodes.push(Node::bos());
@@ -856,8 +876,7 @@ impl<'dict> Worker<'dict> {
             .map(|link| link.node)
             .min_by(|left, right| compare_node_cost(&self.nodes[*left], &self.nodes[*right]))
             .ok_or_else(|| Error::Tokenization("no path reached the end of input".into()))?;
-        self.backtrace(input, best)?;
-        Ok(&self.tokens)
+        Ok(Some(best))
     }
 
     fn reset(&mut self, len: usize) {
@@ -996,6 +1015,15 @@ impl<'dict> Worker<'dict> {
         })
         .min_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
         .ok_or_else(|| Error::Tokenization("candidate has no previous node".into()))
+    }
+
+    fn count_path(&self, mut index: usize) -> usize {
+        let mut count = 0usize;
+        while let Some(prev) = self.nodes[index].prev_node {
+            count += 1;
+            index = prev;
+        }
+        count
     }
 
     fn backtrace(&mut self, input: &str, mut index: usize) -> Result<()> {
@@ -1379,9 +1407,6 @@ pub mod ffi {
             count: usize,
         ) -> usize;
         fn delarocha_token_count(worker: *const RawWorker) -> usize;
-        fn delarocha_token_surface_start(worker: *const RawWorker, index: usize) -> usize;
-        fn delarocha_token_surface_end(worker: *const RawWorker, index: usize) -> usize;
-        fn delarocha_token_word_id(worker: *const RawWorker, index: usize) -> u32;
         fn delarocha_tokens_copy_spans(
             worker: *const RawWorker,
             starts: *mut usize,
@@ -1404,6 +1429,9 @@ pub mod ffi {
 
     pub struct ZigWorker<'tokenizer> {
         raw: NonNull<RawWorker>,
+        span_starts: Vec<usize>,
+        span_ends: Vec<usize>,
+        span_word_ids: Vec<u32>,
         _tokenizer: PhantomData<&'tokenizer ZigTokenizer>,
     }
 
@@ -1585,6 +1613,9 @@ pub mod ffi {
             let raw = NonNull::new(raw).ok_or_else(last_error)?;
             Ok(ZigWorker {
                 raw,
+                span_starts: Vec::new(),
+                span_ends: Vec::new(),
+                span_word_ids: Vec::new(),
                 _tokenizer: PhantomData,
             })
         }
@@ -1651,16 +1682,31 @@ pub mod ffi {
             }
 
             let count = unsafe { delarocha_token_count(self.raw.as_ptr()) };
+            self.span_starts.resize(count, 0);
+            self.span_ends.resize(count, 0);
+            self.span_word_ids.resize(count, 0);
+            let copied = unsafe {
+                delarocha_tokens_copy_spans(
+                    self.raw.as_ptr(),
+                    self.span_starts.as_mut_ptr(),
+                    self.span_ends.as_mut_ptr(),
+                    self.span_word_ids.as_mut_ptr(),
+                    count,
+                )
+            };
+            if copied == usize::MAX {
+                return Err(last_error());
+            }
             let mut tokens = Vec::with_capacity(count);
             // Token byte ranges are emitted in sentence order. Keep the
             // character cursor moving forward so long inputs do not rescan the
             // whole prefix for every token.
             let mut previous_byte = 0usize;
             let mut current_char = 0usize;
-            for index in 0..count {
-                let start = unsafe { delarocha_token_surface_start(self.raw.as_ptr(), index) };
-                let end = unsafe { delarocha_token_surface_end(self.raw.as_ptr(), index) };
-                let word_id = unsafe { delarocha_token_word_id(self.raw.as_ptr(), index) };
+            for index in 0..copied {
+                let start = self.span_starts[index];
+                let end = self.span_ends[index];
+                let word_id = self.span_word_ids[index];
                 let feature_ptr = unsafe { delarocha_token_feature(self.raw.as_ptr(), index) };
                 let feature_len = unsafe { delarocha_token_feature_len(self.raw.as_ptr(), index) };
                 let feature = if feature_ptr.is_null() {
