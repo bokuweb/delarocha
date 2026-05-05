@@ -1407,9 +1407,6 @@ pub mod ffi {
             count: usize,
         ) -> usize;
         fn delarocha_token_count(worker: *const RawWorker) -> usize;
-        fn delarocha_token_surface_start(worker: *const RawWorker, index: usize) -> usize;
-        fn delarocha_token_surface_end(worker: *const RawWorker, index: usize) -> usize;
-        fn delarocha_token_word_id(worker: *const RawWorker, index: usize) -> u32;
         fn delarocha_tokens_copy_spans(
             worker: *const RawWorker,
             starts: *mut usize,
@@ -1432,6 +1429,9 @@ pub mod ffi {
 
     pub struct ZigWorker<'tokenizer> {
         raw: NonNull<RawWorker>,
+        span_starts: Vec<usize>,
+        span_ends: Vec<usize>,
+        span_word_ids: Vec<u32>,
         _tokenizer: PhantomData<&'tokenizer ZigTokenizer>,
     }
 
@@ -1613,6 +1613,9 @@ pub mod ffi {
             let raw = NonNull::new(raw).ok_or_else(last_error)?;
             Ok(ZigWorker {
                 raw,
+                span_starts: Vec::new(),
+                span_ends: Vec::new(),
+                span_word_ids: Vec::new(),
                 _tokenizer: PhantomData,
             })
         }
@@ -1679,16 +1682,31 @@ pub mod ffi {
             }
 
             let count = unsafe { delarocha_token_count(self.raw.as_ptr()) };
+            self.span_starts.resize(count, 0);
+            self.span_ends.resize(count, 0);
+            self.span_word_ids.resize(count, 0);
+            let copied = unsafe {
+                delarocha_tokens_copy_spans(
+                    self.raw.as_ptr(),
+                    self.span_starts.as_mut_ptr(),
+                    self.span_ends.as_mut_ptr(),
+                    self.span_word_ids.as_mut_ptr(),
+                    count,
+                )
+            };
+            if copied == usize::MAX {
+                return Err(last_error());
+            }
             let mut tokens = Vec::with_capacity(count);
             // Token byte ranges are emitted in sentence order. Keep the
             // character cursor moving forward so long inputs do not rescan the
             // whole prefix for every token.
             let mut previous_byte = 0usize;
             let mut current_char = 0usize;
-            for index in 0..count {
-                let start = unsafe { delarocha_token_surface_start(self.raw.as_ptr(), index) };
-                let end = unsafe { delarocha_token_surface_end(self.raw.as_ptr(), index) };
-                let word_id = unsafe { delarocha_token_word_id(self.raw.as_ptr(), index) };
+            for index in 0..copied {
+                let start = self.span_starts[index];
+                let end = self.span_ends[index];
+                let word_id = self.span_word_ids[index];
                 let feature_ptr = unsafe { delarocha_token_feature(self.raw.as_ptr(), index) };
                 let feature_len = unsafe { delarocha_token_feature_len(self.raw.as_ptr(), index) };
                 let feature = if feature_ptr.is_null() {
