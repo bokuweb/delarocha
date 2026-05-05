@@ -1562,6 +1562,11 @@ pub mod ffi {
 
             let count = unsafe { delarocha_token_count(self.raw.as_ptr()) };
             let mut tokens = Vec::with_capacity(count);
+            // Token byte ranges are emitted in sentence order. Keep the
+            // character cursor moving forward so long inputs do not rescan the
+            // whole prefix for every token.
+            let mut previous_byte = 0usize;
+            let mut current_char = 0usize;
             for index in 0..count {
                 let start = unsafe { delarocha_token_surface_start(self.raw.as_ptr(), index) };
                 let end = unsafe { delarocha_token_surface_end(self.raw.as_ptr(), index) };
@@ -1576,12 +1581,17 @@ pub mod ffi {
                     })
                     .unwrap_or_default()
                 };
+                current_char += input[previous_byte..start].chars().count();
+                let start_char = current_char;
+                current_char += input[start..end].chars().count();
+                let end_char = current_char;
+                previous_byte = end;
                 tokens.push(Token {
                     surface: input[start..end].to_owned(),
                     start,
                     end,
-                    start_char: input[..start].chars().count(),
-                    end_char: input[..end].chars().count(),
+                    start_char,
+                    end_char,
                     word_id,
                     feature: feature.to_owned(),
                     total_cost: 0,

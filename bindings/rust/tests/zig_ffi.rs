@@ -22,6 +22,8 @@ fn zig_ffi_tokenizes_fixture_dictionary() {
     );
     assert_eq!(tokens[0].byte_range(), 0..6);
     assert_eq!(tokens[1].byte_range(), 6..15);
+    assert_eq!(tokens[0].range_char(), 0..2);
+    assert_eq!(tokens[1].range_char(), 2..5);
 }
 
 #[test]
@@ -42,6 +44,9 @@ fn zig_ffi_full_tokenize_accepts_interior_nul() {
             .collect::<Vec<_>>(),
         ["本", "\0", "カレー"]
     );
+    assert_eq!(tokens[0].range_char(), 0..1);
+    assert_eq!(tokens[1].range_char(), 1..2);
+    assert_eq!(tokens[2].range_char(), 2..5);
 }
 
 #[test]
