@@ -105,6 +105,29 @@ MeCab-compatible space skipping and unknown grouping options are available:
 cargo run -p delarocha -- --lex lex.csv --matrix matrix.def --char char.def --unk unk.def -S -M 24
 ```
 
+## WebAssembly Playground
+
+The Rust tokenizer can be compiled to WebAssembly and used from a static
+browser playground. The playground downloads MeCab ipadic source data, converts
+it to UTF-8, and serves gzip-compressed dictionary assets next to the static UI:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install -f wasm-bindgen-cli --version 0.2.120
+cargo build -p delarocha --lib --target wasm32-unknown-unknown --features wasm --release
+mkdir -p public/pkg
+cp -R playground/. public/
+python3 scripts/prepare_ipadic_playground.py --out-dir public/dic
+wasm-bindgen \
+  --target web \
+  --out-dir public/pkg \
+  --out-name delarocha \
+  target/wasm32-unknown-unknown/release/delarocha.wasm
+python3 -m http.server 4173 --directory public
+```
+
+Pushes to `main` build the same artifact and deploy it to GitHub Pages.
+
 ## Zig Tests
 
 Requires Zig on `PATH`.

@@ -6,6 +6,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: test (${{ matrix.os }})
@@ -23,6 +26,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -43,6 +48,60 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo test -p delarocha --features "zig-ffi vibrato-bench" --example yokohama_text_bench --no-run
 
+      - name: Compile WASM package
+        if: runner.os == 'Linux'
+        run: cargo build -p delarocha --lib --target wasm32-unknown-unknown --features wasm --release
+
       - name: Zig tests
         working-directory: zig
         run: zig build test
+
+  deploy-pages:
+    name: deploy playground
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen CLI
+        run: cargo install -f wasm-bindgen-cli --version 0.2.120
+
+      - name: Build WASM
+        run: cargo build -p delarocha --lib --target wasm32-unknown-unknown --features wasm --release
+
+      - name: Prepare playground
+        run: |
+          mkdir -p public/pkg
+          cp -R playground/. public/
+          python3 scripts/prepare_ipadic_playground.py --out-dir public/dic
+          wasm-bindgen \
+            --target web \
+            --out-dir public/pkg \
+            --out-name delarocha \
+            target/wasm32-unknown-unknown/release/delarocha.wasm
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

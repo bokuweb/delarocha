@@ -6,6 +6,8 @@ use std::io::Read;
 use std::ops::Range;
 #[cfg(feature = "vibrato-system")]
 use std::path::Path;
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+use wasm_bindgen::prelude::*;
 
 const UNKNOWN_WORD_BASE: u32 = 1 << 31;
 const USER_WORD_BASE: u32 = 1 << 30;
@@ -747,6 +749,203 @@ impl CompatWorker<'_> {
     pub fn token_iter(&self) -> impl Iterator<Item = &Token> {
         self.worker.tokens.iter()
     }
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+#[wasm_bindgen]
+#[derive(Clone, Debug)]
+pub struct WasmTokenizer {
+    dictionary: Dictionary,
+    ignore_space: bool,
+    max_grouping_len: usize,
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+#[wasm_bindgen]
+impl WasmTokenizer {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> std::result::Result<WasmTokenizer, JsValue> {
+        let dictionary = build_fixture_dictionary().map_err(js_error)?;
+        Ok(Self {
+            dictionary,
+            ignore_space: false,
+            max_grouping_len: 24,
+        })
+    }
+
+    #[wasm_bindgen(js_name = setOptions)]
+    pub fn set_options(
+        &mut self,
+        ignore_space: bool,
+        max_grouping_len: usize,
+    ) -> std::result::Result<(), JsValue> {
+        self.ignore_space = ignore_space;
+        self.max_grouping_len = max_grouping_len;
+        self.build_tokenizer().map(|_| ()).map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = resetDictionary)]
+    pub fn reset_dictionary(
+        &mut self,
+        lexicon_csv: &str,
+        matrix_def: &str,
+        char_def: &str,
+        unk_def: &str,
+    ) -> std::result::Result<(), JsValue> {
+        let dictionary = SystemDictionaryBuilder::from_readers(
+            lexicon_csv.as_bytes(),
+            matrix_def.as_bytes(),
+            char_def.as_bytes(),
+            unk_def.as_bytes(),
+        )
+        .map_err(js_error)?;
+        self.dictionary = dictionary;
+        self.build_tokenizer().map(|_| ()).map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = resetFixtureDictionary)]
+    pub fn reset_fixture_dictionary(&mut self) -> std::result::Result<(), JsValue> {
+        self.dictionary = build_fixture_dictionary().map_err(js_error)?;
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = tokenizeJson)]
+    pub fn tokenize_json(&self, input: &str) -> std::result::Result<String, JsValue> {
+        let tokens = self
+            .build_tokenizer()
+            .map_err(js_error)?
+            .tokenize(input)
+            .map_err(js_error)?;
+        Ok(tokens_to_json(&tokens))
+    }
+
+    #[wasm_bindgen(js_name = tokenizeWakati)]
+    pub fn tokenize_wakati(&self, input: &str) -> std::result::Result<String, JsValue> {
+        let tokens = self
+            .build_tokenizer()
+            .map_err(js_error)?
+            .tokenize(input)
+            .map_err(js_error)?;
+        Ok(tokens
+            .iter()
+            .map(|token| token.surface.as_str())
+            .collect::<Vec<_>>()
+            .join(" "))
+    }
+
+    #[wasm_bindgen(js_name = tokenizeCount)]
+    pub fn tokenize_count(&self, input: &str) -> std::result::Result<usize, JsValue> {
+        self.build_tokenizer()
+            .map_err(js_error)?
+            .tokenize_count(input)
+            .map_err(js_error)
+    }
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+impl WasmTokenizer {
+    fn build_tokenizer(&self) -> Result<Tokenizer> {
+        Ok(Tokenizer::new(self.dictionary.clone())
+            .ignore_space(self.ignore_space)?
+            .max_grouping_len(self.max_grouping_len))
+    }
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+fn build_fixture_dictionary() -> Result<Dictionary> {
+    SystemDictionaryBuilder::from_readers(
+        WASM_PLAYGROUND_LEX.as_bytes(),
+        WASM_PLAYGROUND_MATRIX.as_bytes(),
+        WASM_PLAYGROUND_CHAR.as_bytes(),
+        WASM_PLAYGROUND_UNK.as_bytes(),
+    )
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+const WASM_PLAYGROUND_LEX: &str = "本,0,0,10,名詞-普通名詞-一般,ホン\n\
+と,0,0,1,助詞-格助詞,ト\n\
+カレー,0,0,10,名詞-普通名詞-一般,カレー\n";
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+const WASM_PLAYGROUND_MATRIX: &str = "1 1\n0 0 0\n";
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+const WASM_PLAYGROUND_CHAR: &str = "DEFAULT 1 0 1\n\
+SPACE 1 1 24\n\
+ALPHA 1 1 24\n\
+KATAKANA 0 1 24\n\
+EMOJI 1 1 1\n\
+0x0020 SPACE\n\
+0x0041..0x005A ALPHA\n\
+0x0061..0x007A ALPHA\n\
+0x30A0..0x30FF KATAKANA\n\
+0x1F300..0x1FAFF EMOJI\n";
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+const WASM_PLAYGROUND_UNK: &str = "DEFAULT,0,0,10000,*\n\
+SPACE,0,0,10000,空白,\n\
+ALPHA,0,0,10000,記号-文字,\n\
+KATAKANA,0,0,10000,名詞-普通名詞-一般,\n\
+EMOJI,0,0,10000,補助記号-一般,\n";
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+fn tokens_to_json(tokens: &[Token]) -> String {
+    let mut json = String::from("[");
+    for (i, token) in tokens.iter().enumerate() {
+        if i != 0 {
+            json.push(',');
+        }
+        json.push_str("{\"surface\":");
+        push_json_string(&mut json, &token.surface);
+        json.push_str(",\"feature\":");
+        push_json_string(&mut json, &token.feature);
+        json.push_str(",\"start\":");
+        json.push_str(&token.start.to_string());
+        json.push_str(",\"end\":");
+        json.push_str(&token.end.to_string());
+        json.push_str(",\"startChar\":");
+        json.push_str(&token.start_char.to_string());
+        json.push_str(",\"endChar\":");
+        json.push_str(&token.end_char.to_string());
+        json.push_str(",\"wordId\":");
+        json.push_str(&token.word_id.to_string());
+        json.push_str(",\"totalCost\":");
+        json.push_str(&token.total_cost.to_string());
+        json.push_str(",\"unknown\":");
+        json.push_str(if token.is_unknown() { "true" } else { "false" });
+        json.push('}');
+    }
+    json.push(']');
+    json
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+fn push_json_string(json: &mut String, value: &str) {
+    json.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => json.push_str("\\\""),
+            '\\' => json.push_str("\\\\"),
+            '\n' => json.push_str("\\n"),
+            '\r' => json.push_str("\\r"),
+            '\t' => json.push_str("\\t"),
+            '\u{08}' => json.push_str("\\b"),
+            '\u{0c}' => json.push_str("\\f"),
+            ch if ch <= '\u{1f}' => {
+                json.push_str("\\u00");
+                let code = ch as u8;
+                json.push(char::from_digit(u32::from(code >> 4), 16).expect("hex digit"));
+                json.push(char::from_digit(u32::from(code & 0x0f), 16).expect("hex digit"));
+            }
+            ch => json.push(ch),
+        }
+    }
+    json.push('"');
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+fn js_error(err: Error) -> JsValue {
+    JsValue::from_str(&err.to_string())
 }
 
 #[derive(Debug)]
