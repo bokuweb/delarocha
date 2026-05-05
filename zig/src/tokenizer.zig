@@ -463,12 +463,14 @@ pub const Worker = struct {
     }
 
     inline fn appendUnknownCount(self: *Worker, input: []const u8, begin: usize, has_matched: bool) !void {
+        if (has_matched and !self.dictionary.char_property.has_invoke) return;
+
         const first = codepointWithEndAssumeValid(input, begin) orelse return error.InvalidDictionary;
         if (has_matched and !self.dictionary.char_property.mayInvoke(first.ch)) return;
         const info = self.dictionary.char_property.info(first.ch);
 
         var emitted = false;
-        const group_span = groupSpanAfterFirst(input, first.end, &self.dictionary.char_property, info);
+        const group_span = groupSpanAfterFirstAssumeValid(input, first.end, &self.dictionary.char_property, info);
         const end_group = group_span.end;
         const group_len = if (info.category.group or info.category.length != 0) group_span.count else 0;
         const max_len = @min(info.category.length, group_len);
@@ -859,6 +861,21 @@ fn groupSpanAfterFirst(input: []const u8, first_end: usize, char_property: *cons
         const info = char_property.info(ch);
         if (!intersects(start_info.category_ids, info.category_ids)) break;
         end = nextBoundary(input, end) orelse break;
+        count += 1;
+    }
+    return .{ .end = end, .count = count };
+}
+
+fn groupSpanAfterFirstAssumeValid(input: []const u8, first_end: usize, char_property: *const dict_mod.CharProperty, start_info: dict_mod.CharInfo) GroupSpan {
+    // Count-only FFI callers pass Rust `&str`, so grouping can use the same
+    // unchecked UTF-8 decoder as the surrounding count hot path.
+    var end = first_end;
+    var count: usize = 1;
+    while (end < input.len) {
+        const next = codepointWithEndAssumeValid(input, end) orelse break;
+        const info = char_property.info(next.ch);
+        if (!intersects(start_info.category_ids, info.category_ids)) break;
+        end = next.end;
         count += 1;
     }
     return .{ .end = end, .count = count };
