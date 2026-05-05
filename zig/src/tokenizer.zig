@@ -154,7 +154,7 @@ pub const Worker = struct {
         // carrying error formatting and error-return branches through every
         // benchmark iteration.
         if (input.len == 0) {
-            self.resetCount(0) catch unreachable;
+            self.resetCount() catch unreachable;
             return 0;
         }
         const best = self.buildBestCountPath(input) catch unreachable;
@@ -190,29 +190,33 @@ pub const Worker = struct {
     }
 
     fn buildBestCountPath(self: *Worker, input: []const u8) !u32 {
-        try self.resetCount(input.len);
+        try self.resetCount();
         if (input.len == 0) return error.NoPath;
 
         try self.appendCountNode(.bos());
         self.count_end_heads.items[0] = 0;
 
         var begin: usize = 0;
-        while (begin < input.len) : (begin = nextBoundary(input, begin) orelse input.len) {
-            if (self.count_end_heads.items[begin] == invalid_count_node) continue;
+        var begin_index: usize = 0;
+        while (begin < input.len) : ({
+            begin = nextBoundary(input, begin) orelse input.len;
+            begin_index += 1;
+        }) {
+            if (self.count_end_heads.items[begin_index] == invalid_count_node) continue;
 
             var emitted = false;
             if (self.dictionary.user_entries.len != 0) {
-                try self.appendEntriesCount(input, begin, self.dictionary.user_entries, &emitted);
+                try self.appendEntriesCount(input, begin, begin_index, self.dictionary.user_entries, &emitted);
             }
             if (self.dictionary.trie_pair.len == 0) {
-                try self.appendIndexedEntriesCount(input, begin, &emitted);
+                try self.appendIndexedEntriesCount(input, begin, begin_index, &emitted);
             } else {
-                try self.appendTrieEntriesCount(input, begin, &emitted);
+                try self.appendTrieEntriesCount(input, begin, begin_index, &emitted);
             }
-            try self.appendUnknownCount(input, begin, emitted);
+            try self.appendUnknownCount(input, begin, begin_index, emitted);
         }
 
-        return self.bestCountEndNode(input.len);
+        return self.bestCountEndNode(begin_index);
     }
 
     fn appendEntries(self: *Worker, input: []const u8, begin: usize, entries: []const dict_mod.Entry, word_base: u32, emitted: *bool) !void {
@@ -331,31 +335,39 @@ pub const Worker = struct {
         }
     }
 
-    inline fn appendEntriesCount(self: *Worker, input: []const u8, begin: usize, entries: []const dict_mod.Entry, emitted: *bool) !void {
+    inline fn appendEntriesCount(self: *Worker, input: []const u8, begin: usize, begin_index: usize, entries: []const dict_mod.Entry, emitted: *bool) !void {
         for (entries) |entry| {
             if (std.mem.startsWith(u8, input[begin..], entry.surface)) {
-                self.appendBestCountNode(begin, begin + entry.surface.len, entry.left_id, entry.right_id, entry.word_cost);
+                self.appendBestCountNode(begin_index, begin_index + utf8BoundaryCountAssumeValid(entry.surface), entry.left_id, entry.right_id, entry.word_cost);
                 emitted.* = true;
             }
         }
     }
 
-    inline fn appendTrieEntriesCount(self: *Worker, input: []const u8, begin: usize, emitted: *bool) !void {
+    inline fn appendTrieEntriesCount(self: *Worker, input: []const u8, begin: usize, begin_index: usize, emitted: *bool) !void {
         var node_index: usize = undefined;
         var pos: usize = begin + 1;
+        var end_index: usize = begin_index;
+        var next_boundary = nextBoundary(input, begin) orelse input.len;
         if (rootBmpNodeAssumeValid(self.dictionary, input, begin)) |root| {
             // Valid UTF-8 dictionary surfaces cannot end after only the first
             // byte of a multibyte BMP scalar. Starting from the BMP root table
             // skips that empty first-byte term check on the common Japanese
             // count-only path.
             node_index = root.node_index;
-            self.appendTrieCountTerms(begin, root.end, node_index, emitted);
+            end_index = begin_index + 1;
+            self.appendTrieCountTerms(begin_index, end_index, node_index, emitted);
             pos = root.end;
+            next_boundary = nextBoundary(input, pos) orelse input.len + 1;
         } else {
             const first_node = self.dictionary.trie_first[input[begin]];
             if (first_node == dict_mod.invalid_trie_node) return;
             node_index = @intCast(first_node);
-            self.appendTrieCountTerms(begin, begin + 1, node_index, emitted);
+            if (pos == next_boundary) {
+                end_index += 1;
+                self.appendTrieCountTerms(begin_index, end_index, node_index, emitted);
+                next_boundary = nextBoundary(input, pos) orelse input.len + 1;
+            }
         }
         if (pos == begin + 1 and pos < input.len) {
             // The root pair table avoids the first trie edge lookup for the
@@ -366,8 +378,12 @@ pub const Worker = struct {
             const pair_node = self.dictionary.trie_pair[pair_index];
             if (pair_node == dict_mod.invalid_trie_node) return;
             node_index = @intCast(pair_node);
-            self.appendTrieCountTerms(begin, begin + 2, node_index, emitted);
             pos = begin + 2;
+            if (pos == next_boundary) {
+                end_index += 1;
+                self.appendTrieCountTerms(begin_index, end_index, node_index, emitted);
+                next_boundary = nextBoundary(input, pos) orelse input.len + 1;
+            }
         }
         if (self.dictionary.trie_triple.len != 0 and pos == begin + 2 and pos < input.len) {
             // Kept as a conditional hook for dictionaries that may choose to
@@ -377,16 +393,25 @@ pub const Worker = struct {
             const triple_node = self.dictionary.trie_triple[triple_index];
             if (triple_node == dict_mod.invalid_trie_node) return;
             node_index = @intCast(triple_node);
-            self.appendTrieCountTerms(begin, begin + 3, node_index, emitted);
             pos = begin + 3;
+            if (pos == next_boundary) {
+                end_index += 1;
+                self.appendTrieCountTerms(begin_index, end_index, node_index, emitted);
+                next_boundary = nextBoundary(input, pos) orelse input.len + 1;
+            }
         }
         while (pos < input.len) : (pos += 1) {
             node_index = self.findTrieEdge(node_index, input[pos]) orelse break;
-            self.appendTrieCountTerms(begin, pos + 1, node_index, emitted);
+            const end = pos + 1;
+            if (end == next_boundary) {
+                end_index += 1;
+                self.appendTrieCountTerms(begin_index, end_index, node_index, emitted);
+                next_boundary = nextBoundary(input, end) orelse input.len + 1;
+            }
         }
     }
 
-    inline fn appendTrieCountTerms(self: *Worker, begin: usize, end: usize, node_index: usize, emitted: *bool) void {
+    inline fn appendTrieCountTerms(self: *Worker, begin_index: usize, end_index: usize, node_index: usize, emitted: *bool) void {
         // Count-only trie nodes store a compact term stream. Iterating it here
         // avoids rebuilding slice values at every trie depth and keeps the
         // candidate append path shared across root, pair, triple, and edge hits.
@@ -395,16 +420,16 @@ pub const Worker = struct {
         const stop = index + @as(usize, @intCast(node.count_word_len));
         while (index < stop) : (index += 1) {
             const term = self.dictionary.trie_count_terms[index];
-            self.appendBestCountNode(begin, end, term.left_id, term.right_id, term.word_cost);
+            self.appendBestCountNode(begin_index, end_index, term.left_id, term.right_id, term.word_cost);
             emitted.* = true;
         }
     }
 
-    inline fn appendIndexedEntriesCount(self: *Worker, input: []const u8, begin: usize, emitted: *bool) !void {
+    inline fn appendIndexedEntriesCount(self: *Worker, input: []const u8, begin: usize, begin_index: usize, emitted: *bool) !void {
         for (self.dictionary.entry_index.buckets[input[begin]]) |word_id| {
             const entry = self.dictionary.entries[word_id];
             if (surfaceMatchesIndexed(input, begin, entry.surface)) {
-                self.appendBestCountNode(begin, begin + entry.surface.len, entry.left_id, entry.right_id, entry.word_cost);
+                self.appendBestCountNode(begin_index, begin_index + utf8BoundaryCountAssumeValid(entry.surface), entry.left_id, entry.right_id, entry.word_cost);
                 emitted.* = true;
             }
         }
@@ -462,26 +487,16 @@ pub const Worker = struct {
         }
     }
 
-    inline fn appendUnknownCount(self: *Worker, input: []const u8, begin: usize, has_matched: bool) !void {
+    inline fn appendUnknownCount(self: *Worker, input: []const u8, begin: usize, begin_index: usize, has_matched: bool) !void {
         const first = codepointWithEndAssumeValid(input, begin) orelse return error.InvalidDictionary;
         if (has_matched and !self.dictionary.char_property.mayInvoke(first.ch)) return;
         const info = self.dictionary.char_property.info(first.ch);
 
         var emitted = false;
         const group_span = groupSpanAfterFirst(input, first.end, &self.dictionary.char_property, info);
-        const end_group = group_span.end;
+        const end_group_index = begin_index + group_span.count;
         const group_len = if (info.category.group or info.category.length != 0) group_span.count else 0;
         const max_len = @min(info.category.length, group_len);
-        var len_ends_buf: [8]usize = undefined;
-        const cached_len_ends = max_len <= len_ends_buf.len;
-        if (cached_len_ends) {
-            var end = begin;
-            var len: usize = 1;
-            while (len <= max_len) : (len += 1) {
-                end = nextBoundary(input, end) orelse return error.InvalidDictionary;
-                len_ends_buf[len - 1] = end;
-            }
-        }
         for (self.dictionary.unk_index.count_buckets[info.base_id]) |unk| {
             var grouped = false;
             if (info.category.group) {
@@ -489,7 +504,7 @@ pub const Worker = struct {
                     break :blk group_len -| 1 <= max_grouping_len;
                 } else true;
                 if (can_group) {
-                    self.appendBestCountNode(begin, end_group, unk.left_id, unk.right_id, unk.word_cost);
+                    self.appendBestCountNode(begin_index, end_group_index, unk.left_id, unk.right_id, unk.word_cost);
                     emitted = true;
                     grouped = true;
                 }
@@ -497,15 +512,14 @@ pub const Worker = struct {
             var len: usize = 1;
             while (len <= max_len) : (len += 1) {
                 if (grouped and len == group_len) continue;
-                const end = if (cached_len_ends) len_ends_buf[len - 1] else try nthBoundary(input, begin, len);
-                self.appendBestCountNode(begin, end, unk.left_id, unk.right_id, unk.word_cost);
+                self.appendBestCountNode(begin_index, begin_index + len, unk.left_id, unk.right_id, unk.word_cost);
                 emitted = true;
             }
         }
 
         if (!has_matched and !emitted) {
             const fallback = self.dictionary.unk_index.fallback_terms[info.base_id];
-            self.appendBestCountNode(begin, first.end, fallback.left_id, fallback.right_id, fallback.word_cost);
+            self.appendBestCountNode(begin_index, begin_index + 1, fallback.left_id, fallback.right_id, fallback.word_cost);
         }
     }
 
@@ -517,11 +531,10 @@ pub const Worker = struct {
         @memset(self.end_heads.items[0 .. len + 1], invalid_node);
     }
 
-    fn resetCount(self: *Worker, len: usize) !void {
+    fn resetCount(self: *Worker) !void {
         self.count_nodes.clearRetainingCapacity();
-        try self.count_end_heads.ensureTotalCapacity(self.allocator, len + 1);
-        while (self.count_end_heads.items.len < len + 1) try self.count_end_heads.append(self.allocator, invalid_count_node);
-        @memset(self.count_end_heads.items[0 .. len + 1], invalid_count_node);
+        self.count_end_heads.clearRetainingCapacity();
+        try self.count_end_heads.append(self.allocator, invalid_count_node);
     }
 
     fn appendBestNode(self: *Worker, begin: usize, end: usize, candidate: Candidate) !void {
@@ -546,6 +559,7 @@ pub const Worker = struct {
         // dictionary and unknown-word loops.
         const best = self.findBestCountPrev(begin, left_id, word_cost);
         const token_count = self.count_nodes.items[best.index].token_count + 1;
+        self.ensureCountEndHead(end);
         var existing_index = self.count_end_heads.items[end];
         while (existing_index != invalid_count_node) : (existing_index = self.count_nodes.items[existing_index].next_end) {
             var existing = &self.count_nodes.items[existing_index];
@@ -564,6 +578,12 @@ pub const Worker = struct {
             .next_end = self.count_end_heads.items[end],
         }) catch unreachable;
         self.count_end_heads.items[end] = @intCast(index);
+    }
+
+    inline fn ensureCountEndHead(self: *Worker, index: usize) void {
+        while (self.count_end_heads.items.len <= index) {
+            self.count_end_heads.append(self.allocator, invalid_count_node) catch unreachable;
+        }
     }
 
     inline fn appendCountNode(self: *Worker, node: CountNode) !void {
@@ -816,6 +836,16 @@ inline fn nextCodepointWithEnd(input: []const u8, start: usize) ?CodepointWithEn
 
 inline fn codepointAtAssumeValid(input: []const u8, start: usize) ?u21 {
     return (codepointWithEndAssumeValid(input, start) orelse return null).ch;
+}
+
+inline fn utf8BoundaryCountAssumeValid(input: []const u8) usize {
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (pos < input.len) {
+        pos = nextBoundary(input, pos) orelse input.len;
+        count += 1;
+    }
+    return count;
 }
 
 inline fn codepointWithEndAssumeValid(input: []const u8, start: usize) ?CodepointWithEnd {
