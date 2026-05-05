@@ -53,6 +53,14 @@ fn bench_zig_ffi(c: &mut Criterion) {
         });
     });
 
+    c.bench_function("delarocha/zig-ffi-full-tokenize", |b| {
+        b.iter(|| {
+            for sentence in SENTENCES {
+                black_box(worker.tokenize(black_box(sentence)).unwrap());
+            }
+        });
+    });
+
     let batch = delarocha::ffi::ZigBatch::new(SENTENCES);
     c.bench_function("delarocha/zig-ffi-batch", |b| {
         b.iter(|| {
