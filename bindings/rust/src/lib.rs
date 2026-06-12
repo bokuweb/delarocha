@@ -1197,23 +1197,58 @@ impl<'dict> Worker<'dict> {
     }
 
     fn find_best_prev(&self, begin: usize, candidate: Candidate) -> Result<(usize, i32)> {
-        EndLinkIter {
-            links: &self.end_links,
-            next: self.ends[begin],
+        let first_link = self.ends[begin]
+            .ok_or_else(|| Error::Tokenization("candidate has no previous node".into()))?;
+        let left = usize::from(candidate.left_id);
+        let matrix = &self.dictionary.matrix;
+        if left >= matrix.left_size {
+            return EndLinkIter {
+                links: &self.end_links,
+                next: Some(first_link),
+            }
+            .map(|link| link.node)
+            .map(|prev_index| {
+                let prev = &self.nodes[prev_index];
+                let cost = prev.min_cost
+                    + matrix.cost(prev.right_id, candidate.left_id)
+                    + candidate.word_cost;
+                (prev_index, cost)
+            })
+            .min_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+            .ok_or_else(|| Error::Tokenization("candidate has no previous node".into()));
         }
-        .map(|link| link.node)
-        .map(|prev_index| {
-            let prev = &self.nodes[prev_index];
+
+        let matrix_row = &matrix.costs[left * matrix.right_size..(left + 1) * matrix.right_size];
+        let first = self.end_links[first_link];
+        if first.next.is_none() {
+            let prev = &self.nodes[first.node];
+            return Ok((
+                first.node,
+                prev.min_cost
+                    + i32::from(matrix_row[usize::from(prev.right_id)])
+                    + candidate.word_cost,
+            ));
+        }
+
+        let mut best_index = first.node;
+        let first_prev = &self.nodes[first.node];
+        let mut best_cost = first_prev.min_cost
+            + i32::from(matrix_row[usize::from(first_prev.right_id)])
+            + candidate.word_cost;
+        let mut next = first.next;
+        while let Some(link_index) = next {
+            let link = self.end_links[link_index];
+            let prev = &self.nodes[link.node];
             let cost = prev.min_cost
-                + self
-                    .dictionary
-                    .matrix
-                    .cost(prev.right_id, candidate.left_id)
+                + i32::from(matrix_row[usize::from(prev.right_id)])
                 + candidate.word_cost;
-            (prev_index, cost)
-        })
-        .min_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
-        .ok_or_else(|| Error::Tokenization("candidate has no previous node".into()))
+            if cost < best_cost || (cost == best_cost && link.node > best_index) {
+                best_index = link.node;
+                best_cost = cost;
+            }
+            next = link.next;
+        }
+        Ok((best_index, best_cost))
     }
 
     fn count_path(&self, mut index: usize) -> usize {
