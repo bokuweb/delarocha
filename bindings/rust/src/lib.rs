@@ -3,14 +3,17 @@ use std::ffi::NulError;
 #[cfg(feature = "vibrato-system")]
 use std::io::BufReader;
 use std::io::Read;
+use std::marker::PhantomData;
 use std::ops::Range;
 #[cfg(feature = "vibrato-system")]
 use std::path::Path;
+use std::sync::Arc;
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 use wasm_bindgen::prelude::*;
 
 const UNKNOWN_WORD_BASE: u32 = 1 << 31;
 const USER_WORD_BASE: u32 = 1 << 30;
+const INVALID_LATTICE_INDEX: u32 = u32::MAX;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -430,6 +433,15 @@ impl VibratoSystemToken<'_, '_> {
 }
 
 impl ConnectionMatrix {
+    #[inline]
+    fn row(&self, left_id: u16) -> Option<&[i16]> {
+        let left = usize::from(left_id);
+        (left < self.left_size).then(|| {
+            let start = left * self.right_size;
+            &self.costs[start..start + self.right_size]
+        })
+    }
+
     fn parse_mecab(input: &str) -> Result<Self> {
         let mut lines = input.lines().filter(|line| !line.trim().is_empty());
         let header = lines
@@ -476,16 +488,6 @@ impl ConnectionMatrix {
             right_size,
             costs,
         })
-    }
-
-    #[inline]
-    fn cost(&self, right_id: u16, left_id: u16) -> i32 {
-        let right = usize::from(right_id);
-        let left = usize::from(left_id);
-        if right >= self.right_size || left >= self.left_size {
-            return i32::MAX / 4;
-        }
-        i32::from(self.costs[left * self.right_size + right])
     }
 }
 
@@ -654,7 +656,7 @@ impl Token {
 
 #[derive(Clone, Debug)]
 pub struct Tokenizer {
-    dictionary: Dictionary,
+    dictionary: Arc<Dictionary>,
     ignore_space_category: Option<usize>,
     max_grouping_len: Option<usize>,
 }
@@ -662,7 +664,7 @@ pub struct Tokenizer {
 impl Tokenizer {
     pub fn new(dictionary: Dictionary) -> Self {
         Self {
-            dictionary,
+            dictionary: Arc::new(dictionary),
             ignore_space_category: None,
             max_grouping_len: None,
         }
@@ -700,14 +702,19 @@ impl Tokenizer {
     }
 
     pub fn create_worker(&self) -> Worker<'_> {
+        self.create_owned_worker()
+    }
+
+    fn create_owned_worker(&self) -> Worker<'static> {
         Worker {
-            dictionary: &self.dictionary,
+            dictionary: Arc::clone(&self.dictionary),
             ignore_space_category: self.ignore_space_category,
             max_grouping_len: self.max_grouping_len,
             nodes: Vec::new(),
             ends: Vec::new(),
             end_links: Vec::new(),
             tokens: Vec::new(),
+            _dictionary_lifetime: PhantomData,
         }
     }
 
@@ -753,9 +760,10 @@ impl CompatWorker<'_> {
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 #[wasm_bindgen]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct WasmTokenizer {
-    dictionary: Dictionary,
+    tokenizer: Tokenizer,
+    worker: Worker<'static>,
     ignore_space: bool,
     max_grouping_len: usize,
 }
@@ -766,8 +774,11 @@ impl WasmTokenizer {
     #[wasm_bindgen(constructor)]
     pub fn new() -> std::result::Result<WasmTokenizer, JsValue> {
         let dictionary = build_fixture_dictionary().map_err(js_error)?;
+        let tokenizer = build_configured_tokenizer(dictionary, false, 24).map_err(js_error)?;
+        let worker = tokenizer.create_owned_worker();
         Ok(Self {
-            dictionary,
+            tokenizer,
+            worker,
             ignore_space: false,
             max_grouping_len: 24,
         })
@@ -781,7 +792,14 @@ impl WasmTokenizer {
     ) -> std::result::Result<(), JsValue> {
         self.ignore_space = ignore_space;
         self.max_grouping_len = max_grouping_len;
-        self.build_tokenizer().map(|_| ()).map_err(js_error)
+        self.tokenizer = build_configured_tokenizer(
+            self.tokenizer.dictionary.as_ref().clone(),
+            ignore_space,
+            max_grouping_len,
+        )
+        .map_err(js_error)?;
+        self.worker = self.tokenizer.create_owned_worker();
+        Ok(())
     }
 
     #[wasm_bindgen(js_name = resetDictionary)]
@@ -799,33 +817,34 @@ impl WasmTokenizer {
             unk_def.as_bytes(),
         )
         .map_err(js_error)?;
-        self.dictionary = dictionary;
-        self.build_tokenizer().map(|_| ()).map_err(js_error)
+        self.tokenizer =
+            build_configured_tokenizer(dictionary, self.ignore_space, self.max_grouping_len)
+                .map_err(js_error)?;
+        self.worker = self.tokenizer.create_owned_worker();
+        Ok(())
     }
 
     #[wasm_bindgen(js_name = resetFixtureDictionary)]
     pub fn reset_fixture_dictionary(&mut self) -> std::result::Result<(), JsValue> {
-        self.dictionary = build_fixture_dictionary().map_err(js_error)?;
+        self.tokenizer = build_configured_tokenizer(
+            build_fixture_dictionary().map_err(js_error)?,
+            self.ignore_space,
+            self.max_grouping_len,
+        )
+        .map_err(js_error)?;
+        self.worker = self.tokenizer.create_owned_worker();
         Ok(())
     }
 
     #[wasm_bindgen(js_name = tokenizeJson)]
-    pub fn tokenize_json(&self, input: &str) -> std::result::Result<String, JsValue> {
-        let tokens = self
-            .build_tokenizer()
-            .map_err(js_error)?
-            .tokenize(input)
-            .map_err(js_error)?;
+    pub fn tokenize_json(&mut self, input: &str) -> std::result::Result<String, JsValue> {
+        let tokens = self.worker.tokenize(input).map_err(js_error)?;
         Ok(tokens_to_json(&tokens))
     }
 
     #[wasm_bindgen(js_name = tokenizeWakati)]
-    pub fn tokenize_wakati(&self, input: &str) -> std::result::Result<String, JsValue> {
-        let tokens = self
-            .build_tokenizer()
-            .map_err(js_error)?
-            .tokenize(input)
-            .map_err(js_error)?;
+    pub fn tokenize_wakati(&mut self, input: &str) -> std::result::Result<String, JsValue> {
+        let tokens = self.worker.tokenize(input).map_err(js_error)?;
         Ok(tokens
             .iter()
             .map(|token| token.surface.as_str())
@@ -834,21 +853,20 @@ impl WasmTokenizer {
     }
 
     #[wasm_bindgen(js_name = tokenizeCount)]
-    pub fn tokenize_count(&self, input: &str) -> std::result::Result<usize, JsValue> {
-        self.build_tokenizer()
-            .map_err(js_error)?
-            .tokenize_count(input)
-            .map_err(js_error)
+    pub fn tokenize_count(&mut self, input: &str) -> std::result::Result<usize, JsValue> {
+        self.worker.tokenize_count(input).map_err(js_error)
     }
 }
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-impl WasmTokenizer {
-    fn build_tokenizer(&self) -> Result<Tokenizer> {
-        Ok(Tokenizer::new(self.dictionary.clone())
-            .ignore_space(self.ignore_space)?
-            .max_grouping_len(self.max_grouping_len))
-    }
+fn build_configured_tokenizer(
+    dictionary: Dictionary,
+    ignore_space: bool,
+    max_grouping_len: usize,
+) -> Result<Tokenizer> {
+    Ok(Tokenizer::new(dictionary)
+        .ignore_space(ignore_space)?
+        .max_grouping_len(max_grouping_len))
 }
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
@@ -950,32 +968,35 @@ fn js_error(err: Error) -> JsValue {
 
 #[derive(Debug)]
 pub struct Worker<'dict> {
-    dictionary: &'dict Dictionary,
+    dictionary: Arc<Dictionary>,
     ignore_space_category: Option<usize>,
     max_grouping_len: Option<usize>,
     nodes: Vec<Node>,
-    ends: Vec<Option<usize>>,
+    ends: Vec<u32>,
     end_links: Vec<EndLink>,
     tokens: Vec<Token>,
+    _dictionary_lifetime: PhantomData<&'dict Dictionary>,
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct Node {
     word_id: u32,
     start: usize,
     end: usize,
-    left_id: u16,
     right_id: u16,
-    word_cost: i32,
     min_cost: i32,
-    prev_node: Option<usize>,
+    prev_node: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct EndLink {
-    node: usize,
-    next: Option<usize>,
+    node: u32,
+    next: u32,
+}
+
+fn narrow_lattice_index(index: usize) -> Result<u32> {
+    u32::try_from(index)
+        .map_err(|_| Error::Tokenization("input produces too many lattice nodes".into()))
 }
 
 impl<'dict> Worker<'dict> {
@@ -995,17 +1016,18 @@ impl<'dict> Worker<'dict> {
     }
 
     fn build_best_path(&mut self, input: &str) -> Result<Option<usize>> {
+        let dictionary = Arc::clone(&self.dictionary);
         self.reset(input.len());
         if input.is_empty() {
             return Ok(None);
         }
 
         self.nodes.push(Node::bos());
-        self.push_end_link(0, 0);
+        self.push_end_link(0, 0)?;
         let input_bytes = input.as_bytes();
 
         for begin in char_boundaries(input) {
-            if begin == input.len() || self.ends[begin].is_none() {
+            if begin == input.len() || self.ends[begin] == INVALID_LATTICE_INDEX {
                 continue;
             }
             if let Some(space_category) = self.ignore_space_category {
@@ -1013,13 +1035,13 @@ impl<'dict> Worker<'dict> {
                     .chars()
                     .next()
                     .ok_or_else(|| Error::Tokenization("missing character at boundary".into()))?;
-                let info = self.dictionary.char_property.category_for(ch);
+                let info = dictionary.char_property.category_for(ch);
                 if info.category_ids.contains(&space_category) {
                     let end = group_end(input, begin, &self.dictionary.char_property, &info);
                     let mut link = self.ends[begin];
-                    while let Some(link_index) = link {
-                        let end_link = self.end_links[link_index];
-                        self.push_end_link(end, end_link.node);
+                    while link != INVALID_LATTICE_INDEX {
+                        let end_link = self.end_links[link as usize];
+                        self.push_end_link(end, end_link.node as usize)?;
                         link = end_link.next;
                     }
                     continue;
@@ -1027,8 +1049,8 @@ impl<'dict> Worker<'dict> {
             }
 
             let mut emitted = false;
-            for &word_id in &self.dictionary.user_entry_index[input_bytes[begin] as usize] {
-                let entry = &self.dictionary.user_entries[word_id];
+            for &word_id in &dictionary.user_entry_index[input_bytes[begin] as usize] {
+                let entry = &dictionary.user_entries[word_id];
                 if input_bytes[begin..].starts_with(entry.surface.as_bytes()) {
                     let end = begin + entry.surface.len();
                     self.append_best_node(
@@ -1044,8 +1066,8 @@ impl<'dict> Worker<'dict> {
                     emitted = true;
                 }
             }
-            for &word_id in &self.dictionary.entry_index[input_bytes[begin] as usize] {
-                let entry = &self.dictionary.entries[word_id];
+            for &word_id in &dictionary.entry_index[input_bytes[begin] as usize] {
+                let entry = &dictionary.entries[word_id];
                 if input_bytes[begin..].starts_with(entry.surface.as_bytes()) {
                     let end = begin + entry.surface.len();
                     self.append_best_node(
@@ -1062,19 +1084,16 @@ impl<'dict> Worker<'dict> {
                 }
             }
 
-            self.append_unknown_nodes(input, begin, emitted)?;
+            self.append_unknown_nodes(&dictionary, input, begin, emitted)?;
         }
 
-        let best = self.ends[input.len()]
-            .map(|first_link| EndLinkIter {
-                links: &self.end_links,
-                next: Some(first_link),
-            })
-            .into_iter()
-            .flatten()
-            .map(|link| link.node)
-            .min_by(|left, right| compare_node_cost(&self.nodes[*left], &self.nodes[*right]))
-            .ok_or_else(|| Error::Tokenization("no path reached the end of input".into()))?;
+        let best = EndLinkIter {
+            links: &self.end_links,
+            next: self.ends[input.len()],
+        }
+        .map(|link| link.node as usize)
+        .min_by(|left, right| compare_node_cost(&self.nodes[*left], &self.nodes[*right]))
+        .ok_or_else(|| Error::Tokenization("no path reached the end of input".into()))?;
         Ok(Some(best))
     }
 
@@ -1083,9 +1102,9 @@ impl<'dict> Worker<'dict> {
         self.tokens.clear();
         self.end_links.clear();
         if self.ends.len() < len + 1 {
-            self.ends.resize(len + 1, None);
+            self.ends.resize(len + 1, INVALID_LATTICE_INDEX);
         }
-        self.ends[..=len].fill(None);
+        self.ends[..=len].fill(INVALID_LATTICE_INDEX);
     }
 
     fn append_best_node(&mut self, begin: usize, end: usize, candidate: Candidate) -> Result<()> {
@@ -1095,40 +1114,45 @@ impl<'dict> Worker<'dict> {
             word_id: candidate.word_id,
             start: begin,
             end,
-            left_id: candidate.left_id,
             right_id: candidate.right_id,
-            word_cost: candidate.word_cost,
             min_cost,
-            prev_node: Some(prev_node),
+            prev_node: narrow_lattice_index(prev_node)?,
         });
-        self.push_end_link(end, index);
+        self.push_end_link(end, index)?;
         Ok(())
     }
 
-    fn push_end_link(&mut self, end: usize, node: usize) {
+    fn push_end_link(&mut self, end: usize, node: usize) -> Result<()> {
         let link = self.end_links.len();
         self.end_links.push(EndLink {
-            node,
+            node: narrow_lattice_index(node)?,
             next: self.ends[end],
         });
-        self.ends[end] = Some(link);
+        self.ends[end] = narrow_lattice_index(link)?;
+        Ok(())
     }
 
-    fn append_unknown_nodes(&mut self, input: &str, begin: usize, has_matched: bool) -> Result<()> {
+    fn append_unknown_nodes(
+        &mut self,
+        dictionary: &Dictionary,
+        input: &str,
+        begin: usize,
+        has_matched: bool,
+    ) -> Result<()> {
         let ch = input[begin..]
             .chars()
             .next()
             .ok_or_else(|| Error::Tokenization("missing character at unknown boundary".into()))?;
-        let info = self.dictionary.char_property.category_for(ch);
+        let info = dictionary.char_property.category_for(ch);
         if has_matched && !info.category.invoke {
             return Ok(());
         }
 
         let mut emitted = false;
-        let group_end = group_end(input, begin, &self.dictionary.char_property, &info);
+        let group_end = group_end(input, begin, &dictionary.char_property, &info);
         let group_len = input[begin..group_end].chars().count();
-        for &unk_id in &self.dictionary.unk_index[info.base_id] {
-            let unk = &self.dictionary.unk_entries[unk_id];
+        for &unk_id in &dictionary.unk_index[info.base_id] {
+            let unk = &dictionary.unk_entries[unk_id];
             let mut grouped = false;
             if info.category.group
                 && self
@@ -1170,9 +1194,9 @@ impl<'dict> Worker<'dict> {
 
         if !has_matched && !emitted {
             let end = next_char_boundary(input, begin)?;
-            let fallback = self.dictionary.unk_index[info.base_id]
+            let fallback = dictionary.unk_index[info.base_id]
                 .first()
-                .map(|&unk_id| (unk_id, &self.dictionary.unk_entries[unk_id]));
+                .map(|&unk_id| (unk_id, &dictionary.unk_entries[unk_id]));
             let (word_id, left_id, right_id, word_cost) =
                 fallback.map_or((UNKNOWN_WORD_BASE, 0, 0, 10_000), |(unk_id, unk)| {
                     (
@@ -1197,53 +1221,36 @@ impl<'dict> Worker<'dict> {
     }
 
     fn find_best_prev(&self, begin: usize, candidate: Candidate) -> Result<(usize, i32)> {
-        let first_link = self.ends[begin]
-            .ok_or_else(|| Error::Tokenization("candidate has no previous node".into()))?;
-        let left = usize::from(candidate.left_id);
-        let matrix = &self.dictionary.matrix;
-        if left >= matrix.left_size {
-            return EndLinkIter {
-                links: &self.end_links,
-                next: Some(first_link),
-            }
-            .map(|link| link.node)
-            .map(|prev_index| {
-                let prev = &self.nodes[prev_index];
-                let cost = prev.min_cost
-                    + matrix.cost(prev.right_id, candidate.left_id)
-                    + candidate.word_cost;
-                (prev_index, cost)
-            })
-            .min_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
-            .ok_or_else(|| Error::Tokenization("candidate has no previous node".into()));
+        let matrix_row = self
+            .dictionary
+            .matrix
+            .row(candidate.left_id)
+            .ok_or_else(|| Error::Tokenization("candidate has invalid left id".into()))?;
+        let first_link = self.ends[begin];
+        if first_link == INVALID_LATTICE_INDEX {
+            return Err(Error::Tokenization("candidate has no previous node".into()));
         }
-
-        let matrix_row = &matrix.costs[left * matrix.right_size..(left + 1) * matrix.right_size];
-        let first = self.end_links[first_link];
-        if first.next.is_none() {
-            let prev = &self.nodes[first.node];
-            return Ok((
-                first.node,
-                prev.min_cost
-                    + i32::from(matrix_row[usize::from(prev.right_id)])
-                    + candidate.word_cost,
-            ));
-        }
-
-        let mut best_index = first.node;
-        let first_prev = &self.nodes[first.node];
+        let first = self.end_links[first_link as usize];
+        let first_node = first.node as usize;
+        let first_prev = &self.nodes[first_node];
+        let mut best_index = first_node;
         let mut best_cost = first_prev.min_cost
             + i32::from(matrix_row[usize::from(first_prev.right_id)])
             + candidate.word_cost;
+        if first.next == INVALID_LATTICE_INDEX {
+            return Ok((best_index, best_cost));
+        }
+
         let mut next = first.next;
-        while let Some(link_index) = next {
-            let link = self.end_links[link_index];
-            let prev = &self.nodes[link.node];
+        while next != INVALID_LATTICE_INDEX {
+            let link = self.end_links[next as usize];
+            let node_index = link.node as usize;
+            let prev = &self.nodes[node_index];
             let cost = prev.min_cost
                 + i32::from(matrix_row[usize::from(prev.right_id)])
                 + candidate.word_cost;
-            if cost < best_cost || (cost == best_cost && link.node > best_index) {
-                best_index = link.node;
+            if cost < best_cost || (cost == best_cost && node_index > best_index) {
+                best_index = node_index;
                 best_cost = cost;
             }
             next = link.next;
@@ -1253,15 +1260,15 @@ impl<'dict> Worker<'dict> {
 
     fn count_path(&self, mut index: usize) -> usize {
         let mut count = 0usize;
-        while let Some(prev) = self.nodes[index].prev_node {
+        while self.nodes[index].prev_node != INVALID_LATTICE_INDEX {
             count += 1;
-            index = prev;
+            index = self.nodes[index].prev_node as usize;
         }
         count
     }
 
     fn backtrace(&mut self, input: &str, mut index: usize) -> Result<()> {
-        while let Some(prev) = self.nodes[index].prev_node {
+        while self.nodes[index].prev_node != INVALID_LATTICE_INDEX {
             let node = &self.nodes[index];
             let (surface, feature) = if node.word_id >= UNKNOWN_WORD_BASE {
                 let unk_index = (node.word_id - UNKNOWN_WORD_BASE) as usize;
@@ -1290,30 +1297,41 @@ impl<'dict> Worker<'dict> {
                 surface: surface.to_owned(),
                 start: node.start,
                 end: node.end,
-                start_char: input[..node.start].chars().count(),
-                end_char: input[..node.end].chars().count(),
+                start_char: 0,
+                end_char: 0,
                 word_id: node.word_id,
                 feature: feature.to_owned(),
                 total_cost: node.min_cost,
             });
-            index = prev;
+            index = self.nodes[index].prev_node as usize;
         }
         self.tokens.reverse();
+        let mut byte_cursor = 0;
+        let mut char_cursor = 0;
+        for token in &mut self.tokens {
+            char_cursor += input[byte_cursor..token.start].chars().count();
+            token.start_char = char_cursor;
+            char_cursor += input[token.start..token.end].chars().count();
+            token.end_char = char_cursor;
+            byte_cursor = token.end;
+        }
         Ok(())
     }
 }
 
 struct EndLinkIter<'a> {
     links: &'a [EndLink],
-    next: Option<usize>,
+    next: u32,
 }
 
 impl<'a> Iterator for EndLinkIter<'a> {
     type Item = EndLink;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let index = self.next?;
-        let link = self.links[index];
+        if self.next == INVALID_LATTICE_INDEX {
+            return None;
+        }
+        let link = self.links[self.next as usize];
         self.next = link.next;
         Some(link)
     }
@@ -1325,11 +1343,9 @@ impl Node {
             word_id: u32::MAX,
             start: 0,
             end: 0,
-            left_id: 0,
             right_id: 0,
-            word_cost: 0,
             min_cost: 0,
-            prev_node: None,
+            prev_node: INVALID_LATTICE_INDEX,
         }
     }
 }
@@ -1648,6 +1664,15 @@ pub mod ffi {
             word_ids: *mut u32,
             cap: usize,
         ) -> usize;
+        fn delarocha_tokens_copy_metadata(
+            worker: *const RawWorker,
+            starts: *mut u32,
+            ends: *mut u32,
+            word_ids: *mut u32,
+            feature_ptrs: *mut *const u8,
+            feature_lens: *mut usize,
+            cap: usize,
+        ) -> usize;
         fn delarocha_token_feature(
             worker: *const RawWorker,
             index: usize,
@@ -1663,9 +1688,11 @@ pub mod ffi {
 
     pub struct ZigWorker<'tokenizer> {
         raw: NonNull<RawWorker>,
-        span_starts: Vec<usize>,
-        span_ends: Vec<usize>,
+        span_starts: Vec<u32>,
+        span_ends: Vec<u32>,
         span_word_ids: Vec<u32>,
+        feature_ptrs: Vec<*const u8>,
+        feature_lens: Vec<usize>,
         _tokenizer: PhantomData<&'tokenizer ZigTokenizer>,
     }
 
@@ -1685,6 +1712,15 @@ pub mod ffi {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct ZigTokenSpan {
+        pub start: usize,
+        pub end: usize,
+        pub word_id: u32,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ZigTokenView<'a> {
+        pub surface: &'a str,
+        pub feature: &'a str,
         pub start: usize,
         pub end: usize,
         pub word_id: u32,
@@ -1850,6 +1886,8 @@ pub mod ffi {
                 span_starts: Vec::new(),
                 span_ends: Vec::new(),
                 span_word_ids: Vec::new(),
+                feature_ptrs: Vec::new(),
+                feature_lens: Vec::new(),
                 _tokenizer: PhantomData,
             })
         }
@@ -1919,12 +1957,16 @@ pub mod ffi {
             self.span_starts.resize(count, 0);
             self.span_ends.resize(count, 0);
             self.span_word_ids.resize(count, 0);
+            self.feature_ptrs.resize(count, std::ptr::null());
+            self.feature_lens.resize(count, 0);
             let copied = unsafe {
-                delarocha_tokens_copy_spans(
+                delarocha_tokens_copy_metadata(
                     self.raw.as_ptr(),
                     self.span_starts.as_mut_ptr(),
                     self.span_ends.as_mut_ptr(),
                     self.span_word_ids.as_mut_ptr(),
+                    self.feature_ptrs.as_mut_ptr(),
+                    self.feature_lens.as_mut_ptr(),
                     count,
                 )
             };
@@ -1938,11 +1980,11 @@ pub mod ffi {
             let mut previous_byte = 0usize;
             let mut current_char = 0usize;
             for index in 0..copied {
-                let start = self.span_starts[index];
-                let end = self.span_ends[index];
+                let start = self.span_starts[index] as usize;
+                let end = self.span_ends[index] as usize;
                 let word_id = self.span_word_ids[index];
-                let feature_ptr = unsafe { delarocha_token_feature(self.raw.as_ptr(), index) };
-                let feature_len = unsafe { delarocha_token_feature_len(self.raw.as_ptr(), index) };
+                let feature_ptr = self.feature_ptrs[index];
+                let feature_len = self.feature_lens[index];
                 let feature = if feature_ptr.is_null() {
                     ""
                 } else {
@@ -1968,6 +2010,53 @@ pub mod ffi {
                 });
             }
             Ok(tokens)
+        }
+
+        pub fn tokenize_views<'a>(&'a mut self, input: &'a str) -> Result<Vec<ZigTokenView<'a>>> {
+            let status =
+                unsafe { delarocha_tokenize_bytes(self.raw.as_ptr(), input.as_ptr(), input.len()) };
+            if status != 0 {
+                return Err(last_error());
+            }
+
+            let count = unsafe { delarocha_token_count(self.raw.as_ptr()) };
+            self.span_starts.resize(count, 0);
+            self.span_ends.resize(count, 0);
+            self.span_word_ids.resize(count, 0);
+            self.feature_ptrs.resize(count, std::ptr::null());
+            self.feature_lens.resize(count, 0);
+            let copied = unsafe {
+                delarocha_tokens_copy_metadata(
+                    self.raw.as_ptr(),
+                    self.span_starts.as_mut_ptr(),
+                    self.span_ends.as_mut_ptr(),
+                    self.span_word_ids.as_mut_ptr(),
+                    self.feature_ptrs.as_mut_ptr(),
+                    self.feature_lens.as_mut_ptr(),
+                    count,
+                )
+            };
+            if copied == usize::MAX {
+                return Err(last_error());
+            }
+
+            let mut views = Vec::with_capacity(copied);
+            for index in 0..copied {
+                let start = self.span_starts[index] as usize;
+                let end = self.span_ends[index] as usize;
+                let feature = std::str::from_utf8(unsafe {
+                    std::slice::from_raw_parts(self.feature_ptrs[index], self.feature_lens[index])
+                })
+                .unwrap_or_default();
+                views.push(ZigTokenView {
+                    surface: &input[start..end],
+                    feature,
+                    start,
+                    end,
+                    word_id: self.span_word_ids[index],
+                });
+            }
+            Ok(views)
         }
 
         pub fn tokenize_count(&mut self, input: &str) -> Result<usize> {
@@ -2005,15 +2094,19 @@ pub mod ffi {
             }
 
             let count = unsafe { delarocha_token_count(self.raw.as_ptr()) };
-            let mut starts = vec![0; count];
-            let mut ends = vec![0; count];
-            let mut word_ids = vec![0; count];
+            self.span_starts.resize(count, 0);
+            self.span_ends.resize(count, 0);
+            self.span_word_ids.resize(count, 0);
+            self.feature_ptrs.resize(count, std::ptr::null());
+            self.feature_lens.resize(count, 0);
             let copied = unsafe {
-                delarocha_tokens_copy_spans(
+                delarocha_tokens_copy_metadata(
                     self.raw.as_ptr(),
-                    starts.as_mut_ptr(),
-                    ends.as_mut_ptr(),
-                    word_ids.as_mut_ptr(),
+                    self.span_starts.as_mut_ptr(),
+                    self.span_ends.as_mut_ptr(),
+                    self.span_word_ids.as_mut_ptr(),
+                    self.feature_ptrs.as_mut_ptr(),
+                    self.feature_lens.as_mut_ptr(),
                     count,
                 )
             };
@@ -2022,9 +2115,9 @@ pub mod ffi {
             }
             Ok((0..copied)
                 .map(|index| ZigTokenSpan {
-                    start: starts[index],
-                    end: ends[index],
-                    word_id: word_ids[index],
+                    start: self.span_starts[index] as usize,
+                    end: self.span_ends[index] as usize,
+                    word_id: self.span_word_ids[index],
                 })
                 .collect())
         }
