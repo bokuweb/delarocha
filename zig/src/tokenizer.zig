@@ -540,35 +540,6 @@ pub const Worker = struct {
 
     fn appendBestNode(self: *Worker, begin: usize, end: usize, candidate: Candidate) !void {
         const best = try self.findBestPrev(begin, candidate);
-        var previous_index: u32 = invalid_node;
-        var existing_index = self.end_heads.items[end];
-        while (existing_index != invalid_node) {
-            var existing = &self.nodes.items[existing_index];
-            if (existing.right_id == candidate.right_id) {
-                // Nodes ending at the same byte with the same right context
-                // are equivalent for all future transitions. Keep only the
-                // cheapest path. Equal-cost candidates replace the older one
-                // because the unmerged lattice's head-first traversal also
-                // gives the most recently appended candidate precedence.
-                if (best.cost > existing.min_cost) return;
-                existing.word_id = candidate.word_id;
-                existing.start = try narrowInputOffset(begin);
-                existing.min_cost = best.cost;
-                existing.prev_node = best.index;
-
-                // Preserve the original append order for tie-breaking by
-                // moving an updated node to the head of this end-position list.
-                if (previous_index != invalid_node) {
-                    self.nodes.items[previous_index].next_end = existing.next_end;
-                    existing.next_end = self.end_heads.items[end];
-                    self.end_heads.items[end] = existing_index;
-                }
-                return;
-            }
-            previous_index = existing_index;
-            existing_index = existing.next_end;
-        }
-
         const index = self.nodes.items.len;
         if (index >= invalid_node) return error.InputTooLarge;
         try self.nodes.append(self.allocator, .{
