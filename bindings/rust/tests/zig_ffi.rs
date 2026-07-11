@@ -204,27 +204,6 @@ fn zig_ffi_copies_token_spans_in_bulk() {
 }
 
 #[test]
-fn zig_ffi_returns_zero_copy_token_views() {
-    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
-    let tokenizer = ZigTokenizer::from_raw_paths(
-        fixture_dir.join("lex.csv"),
-        fixture_dir.join("matrix.def"),
-        fixture_dir.join("char.def"),
-        fixture_dir.join("unk.def"),
-    )
-    .expect("Zig tokenizer loads raw fixture");
-    let mut worker = tokenizer.create_worker().expect("Zig worker is created");
-
-    let views = worker
-        .tokenize_views("本とカレー")
-        .expect("Zig tokenize views succeeds");
-    assert_eq!(views.len(), 2);
-    assert_eq!(views[0].surface, "本と");
-    assert_eq!(views[0].feature, "compound,book-and");
-    assert_eq!(views[0].start..views[0].end, 0..6);
-}
-
-#[test]
 fn zig_ffi_seeded_fuzz_count_only_matches_full_tokenization() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
     let temp_dir = tempfile::tempdir().expect("create temp dir");

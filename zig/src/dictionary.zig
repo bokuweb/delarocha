@@ -68,12 +68,6 @@ pub const TrieCountTerm = struct {
     word_cost: i32,
 };
 
-comptime {
-    if (@sizeOf(TrieEdge) != 5 or @sizeOf(TrieTerm) != 12 or @sizeOf(TrieCountTerm) != 8) {
-        @compileError("native trie struct layout must match the binary format");
-    }
-}
-
 pub const UnkTerm = struct {
     unk_id: u32,
     left_id: u16,
@@ -134,7 +128,7 @@ pub const CharProperty = struct {
     categories: []CharCategory,
     ranges: []CharRange,
     invoke_bmp: []u8,
-    range_bmp: []u16,
+    range_bmp: []u32,
     default_ids: [1]usize = .{0},
     has_invoke: bool = false,
 
@@ -247,7 +241,7 @@ pub const CharProperty = struct {
         if (cp < 0x10000) {
             const range_index = self.range_bmp[cp];
             if (range_index != invalid_range_index) {
-                const range = self.ranges[@intCast(range_index)];
+                const range = self.ranges[range_index];
                 const base = range.category_ids[0];
                 return .{ .base_id = base, .category_ids = range.category_ids, .category = &self.categories[base] };
             }
@@ -267,43 +261,32 @@ pub const CharProperty = struct {
 
     pub fn mayInvoke(self: *const CharProperty, ch: u21) bool {
         const cp: u32 = ch;
-        if (cp < 0x10000) {
-            const mask = @as(u8, 1) << @intCast(cp & 7);
-            return self.invoke_bmp[cp >> 3] & mask != 0;
-        }
+        if (cp < 0x10000) return self.invoke_bmp[cp] != 0;
         return self.info(ch).category.invoke;
     }
 };
 
 fn buildInvokeBmp(allocator: Allocator, categories: []const CharCategory, ranges: []const CharRange) ![]u8 {
-    const invoke_bmp = try allocator.alloc(u8, 0x10000 / 8);
-    @memset(invoke_bmp, if (categories[0].invoke) 0xff else 0);
+    const invoke_bmp = try allocator.alloc(u8, 0x10000);
+    @memset(invoke_bmp, if (categories[0].invoke) 1 else 0);
     for (ranges) |range| {
         if (range.start >= 0x10000) continue;
         const end = @min(range.end, 0x10000);
-        const invoke = categories[range.category_ids[0]].invoke;
-        for (range.start..end) |cp| {
-            const mask = @as(u8, 1) << @intCast(cp & 7);
-            if (invoke) {
-                invoke_bmp[cp >> 3] |= mask;
-            } else {
-                invoke_bmp[cp >> 3] &= ~mask;
-            }
-        }
+        const invoke: u8 = if (categories[range.category_ids[0]].invoke) 1 else 0;
+        @memset(invoke_bmp[@intCast(range.start)..@intCast(end)], invoke);
     }
     return invoke_bmp;
 }
 
-const invalid_range_index = std.math.maxInt(u16);
+const invalid_range_index = std.math.maxInt(u32);
 
-fn buildRangeBmp(allocator: Allocator, ranges: []const CharRange) ![]u16 {
-    if (ranges.len >= invalid_range_index) return error.InvalidDictionary;
-    const range_bmp = try allocator.alloc(u16, 0x10000);
+fn buildRangeBmp(allocator: Allocator, ranges: []const CharRange) ![]u32 {
+    const range_bmp = try allocator.alloc(u32, 0x10000);
     @memset(range_bmp, invalid_range_index);
     for (ranges, 0..) |range, range_index| {
         if (range.start >= 0x10000) continue;
         const end = @min(range.end, 0x10000);
-        @memset(range_bmp[@intCast(range.start)..@intCast(end)], @as(u16, @intCast(range_index)));
+        @memset(range_bmp[@intCast(range.start)..@intCast(end)], @as(u32, @intCast(range_index)));
     }
     return range_bmp;
 }
@@ -575,7 +558,6 @@ pub const Dictionary = struct {
     pub fn toBinaryAlloc(self: *const Dictionary, allocator: Allocator) ![]u8 {
         var bytes: std.ArrayList(u8) = .empty;
         errdefer bytes.deinit(allocator);
-        try bytes.ensureTotalCapacity(allocator, try self.binarySize());
         try bytes.appendSlice(allocator, binary_magic);
 
         try appendU32(allocator, &bytes, @intCast(self.entries.len));
@@ -619,7 +601,7 @@ pub const Dictionary = struct {
             for (range.category_ids) |category_id| try appendU32(allocator, &bytes, @intCast(category_id));
         }
 
-        try appendI16Slice(allocator, &bytes, self.matrix.costs);
+        for (self.matrix.costs) |cost| try appendI16(allocator, &bytes, cost);
 
         // Binary v2 stores the expensive derived lookup structures directly.
         // Loading the previous format rebuilt the trie and double-array from
@@ -644,9 +626,21 @@ pub const Dictionary = struct {
             try appendU32(allocator, &bytes, node.count_word_start);
             try appendU32(allocator, &bytes, node.count_word_len);
         }
-        try appendNativeStructSlice(TrieEdge, allocator, &bytes, self.trie_edges);
-        try appendNativeStructSlice(TrieTerm, allocator, &bytes, self.trie_terms);
-        try appendNativeStructSlice(TrieCountTerm, allocator, &bytes, self.trie_count_terms);
+        for (self.trie_edges) |edge| {
+            try appendU8(allocator, &bytes, edge.byte);
+            try appendU32(allocator, &bytes, edge.child);
+        }
+        for (self.trie_terms) |term| {
+            try appendU32(allocator, &bytes, term.word_id);
+            try appendU16(allocator, &bytes, term.left_id);
+            try appendU16(allocator, &bytes, term.right_id);
+            try appendI32(allocator, &bytes, term.word_cost);
+        }
+        for (self.trie_count_terms) |term| {
+            try appendU16(allocator, &bytes, term.left_id);
+            try appendU16(allocator, &bytes, term.right_id);
+            try appendI32(allocator, &bytes, term.word_cost);
+        }
         try appendU32Slice(allocator, &bytes, self.trie_pair);
         try appendU32Slice(allocator, &bytes, self.trie_bmp);
         try appendU32Slice(allocator, &bytes, self.trie_triple);
@@ -654,25 +648,6 @@ pub const Dictionary = struct {
         try appendU32Slice(allocator, &bytes, self.trie_check);
         try appendU32Slice(allocator, &bytes, self.trie_child);
         return bytes.toOwnedSlice(allocator);
-    }
-
-    fn binarySize(self: *const Dictionary) !usize {
-        var size: usize = binary_magic.len + 6 * 4 + 10 * 4;
-        for (self.entries) |entry| size = try addSizes(size, .{ 16, entry.surface.len, entry.feature.len });
-        for (self.unk_entries) |entry| size = try addSizes(size, .{ 16, entry.feature.len });
-        for (self.char_property.categories) |category| size = try addSizes(size, .{ 10, category.name.len });
-        for (self.char_property.ranges) |range| {
-            size = try addSizes(size, .{ 12, try std.math.mul(usize, range.category_ids.len, 4) });
-        }
-        size = try addSizes(size, .{try std.math.mul(usize, self.matrix.costs.len, 2)});
-        size = try addSizes(size, .{try std.math.mul(usize, self.trie_nodes.len, 22)});
-        size = try addSizes(size, .{try std.math.mul(usize, self.trie_edges.len, 5)});
-        size = try addSizes(size, .{try std.math.mul(usize, self.trie_terms.len, 12)});
-        size = try addSizes(size, .{try std.math.mul(usize, self.trie_count_terms.len, 8)});
-        for ([_][]align(1) const u32{ self.trie_pair, self.trie_bmp, self.trie_triple, self.trie_base, self.trie_check, self.trie_child }) |table| {
-            size = try addSizes(size, .{try std.math.mul(usize, table.len, 4)});
-        }
-        return size;
     }
 
     pub fn fromBinaryBytes(allocator: Allocator, bytes: []const u8) !Dictionary {
@@ -1028,12 +1003,6 @@ pub const Dictionary = struct {
         return self.entry_blob[start .. start + len];
     }
 };
-
-fn addSizes(initial: usize, values: anytype) !usize {
-    var total = initial;
-    inline for (values) |value| total = try std.math.add(usize, total, value);
-    return total;
-}
 
 const BuildTrieNode = struct {
     edges: std.ArrayList(TrieEdge) = .empty,
@@ -1600,46 +1569,8 @@ fn appendI32(allocator: Allocator, bytes: *std.ArrayList(u8), value: i32) !void 
     try appendU32(allocator, bytes, @bitCast(value));
 }
 
-fn appendI16Slice(allocator: Allocator, bytes: *std.ArrayList(u8), values: []align(1) const i16) !void {
-    if (builtin.cpu.arch.endian() == .little) {
-        try bytes.appendSlice(allocator, std.mem.sliceAsBytes(values));
-        return;
-    }
-    for (values) |value| try appendI16(allocator, bytes, value);
-}
-
 fn appendU32Slice(allocator: Allocator, bytes: *std.ArrayList(u8), values: []align(1) const u32) !void {
-    if (builtin.cpu.arch.endian() == .little) {
-        try bytes.appendSlice(allocator, std.mem.sliceAsBytes(values));
-        return;
-    }
     for (values) |value| try appendU32(allocator, bytes, value);
-}
-
-fn appendNativeStructSlice(comptime T: type, allocator: Allocator, bytes: *std.ArrayList(u8), values: []const T) !void {
-    if (builtin.cpu.arch.endian() == .little) {
-        try bytes.appendSlice(allocator, std.mem.sliceAsBytes(values));
-        return;
-    }
-    if (T == TrieEdge) {
-        for (values) |edge| {
-            try appendU8(allocator, bytes, edge.byte);
-            try appendU32(allocator, bytes, edge.child);
-        }
-    } else if (T == TrieTerm) {
-        for (values) |term| {
-            try appendU32(allocator, bytes, term.word_id);
-            try appendU16(allocator, bytes, term.left_id);
-            try appendU16(allocator, bytes, term.right_id);
-            try appendI32(allocator, bytes, term.word_cost);
-        }
-    } else if (T == TrieCountTerm) {
-        for (values) |term| {
-            try appendU16(allocator, bytes, term.left_id);
-            try appendU16(allocator, bytes, term.right_id);
-            try appendI32(allocator, bytes, term.word_cost);
-        }
-    }
 }
 
 fn readSlice(bytes: []const u8, cursor: *usize, len: usize) ![]const u8 {
@@ -1664,18 +1595,13 @@ fn readI16(bytes: []const u8, cursor: *usize) !i16 {
 
 fn readI16Slice(allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize, borrow: bool) ![]align(1) const i16 {
     if (count == 0) return emptyI16Slice();
-    const raw = try readSlice(bytes, cursor, try std.math.mul(usize, count, 2));
     if (borrow) {
+        const raw = try readSlice(bytes, cursor, try std.math.mul(usize, count, 2));
         return std.mem.bytesAsSlice(i16, raw);
     }
     const values = try allocator.alloc(i16, count);
     errdefer allocator.free(values);
-    if (builtin.cpu.arch.endian() == .little) {
-        @memcpy(std.mem.sliceAsBytes(values), raw);
-    } else {
-        var raw_cursor: usize = 0;
-        for (values) |*value| value.* = try readI16(raw, &raw_cursor);
-    }
+    for (values) |*value| value.* = try readI16(bytes, cursor);
     return values;
 }
 
@@ -1710,11 +1636,6 @@ fn readTrieNodes(allocator: Allocator, bytes: []const u8, cursor: *usize, count:
 fn readTrieEdges(allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize) ![]TrieEdge {
     const edges = try allocator.alloc(TrieEdge, count);
     errdefer allocator.free(edges);
-    if (builtin.cpu.arch.endian() == .little) {
-        const raw = try readSlice(bytes, cursor, try std.math.mul(usize, count, @sizeOf(TrieEdge)));
-        @memcpy(std.mem.sliceAsBytes(edges), raw);
-        return edges;
-    }
     for (edges) |*edge| {
         edge.* = .{
             .byte = try readU8(bytes, cursor),
@@ -1727,11 +1648,6 @@ fn readTrieEdges(allocator: Allocator, bytes: []const u8, cursor: *usize, count:
 fn readTrieTerms(allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize) ![]TrieTerm {
     const terms = try allocator.alloc(TrieTerm, count);
     errdefer allocator.free(terms);
-    if (builtin.cpu.arch.endian() == .little) {
-        const raw = try readSlice(bytes, cursor, try std.math.mul(usize, count, @sizeOf(TrieTerm)));
-        @memcpy(std.mem.sliceAsBytes(terms), raw);
-        return terms;
-    }
     for (terms) |*term| {
         term.* = .{
             .word_id = try readU32(bytes, cursor),
@@ -1746,11 +1662,6 @@ fn readTrieTerms(allocator: Allocator, bytes: []const u8, cursor: *usize, count:
 fn readTrieCountTerms(allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize) ![]TrieCountTerm {
     const terms = try allocator.alloc(TrieCountTerm, count);
     errdefer allocator.free(terms);
-    if (builtin.cpu.arch.endian() == .little) {
-        const raw = try readSlice(bytes, cursor, try std.math.mul(usize, count, @sizeOf(TrieCountTerm)));
-        @memcpy(std.mem.sliceAsBytes(terms), raw);
-        return terms;
-    }
     for (terms) |*term| {
         term.* = .{
             .left_id = try readU16(bytes, cursor),
@@ -1763,18 +1674,13 @@ fn readTrieCountTerms(allocator: Allocator, bytes: []const u8, cursor: *usize, c
 
 fn readU32Slice(allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize, borrow: bool) ![]align(1) const u32 {
     if (count == 0) return emptyU32Slice();
-    const raw = try readSlice(bytes, cursor, try std.math.mul(usize, count, 4));
     if (borrow) {
+        const raw = try readSlice(bytes, cursor, try std.math.mul(usize, count, 4));
         return std.mem.bytesAsSlice(u32, raw);
     }
     const values = try allocator.alloc(u32, count);
     errdefer allocator.free(values);
-    if (builtin.cpu.arch.endian() == .little) {
-        @memcpy(std.mem.sliceAsBytes(values), raw);
-    } else {
-        var raw_cursor: usize = 0;
-        for (values) |*value| value.* = try readU32(raw, &raw_cursor);
-    }
+    for (values) |*value| value.* = try readU32(bytes, cursor);
     return values;
 }
 

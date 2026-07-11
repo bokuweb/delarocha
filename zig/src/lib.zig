@@ -30,7 +30,6 @@ comptime {
     _ = ffi.delarocha_token_surface_end;
     _ = ffi.delarocha_token_word_id;
     _ = ffi.delarocha_tokens_copy_spans;
-    _ = ffi.delarocha_tokens_copy_metadata;
     _ = ffi.delarocha_token_feature;
 }
 

@@ -7,7 +7,7 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const Worker = tokenizer_mod.Worker;
 const is_wasm = @import("builtin").target.cpu.arch.isWasm();
 
-var c_allocator = if (is_wasm) std.heap.page_allocator else std.heap.smp_allocator;
+var c_allocator = std.heap.page_allocator;
 threadlocal var last_error_buf: [256]u8 = [_]u8{0} ** 256;
 
 fn setLastError(comptime fmt: []const u8, args: anytype) void {
@@ -305,34 +305,6 @@ pub export fn delarocha_tokens_copy_spans(
         starts[index] = token.start;
         ends[index] = token.end;
         word_ids[index] = token.word_id;
-    }
-    return tokens.len;
-}
-
-pub export fn delarocha_tokens_copy_metadata(
-    worker: ?*const Worker,
-    starts: [*]u32,
-    ends: [*]u32,
-    word_ids: [*]u32,
-    feature_ptrs: [*][*]const u8,
-    feature_lens: [*]usize,
-    cap: usize,
-) usize {
-    const worker_ptr = worker orelse {
-        setLastError("worker is null", .{});
-        return std.math.maxInt(usize);
-    };
-    const tokens = worker_ptr.tokens.items;
-    if (cap < tokens.len) {
-        setLastError("token metadata output capacity is too small", .{});
-        return std.math.maxInt(usize);
-    }
-    for (tokens, 0..) |token, index| {
-        starts[index] = @intCast(token.start);
-        ends[index] = @intCast(token.end);
-        word_ids[index] = token.word_id;
-        feature_ptrs[index] = token.feature.ptr;
-        feature_lens[index] = token.feature.len;
     }
     return tokens.len;
 }
