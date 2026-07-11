@@ -158,6 +158,10 @@ The bundled targets are:
 - `x86_64-unknown-linux-gnu`
 - `i686-pc-windows-msvc`
 - `x86_64-pc-windows-msvc`
+- `wasm32-unknown-unknown`
+
+The WASM artifact is built with Zig's `ReleaseSmall` optimization mode to keep
+the download size low. Native artifacts continue to use `ReleaseFast`.
 
 Set `DELAROCHA_BUILD_ZIG=1` to rebuild the static library from
 `zig/src/lib.zig`. Unsupported targets also fall back to building from Zig
