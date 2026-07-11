@@ -44,6 +44,10 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo test -p delarocha --features "zig-ffi"
 
+      - name: Check prebuilt WASM Zig library size
+        if: runner.os == 'Linux'
+        run: test $(wc -c < bindings/rust/prebuilt/wasm32-unknown-unknown/libdelarocha_zig.a) -le 150000
+
       - name: Compile Yokohama text benchmark
         if: runner.os != 'Windows'
         run: cargo test -p delarocha --features "zig-ffi vibrato-bench" --example yokohama_text_bench --no-run

@@ -52,7 +52,7 @@ fn main() {
     command
         .arg("build-lib")
         .arg(zig_lib)
-        .args(["-O", "ReleaseFast", "-static"])
+        .args(["-O", optimization_mode(&target), "-static"])
         .args(["-target", zig_target]);
 
     // Linux links this static Zig object into Rust test binaries, so it must be
@@ -70,6 +70,17 @@ fn main() {
 
     assert!(status.success(), "zig build-lib failed");
     link_static_library(&out_dir);
+}
+
+fn optimization_mode(rust_target: &str) -> &str {
+    if rust_target == "wasm32-unknown-unknown" {
+        // WASM consumers download this code as part of the application. Zig's
+        // ReleaseSmall output is substantially smaller while native targets
+        // retain ReleaseFast for throughput-sensitive workloads.
+        "ReleaseSmall"
+    } else {
+        "ReleaseFast"
+    }
 }
 
 fn link_static_library(dir: &Path) {
