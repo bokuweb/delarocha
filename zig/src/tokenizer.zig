@@ -421,6 +421,17 @@ pub const Worker = struct {
         const group_span = groupSpanAfterFirst(input, first.end, &self.dictionary.char_property, info);
         const end_group = group_span.end;
         const group_len = if (info.category.group or info.category.length != 0) group_span.count else 0;
+        const max_len = @min(info.category.length, group_len);
+        var len_ends_buf: [8]usize = undefined;
+        const cached_len_ends = max_len <= len_ends_buf.len;
+        if (cached_len_ends) {
+            var end = begin;
+            var len: usize = 1;
+            while (len <= max_len) : (len += 1) {
+                end = nextBoundary(input, end) orelse return error.InvalidDictionary;
+                len_ends_buf[len - 1] = end;
+            }
+        }
         for (self.dictionary.unk_index.buckets[info.base_id]) |unk| {
             var grouped = false;
             if (info.category.group) {
@@ -439,9 +450,10 @@ pub const Worker = struct {
                 }
             }
             var len: usize = 1;
-            while (len <= @min(info.category.length, group_len)) : (len += 1) {
+            while (len <= max_len) : (len += 1) {
                 if (grouped and len == group_len) continue;
-                try self.appendBestNode(begin, try nthBoundary(input, begin, len), .{
+                const end = if (cached_len_ends) len_ends_buf[len - 1] else try nthBoundary(input, begin, len);
+                try self.appendBestNode(begin, end, .{
                     .word_id = unknown_word_base + unk.unk_id,
                     .left_id = unk.left_id,
                     .right_id = unk.right_id,
@@ -515,19 +527,48 @@ pub const Worker = struct {
         self.nodes.clearRetainingCapacity();
         self.tokens.clearRetainingCapacity();
         try self.end_heads.ensureTotalCapacity(self.allocator, len + 1);
-        while (self.end_heads.items.len < len + 1) try self.end_heads.append(self.allocator, invalid_node);
+        self.end_heads.items.len = len + 1;
         @memset(self.end_heads.items[0 .. len + 1], invalid_node);
     }
 
     fn resetCount(self: *Worker, len: usize) !void {
         self.count_nodes.clearRetainingCapacity();
         try self.count_end_heads.ensureTotalCapacity(self.allocator, len + 1);
-        while (self.count_end_heads.items.len < len + 1) try self.count_end_heads.append(self.allocator, invalid_count_node);
+        self.count_end_heads.items.len = len + 1;
         @memset(self.count_end_heads.items[0 .. len + 1], invalid_count_node);
     }
 
     fn appendBestNode(self: *Worker, begin: usize, end: usize, candidate: Candidate) !void {
         const best = try self.findBestPrev(begin, candidate);
+        var previous_index: u32 = invalid_node;
+        var existing_index = self.end_heads.items[end];
+        while (existing_index != invalid_node) {
+            var existing = &self.nodes.items[existing_index];
+            if (existing.right_id == candidate.right_id) {
+                // Nodes ending at the same byte with the same right context
+                // are equivalent for all future transitions. Keep only the
+                // cheapest path. Equal-cost candidates replace the older one
+                // because the unmerged lattice's head-first traversal also
+                // gives the most recently appended candidate precedence.
+                if (best.cost > existing.min_cost) return;
+                existing.word_id = candidate.word_id;
+                existing.start = try narrowInputOffset(begin);
+                existing.min_cost = best.cost;
+                existing.prev_node = best.index;
+
+                // Preserve the original append order for tie-breaking by
+                // moving an updated node to the head of this end-position list.
+                if (previous_index != invalid_node) {
+                    self.nodes.items[previous_index].next_end = existing.next_end;
+                    existing.next_end = self.end_heads.items[end];
+                    self.end_heads.items[end] = existing_index;
+                }
+                return;
+            }
+            previous_index = existing_index;
+            existing_index = existing.next_end;
+        }
+
         const index = self.nodes.items.len;
         if (index >= invalid_node) return error.InputTooLarge;
         try self.nodes.append(self.allocator, .{
@@ -581,18 +622,29 @@ pub const Worker = struct {
     }
 
     fn findBestPrev(self: *Worker, begin: usize, candidate: Candidate) !struct { index: u32, cost: i32 } {
+        const first_index = self.end_heads.items[begin];
+        if (first_index == invalid_node) return error.NoPath;
+        const row_start = @as(usize, candidate.left_id) * self.dictionary.matrix.right_size;
+        const matrix_row = self.dictionary.matrix.costs[row_start .. row_start + self.dictionary.matrix.right_size];
+        const first = self.nodes.items[first_index];
+        if (first.next_end == invalid_node) {
+            return .{
+                .index = first_index,
+                .cost = first.min_cost + @as(i32, matrix_row[first.right_id]) + candidate.word_cost,
+            };
+        }
+
         var best_index: u32 = invalid_node;
         var best_cost: i32 = std.math.maxInt(i32);
-        var prev_index = self.end_heads.items[begin];
+        var prev_index = first_index;
         while (prev_index != invalid_node) : (prev_index = self.nodes.items[prev_index].next_end) {
             const prev = self.nodes.items[prev_index];
-            const cost = prev.min_cost + self.dictionary.matrix.trustedCost(prev.right_id, candidate.left_id) + candidate.word_cost;
+            const cost = prev.min_cost + @as(i32, matrix_row[prev.right_id]) + candidate.word_cost;
             if (best_index == invalid_node or cost < best_cost) {
                 best_index = prev_index;
                 best_cost = cost;
             }
         }
-        if (best_index == invalid_node) return error.NoPath;
         return .{ .index = best_index, .cost = best_cost };
     }
 

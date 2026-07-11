@@ -309,6 +309,34 @@ pub export fn delarocha_tokens_copy_spans(
     return tokens.len;
 }
 
+pub export fn delarocha_tokens_copy_metadata(
+    worker: ?*const Worker,
+    starts: [*]u32,
+    ends: [*]u32,
+    word_ids: [*]u32,
+    feature_ptrs: [*][*]const u8,
+    feature_lens: [*]usize,
+    cap: usize,
+) usize {
+    const worker_ptr = worker orelse {
+        setLastError("worker is null", .{});
+        return std.math.maxInt(usize);
+    };
+    const tokens = worker_ptr.tokens.items;
+    if (cap < tokens.len) {
+        setLastError("token metadata output capacity is too small", .{});
+        return std.math.maxInt(usize);
+    }
+    for (tokens, 0..) |token, index| {
+        starts[index] = @intCast(token.start);
+        ends[index] = @intCast(token.end);
+        word_ids[index] = token.word_id;
+        feature_ptrs[index] = token.feature.ptr;
+        feature_lens[index] = token.feature.len;
+    }
+    return tokens.len;
+}
+
 pub export fn delarocha_token_feature(worker: ?*const Worker, index: usize) [*]const u8 {
     return if (worker) |ptr| ptr.tokens.items[index].feature.ptr else "UNK";
 }
