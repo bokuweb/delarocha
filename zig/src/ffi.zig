@@ -7,7 +7,7 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const Worker = tokenizer_mod.Worker;
 const is_wasm = @import("builtin").target.cpu.arch.isWasm();
 
-var c_allocator = if (is_wasm) std.heap.page_allocator else std.heap.smp_allocator;
+var c_allocator = std.heap.page_allocator;
 threadlocal var last_error_buf: [256]u8 = [_]u8{0} ** 256;
 
 fn setLastError(comptime fmt: []const u8, args: anytype) void {
