@@ -147,6 +147,26 @@ fn groups_unknown_words_by_char_category() {
 }
 
 #[test]
+fn cached_unknown_grouping_preserves_reused_worker_results() {
+    let dictionary = SystemDictionaryBuilder::from_readers(
+        "a,0,0,10,system-alpha\n".as_bytes(),
+        "1 1\n0 0 0\n".as_bytes(),
+        "DEFAULT 0 1 0\nALPHA 1 1 24\n0x0061..0x007A ALPHA\n".as_bytes(),
+        "DEFAULT,0,0,10000,default\nALPHA,0,0,1,unknown-alpha\n".as_bytes(),
+    )
+    .expect("dictionary builds");
+    let tokenizer = Tokenizer::new(dictionary);
+    let mut worker = tokenizer.create_worker();
+
+    for input in ["aaaa", "aa", "aaaaaaaa"] {
+        let tokens = worker.tokenize(input).expect("tokenize succeeds");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].surface(), input);
+        assert!(tokens[0].is_unknown());
+    }
+}
+
+#[test]
 fn ignore_space_matches_mecab_compatible_option() {
     let lexicon_csv = "mens,0,0,1,noun\nsecond,0,0,1,noun\nbag,0,0,1,noun";
     let matrix_def = "1 1\n0 0 0";

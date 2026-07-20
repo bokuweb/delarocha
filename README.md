@@ -171,6 +171,12 @@ sources, so those environments still need Zig installed.
 cargo test -p delarocha --features zig-ffi
 ```
 
+For output-sensitive callers, `ZigWorker::tokenize_borrowed_views` returns a
+`ZigTokenViews` collection backed by the worker's reusable metadata buffers.
+Iterating it avoids both owned surface/feature strings and the per-call
+`Vec<ZigTokenView>` allocation. The collection and its token views remain valid
+until the worker is mutably used again.
+
 ## Benchmarks
 
 Run the baseline benchmark:
