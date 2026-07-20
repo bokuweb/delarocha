@@ -45,6 +45,7 @@
 | 候補 | 結果 |
 |---|---|
 | 未知語run cache | groupしないカテゴリは必要な`length`までに走査を制限。groupするカテゴリは同一category setのrun終端・残り文字数をworkerに保持した。Zig count-onlyの2048文字未知漢字は約3.4 msから約26 µs、既知1文字候補と競合するgroup付き2048文字英字は約5.6–10.9 msから約303 µsへ改善。短文fixtureは約39–40 ns/文を維持。Pure Rustの512文字英字は927 µsから636 µs（約31%改善）。 |
+| 長い未知語候補のbatch化 | `length > 8`のカテゴリでは、同じ未知語entryが生成する全長候補でpredecessor探索を1回だけ共有し、UTF-8境界を先頭からの再走査ではなく前進cursorで求める。長いpathを非inline関数へ分離して短文を従来経路に維持した。外部負荷下で旧・新binaryを交互に測定した4ペア中央値では、Zig grouped alpha 2048文字が約605 µsから119 µs（約80%改善）、短文coreが約95 ns/文から98 ns/文。Pure Rust 512文字の同条件ペアでは約1.46 msから243 µs（約83%改善）。 |
 | allocation-free view | `ZigTokenViews` / `tokenize_borrowed_views`を追加。worker内metadata bufferを直接iterationし、結果`Vec<ZigTokenView>`の確保を回避。同一短文fixtureで従来view約748–785 ns/4文に対し約630 ns/4文。 |
 | 安定性修正 | full lattice node統合を削除し、`ArrayList` length操作・full predecessor経路・FFI allocatorを安定版へ戻した。 |
 

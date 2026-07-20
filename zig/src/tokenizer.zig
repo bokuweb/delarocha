@@ -7,6 +7,7 @@ pub const unknown_word_base: u32 = 1 << 31;
 pub const unknown_word_id: u32 = std.math.maxInt(u32);
 const invalid_node: u32 = std.math.maxInt(u32);
 const invalid_count_node: u32 = std.math.maxInt(u32);
+const max_cached_unknown_boundaries: usize = 8;
 
 pub const Token = struct {
     start: usize,
@@ -73,6 +74,11 @@ const Candidate = struct {
     left_id: u16,
     right_id: u16,
     word_cost: i32,
+};
+
+const BestPath = struct {
+    index: u32,
+    cost: i32,
 };
 
 pub const Tokenizer = struct {
@@ -438,34 +444,39 @@ pub const Worker = struct {
             self.groupSpanCached(input, begin, first.end, info);
         const end_group = group_span.end;
         const group_len = group_span.count;
-        for (self.dictionary.unk_index.buckets[info.base_id]) |unk| {
-            var grouped = false;
-            if (info.category.group) {
-                const can_group = if (self.max_grouping_len) |max_grouping_len| blk: {
-                    break :blk group_len -| 1 <= max_grouping_len;
-                } else true;
-                if (can_group) {
-                    try self.appendBestNode(begin, end_group, .{
+        const max_len = @min(info.category.length, group_len);
+        if (max_len <= max_cached_unknown_boundaries) {
+            for (self.dictionary.unk_index.buckets[info.base_id]) |unk| {
+                var grouped = false;
+                if (info.category.group) {
+                    const can_group = if (self.max_grouping_len) |max_grouping_len| blk: {
+                        break :blk group_len -| 1 <= max_grouping_len;
+                    } else true;
+                    if (can_group) {
+                        try self.appendBestNode(begin, end_group, .{
+                            .word_id = unknown_word_base + unk.unk_id,
+                            .left_id = unk.left_id,
+                            .right_id = unk.right_id,
+                            .word_cost = unk.word_cost,
+                        });
+                        emitted = true;
+                        grouped = true;
+                    }
+                }
+                var len: usize = 1;
+                while (len <= max_len) : (len += 1) {
+                    if (grouped and len == group_len) continue;
+                    try self.appendBestNode(begin, try nthBoundary(input, begin, len), .{
                         .word_id = unknown_word_base + unk.unk_id,
                         .left_id = unk.left_id,
                         .right_id = unk.right_id,
                         .word_cost = unk.word_cost,
                     });
                     emitted = true;
-                    grouped = true;
                 }
             }
-            var len: usize = 1;
-            while (len <= @min(info.category.length, group_len)) : (len += 1) {
-                if (grouped and len == group_len) continue;
-                try self.appendBestNode(begin, try nthBoundary(input, begin, len), .{
-                    .word_id = unknown_word_base + unk.unk_id,
-                    .left_id = unk.left_id,
-                    .right_id = unk.right_id,
-                    .word_cost = unk.word_cost,
-                });
-                emitted = true;
-            }
+        } else {
+            emitted = try self.appendLongUnknown(input, begin, info, end_group, group_len, max_len);
         }
 
         if (!has_matched and !emitted) {
@@ -477,6 +488,38 @@ pub const Worker = struct {
                 .word_cost = fallback.word_cost,
             });
         }
+    }
+
+    noinline fn appendLongUnknown(self: *Worker, input: []const u8, begin: usize, info: dict_mod.CharInfo, end_group: usize, group_len: usize, max_len: usize) !bool {
+        var emitted = false;
+        for (self.dictionary.unk_index.buckets[info.base_id]) |unk| {
+            const grouped = if (info.category.group)
+                if (self.max_grouping_len) |max_grouping_len| blk: {
+                    break :blk group_len -| 1 <= max_grouping_len;
+                } else true
+            else
+                false;
+            const candidate = Candidate{
+                .word_id = unknown_word_base + unk.unk_id,
+                .left_id = unk.left_id,
+                .right_id = unk.right_id,
+                .word_cost = unk.word_cost,
+            };
+            const best = try self.findBestPrev(begin, candidate);
+            if (grouped) {
+                try self.appendBestNodeWithBest(begin, end_group, candidate, best);
+                emitted = true;
+            }
+            var end = begin;
+            var len: usize = 1;
+            while (len <= max_len) : (len += 1) {
+                end = nextBoundary(input, end) orelse return error.InvalidDictionary;
+                if (grouped and len == group_len) continue;
+                try self.appendBestNodeWithBest(begin, end, candidate, best);
+                emitted = true;
+            }
+        }
+        return emitted;
     }
 
     inline fn appendUnknownCount(self: *Worker, input: []const u8, begin: usize, has_matched: bool) !void {
@@ -499,41 +542,67 @@ pub const Worker = struct {
         const end_group = group_span.end;
         const group_len = group_span.count;
         const max_len = @min(info.category.length, group_len);
-        var len_ends_buf: [8]usize = undefined;
-        const cached_len_ends = max_len <= len_ends_buf.len;
-        if (cached_len_ends) {
+        if (max_len <= max_cached_unknown_boundaries) {
+            var len_ends_buf: [max_cached_unknown_boundaries]usize = undefined;
             var end = begin;
             var len: usize = 1;
             while (len <= max_len) : (len += 1) {
                 end = nextBoundary(input, end) orelse return error.InvalidDictionary;
                 len_ends_buf[len - 1] = end;
             }
-        }
-        for (self.dictionary.unk_index.count_buckets[info.base_id]) |unk| {
-            var grouped = false;
-            if (info.category.group) {
-                const can_group = if (self.max_grouping_len) |max_grouping_len| blk: {
-                    break :blk group_len -| 1 <= max_grouping_len;
-                } else true;
-                if (can_group) {
-                    self.appendBestCountNode(begin, end_group, unk.left_id, unk.right_id, unk.word_cost);
+            for (self.dictionary.unk_index.count_buckets[info.base_id]) |unk| {
+                var grouped = false;
+                if (info.category.group) {
+                    const can_group = if (self.max_grouping_len) |max_grouping_len| blk: {
+                        break :blk group_len -| 1 <= max_grouping_len;
+                    } else true;
+                    if (can_group) {
+                        self.appendBestCountNode(begin, end_group, unk.left_id, unk.right_id, unk.word_cost);
+                        emitted = true;
+                        grouped = true;
+                    }
+                }
+                len = 1;
+                while (len <= max_len) : (len += 1) {
+                    if (grouped and len == group_len) continue;
+                    self.appendBestCountNode(begin, len_ends_buf[len - 1], unk.left_id, unk.right_id, unk.word_cost);
                     emitted = true;
-                    grouped = true;
                 }
             }
-            var len: usize = 1;
-            while (len <= max_len) : (len += 1) {
-                if (grouped and len == group_len) continue;
-                const end = if (cached_len_ends) len_ends_buf[len - 1] else try nthBoundary(input, begin, len);
-                self.appendBestCountNode(begin, end, unk.left_id, unk.right_id, unk.word_cost);
-                emitted = true;
-            }
+        } else {
+            emitted = try self.appendLongUnknownCount(input, begin, info, end_group, group_len, max_len);
         }
 
         if (!has_matched and !emitted) {
             const fallback = self.dictionary.unk_index.fallback_terms[info.base_id];
             self.appendBestCountNode(begin, first.end, fallback.left_id, fallback.right_id, fallback.word_cost);
         }
+    }
+
+    noinline fn appendLongUnknownCount(self: *Worker, input: []const u8, begin: usize, info: dict_mod.CharInfo, end_group: usize, group_len: usize, max_len: usize) !bool {
+        var emitted = false;
+        for (self.dictionary.unk_index.count_buckets[info.base_id]) |unk| {
+            const grouped = if (info.category.group)
+                if (self.max_grouping_len) |max_grouping_len| blk: {
+                    break :blk group_len -| 1 <= max_grouping_len;
+                } else true
+            else
+                false;
+            const best = self.findBestCountPrev(begin, unk.left_id, unk.word_cost);
+            if (grouped) {
+                self.appendBestCountNodeWithBest(end_group, unk.right_id, best);
+                emitted = true;
+            }
+            var end = begin;
+            var len: usize = 1;
+            while (len <= max_len) : (len += 1) {
+                end = nextBoundary(input, end) orelse return error.InvalidDictionary;
+                if (grouped and len == group_len) continue;
+                self.appendBestCountNodeWithBest(end, unk.right_id, best);
+                emitted = true;
+            }
+        }
+        return emitted;
     }
 
     fn reset(self: *Worker, len: usize) !void {
@@ -589,6 +658,10 @@ pub const Worker = struct {
 
     fn appendBestNode(self: *Worker, begin: usize, end: usize, candidate: Candidate) !void {
         const best = try self.findBestPrev(begin, candidate);
+        try self.appendBestNodeWithBest(begin, end, candidate, best);
+    }
+
+    fn appendBestNodeWithBest(self: *Worker, begin: usize, end: usize, candidate: Candidate, best: BestPath) !void {
         const index = self.nodes.items.len;
         if (index >= invalid_node) return error.InputTooLarge;
         try self.nodes.append(self.allocator, .{
@@ -608,6 +681,10 @@ pub const Worker = struct {
         // avoids materializing a short-lived candidate struct in the tight
         // dictionary and unknown-word loops.
         const best = self.findBestCountPrev(begin, left_id, word_cost);
+        self.appendBestCountNodeWithBest(end, right_id, best);
+    }
+
+    inline fn appendBestCountNodeWithBest(self: *Worker, end: usize, right_id: u16, best: BestPath) void {
         const token_count = self.count_nodes.items[best.index].token_count + 1;
         var existing_index = self.count_end_heads.items[end];
         while (existing_index != invalid_count_node) : (existing_index = self.count_nodes.items[existing_index].next_end) {
@@ -641,7 +718,7 @@ pub const Worker = struct {
         try self.count_nodes.append(self.allocator, node);
     }
 
-    fn findBestPrev(self: *Worker, begin: usize, candidate: Candidate) !struct { index: u32, cost: i32 } {
+    fn findBestPrev(self: *Worker, begin: usize, candidate: Candidate) !BestPath {
         var best_index: u32 = invalid_node;
         var best_cost: i32 = std.math.maxInt(i32);
         var prev_index = self.end_heads.items[begin];
@@ -657,7 +734,7 @@ pub const Worker = struct {
         return .{ .index = best_index, .cost = best_cost };
     }
 
-    inline fn findBestCountPrev(self: *Worker, begin: usize, left_id: u16, word_cost: i32) struct { index: u32, cost: i32 } {
+    inline fn findBestCountPrev(self: *Worker, begin: usize, left_id: u16, word_cost: i32) BestPath {
         const first_index = self.count_end_heads.items[begin];
         if (first_index == invalid_count_node) unreachable;
         const row_start = @as(usize, left_id) * self.dictionary.matrix.right_size;

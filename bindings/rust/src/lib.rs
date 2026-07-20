@@ -1125,7 +1125,17 @@ impl<'dict> Worker<'dict> {
     }
 
     fn append_best_node(&mut self, begin: usize, end: usize, candidate: Candidate) -> Result<()> {
-        let (prev_node, min_cost) = self.find_best_prev(begin, candidate)?;
+        let best = self.find_best_prev(begin, candidate)?;
+        self.append_best_node_with_best(begin, end, candidate, best)
+    }
+
+    fn append_best_node_with_best(
+        &mut self,
+        begin: usize,
+        end: usize,
+        candidate: Candidate,
+        (prev_node, min_cost): (usize, i32),
+    ) -> Result<()> {
         let index = self.nodes.len();
         self.nodes.push(Node {
             word_id: candidate.word_id,
@@ -1195,45 +1205,50 @@ impl<'dict> Worker<'dict> {
         };
         let group_end = group_span.end;
         let group_len = group_span.count;
-        for &unk_id in &dictionary.unk_index[info.base_id] {
-            let unk = &dictionary.unk_entries[unk_id];
-            let mut grouped = false;
-            if info.category.group
-                && self
-                    .max_grouping_len
-                    .is_none_or(|max| group_len.saturating_sub(1) <= max)
-            {
-                self.append_best_node(
-                    begin,
-                    group_end,
-                    Candidate {
-                        word_id: UNKNOWN_WORD_BASE + unk_id as u32,
-                        left_id: unk.left_id,
-                        right_id: unk.right_id,
-                        word_cost: unk.word_cost,
-                    },
-                )?;
-                emitted = true;
-                grouped = true;
-            }
-
-            for len in 1..=info.category.length.min(group_len) {
-                if grouped && len == group_len {
-                    continue;
+        let max_len = info.category.length.min(group_len);
+        if max_len <= 8 {
+            for &unk_id in &dictionary.unk_index[info.base_id] {
+                let unk = &dictionary.unk_entries[unk_id];
+                let mut grouped = false;
+                if info.category.group
+                    && self
+                        .max_grouping_len
+                        .is_none_or(|max| group_len.saturating_sub(1) <= max)
+                {
+                    self.append_best_node(
+                        begin,
+                        group_end,
+                        Candidate {
+                            word_id: UNKNOWN_WORD_BASE + unk_id as u32,
+                            left_id: unk.left_id,
+                            right_id: unk.right_id,
+                            word_cost: unk.word_cost,
+                        },
+                    )?;
+                    emitted = true;
+                    grouped = true;
                 }
-                let end = nth_char_boundary(input, begin, len)?;
-                self.append_best_node(
-                    begin,
-                    end,
-                    Candidate {
-                        word_id: UNKNOWN_WORD_BASE + unk_id as u32,
-                        left_id: unk.left_id,
-                        right_id: unk.right_id,
-                        word_cost: unk.word_cost,
-                    },
-                )?;
-                emitted = true;
+
+                for len in 1..=max_len {
+                    if grouped && len == group_len {
+                        continue;
+                    }
+                    self.append_best_node(
+                        begin,
+                        nth_char_boundary(input, begin, len)?,
+                        Candidate {
+                            word_id: UNKNOWN_WORD_BASE + unk_id as u32,
+                            left_id: unk.left_id,
+                            right_id: unk.right_id,
+                            word_cost: unk.word_cost,
+                        },
+                    )?;
+                    emitted = true;
+                }
             }
+        } else {
+            emitted = self
+                .append_long_unknown_nodes(dictionary, input, begin, &info, group_span, max_len)?;
         }
 
         if !has_matched && !emitted {
@@ -1262,6 +1277,48 @@ impl<'dict> Worker<'dict> {
             )?;
         }
         Ok(())
+    }
+
+    #[inline(never)]
+    fn append_long_unknown_nodes(
+        &mut self,
+        dictionary: &Dictionary,
+        input: &str,
+        begin: usize,
+        info: &CharInfo<'_>,
+        group_span: GroupSpan,
+        max_len: usize,
+    ) -> Result<bool> {
+        let mut emitted = false;
+        for &unk_id in &dictionary.unk_index[info.base_id] {
+            let unk = &dictionary.unk_entries[unk_id];
+            let grouped = info.category.group
+                && self
+                    .max_grouping_len
+                    .is_none_or(|max| group_span.count.saturating_sub(1) <= max);
+            let candidate = Candidate {
+                word_id: UNKNOWN_WORD_BASE + unk_id as u32,
+                left_id: unk.left_id,
+                right_id: unk.right_id,
+                word_cost: unk.word_cost,
+            };
+            let best = self.find_best_prev(begin, candidate)?;
+            if grouped {
+                self.append_best_node_with_best(begin, group_span.end, candidate, best)?;
+                emitted = true;
+            }
+
+            let mut end = begin;
+            for len in 1..=max_len {
+                end = next_char_boundary(input, end)?;
+                if grouped && len == group_span.count {
+                    continue;
+                }
+                self.append_best_node_with_best(begin, end, candidate, best)?;
+                emitted = true;
+            }
+        }
+        Ok(emitted)
     }
 
     fn cached_group_span(
