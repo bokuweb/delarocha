@@ -158,11 +158,12 @@ fn cached_unknown_grouping_preserves_reused_worker_results() {
     let tokenizer = Tokenizer::new(dictionary);
     let mut worker = tokenizer.create_worker();
 
-    for input in ["aaaa", "aa", "aaaaaaaa"] {
+    for input in ["aaaa", "aa", "aaaaaaaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] {
         let tokens = worker.tokenize(input).expect("tokenize succeeds");
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].surface(), input);
         assert!(tokens[0].is_unknown());
+        assert_eq!(worker.tokenize_count(input).expect("count succeeds"), 1);
     }
 }
 

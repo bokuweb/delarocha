@@ -1,6 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use delarocha::{Dictionary, SystemDictionaryBuilder, Tokenizer};
 use std::hint::black_box;
+#[cfg(feature = "zig-ffi")]
 use std::path::{Path, PathBuf};
 
 const DICT: &str = include_str!("../../../fixtures/minimal.dict");

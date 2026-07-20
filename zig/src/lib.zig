@@ -121,7 +121,7 @@ test "cached unknown grouping preserves full and count paths" {
     var worker = Worker.init(std.testing.allocator, &dict, null);
     defer worker.deinit();
 
-    for ([_][]const u8{ "aaaa", "aa", "aaaaaaaa" }) |input| {
+    for ([_][]const u8{ "aaaa", "aa", "aaaaaaaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }) |input| {
         const tokens = try worker.tokenize(input);
         try std.testing.expectEqual(@as(usize, 1), tokens.len);
         try std.testing.expectEqual(@as(usize, 0), tokens[0].start);
