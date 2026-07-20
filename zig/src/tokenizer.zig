@@ -61,6 +61,13 @@ const CountNode = struct {
     }
 };
 
+const GroupCache = struct {
+    cursor: usize,
+    end: usize,
+    remaining: usize,
+    category_ids: []const usize,
+};
+
 const Candidate = struct {
     word_id: u32,
     left_id: u16,
@@ -106,6 +113,7 @@ pub const Worker = struct {
     count_nodes: std.ArrayList(CountNode),
     count_end_heads: std.ArrayList(u32),
     tokens: std.ArrayList(Token),
+    group_cache: ?GroupCache,
 
     pub fn init(allocator: Allocator, dictionary: *const dict_mod.Dictionary, max_grouping_len: ?usize) Worker {
         return .{
@@ -117,6 +125,7 @@ pub const Worker = struct {
             .count_nodes = .empty,
             .count_end_heads = .empty,
             .tokens = .empty,
+            .group_cache = null,
         };
     }
 
@@ -418,9 +427,17 @@ pub const Worker = struct {
         const info = self.dictionary.char_property.info(first.ch);
 
         var emitted = false;
-        const group_span = groupSpanAfterFirst(input, first.end, &self.dictionary.char_property, info);
+        const group_span = if (!info.category.group)
+            if (info.category.length == 0)
+                GroupSpan{ .end = first.end, .count = 0 }
+            else
+                groupSpanAfterFirstLimited(input, first.end, &self.dictionary.char_property, info, info.category.length)
+        else if (self.max_grouping_len) |max|
+            groupSpanAfterFirstLimited(input, first.end, &self.dictionary.char_property, info, @max(info.category.length, max +| 2))
+        else
+            self.groupSpanCached(input, begin, first.end, info);
         const end_group = group_span.end;
-        const group_len = if (info.category.group or info.category.length != 0) group_span.count else 0;
+        const group_len = group_span.count;
         for (self.dictionary.unk_index.buckets[info.base_id]) |unk| {
             var grouped = false;
             if (info.category.group) {
@@ -470,9 +487,17 @@ pub const Worker = struct {
         const info = self.dictionary.char_property.info(first.ch);
 
         var emitted = false;
-        const group_span = groupSpanAfterFirstAssumeValid(input, first.end, &self.dictionary.char_property, info);
+        const group_span = if (!info.category.group)
+            if (info.category.length == 0)
+                GroupSpan{ .end = first.end, .count = 0 }
+            else
+                groupSpanAfterFirstLimitedAssumeValid(input, first.end, &self.dictionary.char_property, info, info.category.length)
+        else if (self.max_grouping_len) |max|
+            groupSpanAfterFirstLimitedAssumeValid(input, first.end, &self.dictionary.char_property, info, @max(info.category.length, max +| 2))
+        else
+            self.groupSpanCachedAssumeValid(input, begin, first.end, info);
         const end_group = group_span.end;
-        const group_len = if (info.category.group or info.category.length != 0) group_span.count else 0;
+        const group_len = group_span.count;
         const max_len = @min(info.category.length, group_len);
         var len_ends_buf: [8]usize = undefined;
         const cached_len_ends = max_len <= len_ends_buf.len;
@@ -514,6 +539,7 @@ pub const Worker = struct {
     fn reset(self: *Worker, len: usize) !void {
         self.nodes.clearRetainingCapacity();
         self.tokens.clearRetainingCapacity();
+        self.group_cache = null;
         try self.end_heads.ensureTotalCapacity(self.allocator, len + 1);
         while (self.end_heads.items.len < len + 1) try self.end_heads.append(self.allocator, invalid_node);
         @memset(self.end_heads.items[0 .. len + 1], invalid_node);
@@ -521,9 +547,44 @@ pub const Worker = struct {
 
     fn resetCount(self: *Worker, len: usize) !void {
         self.count_nodes.clearRetainingCapacity();
+        self.group_cache = null;
         try self.count_end_heads.ensureTotalCapacity(self.allocator, len + 1);
         while (self.count_end_heads.items.len < len + 1) try self.count_end_heads.append(self.allocator, invalid_count_node);
         @memset(self.count_end_heads.items[0 .. len + 1], invalid_count_node);
+    }
+
+    fn groupSpanCached(self: *Worker, input: []const u8, begin: usize, first_end: usize, info: dict_mod.CharInfo) GroupSpan {
+        if (self.cachedGroupSpan(input, begin, info.category_ids)) |span| return span;
+        const span = groupSpanAfterFirst(input, first_end, &self.dictionary.char_property, info);
+        self.rememberGroupSpan(begin, span, info.category_ids);
+        return span;
+    }
+
+    inline fn groupSpanCachedAssumeValid(self: *Worker, input: []const u8, begin: usize, first_end: usize, info: dict_mod.CharInfo) GroupSpan {
+        if (self.cachedGroupSpan(input, begin, info.category_ids)) |span| return span;
+        const span = groupSpanAfterFirstAssumeValid(input, first_end, &self.dictionary.char_property, info);
+        self.rememberGroupSpan(begin, span, info.category_ids);
+        return span;
+    }
+
+    inline fn cachedGroupSpan(self: *Worker, input: []const u8, begin: usize, category_ids: []const usize) ?GroupSpan {
+        const cache = if (self.group_cache) |*value| value else return null;
+        if (begin < cache.cursor or begin >= cache.end or !std.mem.eql(usize, cache.category_ids, category_ids)) return null;
+        while (cache.cursor < begin) {
+            cache.cursor = nextBoundary(input, cache.cursor) orelse return null;
+            cache.remaining -= 1;
+        }
+        if (cache.cursor != begin) return null;
+        return .{ .end = cache.end, .count = cache.remaining };
+    }
+
+    inline fn rememberGroupSpan(self: *Worker, begin: usize, span: GroupSpan, category_ids: []const usize) void {
+        self.group_cache = .{
+            .cursor = begin,
+            .end = span.end,
+            .remaining = span.count,
+            .category_ids = category_ids,
+        };
     }
 
     fn appendBestNode(self: *Worker, begin: usize, end: usize, candidate: Candidate) !void {
@@ -849,6 +910,44 @@ const GroupSpan = struct {
     end: usize,
     count: usize,
 };
+
+inline fn groupSpanAfterFirstLimited(
+    input: []const u8,
+    first_end: usize,
+    char_property: *const dict_mod.CharProperty,
+    start_info: dict_mod.CharInfo,
+    max_count: usize,
+) GroupSpan {
+    var end = first_end;
+    var count: usize = 1;
+    while (end < input.len and count < max_count) {
+        const next = nextCodepointWithEnd(input, end) orelse break;
+        const info = char_property.info(next.ch);
+        if (!intersects(start_info.category_ids, info.category_ids)) break;
+        end = next.end;
+        count += 1;
+    }
+    return .{ .end = end, .count = count };
+}
+
+inline fn groupSpanAfterFirstLimitedAssumeValid(
+    input: []const u8,
+    first_end: usize,
+    char_property: *const dict_mod.CharProperty,
+    start_info: dict_mod.CharInfo,
+    max_count: usize,
+) GroupSpan {
+    var end = first_end;
+    var count: usize = 1;
+    while (end < input.len and count < max_count) {
+        const next = codepointWithEndAssumeValid(input, end) orelse break;
+        const info = char_property.info(next.ch);
+        if (!intersects(start_info.category_ids, info.category_ids)) break;
+        end = next.end;
+        count += 1;
+    }
+    return .{ .end = end, .count = count };
+}
 
 fn groupSpanAfterFirst(input: []const u8, first_end: usize, char_property: *const dict_mod.CharProperty, start_info: dict_mod.CharInfo) GroupSpan {
     // The caller has already decoded and classified the first character.

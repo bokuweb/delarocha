@@ -30,6 +30,7 @@ comptime {
     _ = ffi.delarocha_token_surface_end;
     _ = ffi.delarocha_token_word_id;
     _ = ffi.delarocha_tokens_copy_spans;
+    _ = ffi.delarocha_tokens_copy_metadata;
     _ = ffi.delarocha_token_feature;
 }
 
@@ -108,6 +109,26 @@ test "builds raw mecab style dictionary" {
     try std.testing.expectEqual(@as(usize, 3), tokens[1].start);
     try std.testing.expectEqual(@as(usize, 6), tokens[1].end);
     try std.testing.expect(tokens[1].isUnknown());
+}
+
+test "cached unknown grouping preserves full and count paths" {
+    const lex = "a,0,0,10,system-alpha\n";
+    const matrix = "1 1\n0 0 0\n";
+    const char_def = "DEFAULT 0 1 0\nALPHA 1 1 24\n0x0061..0x007A ALPHA\n";
+    const unk = "DEFAULT,0,0,10000,default\nALPHA,0,0,1,unknown-alpha\n";
+    var dict = try Dictionary.fromRawBytes(std.testing.allocator, lex, matrix, char_def, unk);
+    defer dict.deinit();
+    var worker = Worker.init(std.testing.allocator, &dict, null);
+    defer worker.deinit();
+
+    for ([_][]const u8{ "aaaa", "aa", "aaaaaaaa" }) |input| {
+        const tokens = try worker.tokenize(input);
+        try std.testing.expectEqual(@as(usize, 1), tokens.len);
+        try std.testing.expectEqual(@as(usize, 0), tokens[0].start);
+        try std.testing.expectEqual(input.len, tokens[0].end);
+        try std.testing.expect(tokens[0].isUnknown());
+        try std.testing.expectEqual(@as(usize, 1), try worker.tokenizeCount(input));
+    }
 }
 
 test "roundtrips binary dictionary" {

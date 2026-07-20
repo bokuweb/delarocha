@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use delarocha::{Dictionary, Tokenizer};
+use delarocha::{Dictionary, SystemDictionaryBuilder, Tokenizer};
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 
@@ -39,6 +39,26 @@ fn bench_delarocha(c: &mut Criterion) {
             }
         });
     });
+
+    let alpha_dictionary = SystemDictionaryBuilder::from_readers(
+        "a,0,0,1,alpha\n".as_bytes(),
+        "1 1\n0 0 0\n".as_bytes(),
+        "DEFAULT 0 1 0\nALPHA 1 1 24\n0x0061..0x007A ALPHA\n".as_bytes(),
+        "DEFAULT,0,0,10000,default\nALPHA,0,0,10000,alpha\n".as_bytes(),
+    )
+    .expect("alpha benchmark dictionary parses");
+    let alpha_tokenizer = Tokenizer::new(alpha_dictionary);
+    let mut alpha_worker = alpha_tokenizer.create_worker();
+    let alpha = "a".repeat(512);
+    c.bench_function("delarocha/rust-grouped-alpha-512", |b| {
+        b.iter(|| {
+            black_box(
+                alpha_worker
+                    .tokenize_count(black_box(&alpha))
+                    .expect("alpha tokenization succeeds"),
+            );
+        });
+    });
 }
 
 #[cfg(feature = "zig-ffi")]
@@ -65,6 +85,28 @@ fn bench_zig_ffi(c: &mut Criterion) {
         b.iter(|| {
             for sentence in SENTENCES {
                 black_box(worker.tokenize(black_box(sentence)).unwrap());
+            }
+        });
+    });
+
+    c.bench_function("delarocha/zig-ffi-tokenize-views", |b| {
+        b.iter(|| {
+            for sentence in SENTENCES {
+                black_box(worker.tokenize_views(black_box(sentence)).unwrap());
+            }
+        });
+    });
+
+    c.bench_function("delarocha/zig-ffi-tokenize-borrowed-views", |b| {
+        b.iter(|| {
+            for sentence in SENTENCES {
+                let views = worker.tokenize_borrowed_views(black_box(sentence)).unwrap();
+                black_box(
+                    views
+                        .iter()
+                        .map(|token| token.surface.len() + token.feature.len())
+                        .sum::<usize>(),
+                );
             }
         });
     });
