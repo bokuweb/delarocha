@@ -1,6 +1,9 @@
 use delarocha::{Dictionary, Tokenizer};
 use std::hint::black_box;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "zig-ffi")]
+use std::path::Path;
+#[cfg(any(feature = "vibrato-bench", feature = "zig-ffi"))]
+use std::path::PathBuf;
 use std::process::Command;
 
 const DICT: &str = include_str!("../../../fixtures/minimal.dict");
