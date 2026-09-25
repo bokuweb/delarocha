@@ -11,6 +11,9 @@ const binary_magic = "DLRDIC03";
 // rebuilt from the raw dictionary with the current version.
 const legacy_binary_magics = [_][]const u8{ "DLRDIC01", "DLRDIC02" };
 const binary_section_align = 16;
+// Dictionaries with at most this many entries tokenize through the linear
+// first-byte entry index (and keep `entries`); larger ones use the trie only.
+const small_dictionary_entry_limit = 32;
 
 pub const Entry = struct {
     surface: []const u8,
@@ -479,7 +482,7 @@ pub const Dictionary = struct {
         errdefer freeI16Slice(allocator, matrix.costs);
         // Large dictionaries use the trie path exclusively; building the
         // first-byte entry index there only consumes memory and load time.
-        const entry_index = if (owned_entries.len <= 32) try buildEntryIndex(allocator, owned_entries) else EntryIndex.empty();
+        const entry_index = if (owned_entries.len <= small_dictionary_entry_limit) try buildEntryIndex(allocator, owned_entries) else EntryIndex.empty();
         errdefer entry_index.deinit(allocator);
         const unk_index = try buildUnkIndex(allocator, char_property.categories.len, unk_entries, &matrix);
         errdefer unk_index.deinit(allocator);
@@ -573,7 +576,7 @@ pub const Dictionary = struct {
         errdefer freeI16Slice(allocator, matrix.costs);
         // Large dictionaries use the trie path exclusively; building the
         // first-byte entry index there only consumes memory and load time.
-        const entry_index = if (entries.len <= 32) try buildEntryIndex(allocator, entries) else EntryIndex.empty();
+        const entry_index = if (entries.len <= small_dictionary_entry_limit) try buildEntryIndex(allocator, entries) else EntryIndex.empty();
         errdefer entry_index.deinit(allocator);
         const unk_index = try buildUnkIndex(allocator, char_property.categories.len, unk_entries, &matrix);
         errdefer unk_index.deinit(allocator);
@@ -614,10 +617,14 @@ pub const Dictionary = struct {
         try bytes.ensureTotalCapacity(allocator, try self.binarySize());
         try bytes.appendSlice(allocator, binary_magic);
 
+        // Large dictionaries tokenize through the trie and only need entry
+        // features; surfaces and connection ids per entry are stored for small
+        // dictionaries, which rebuild `entries` for the linear entry index.
+        const store_lexicon = self.entries.len <= small_dictionary_entry_limit;
         var surface_blob_len: usize = 0;
         var feature_blob_len: usize = 0;
         for (self.entries) |entry| {
-            surface_blob_len = try std.math.add(usize, surface_blob_len, entry.surface.len);
+            if (store_lexicon) surface_blob_len = try std.math.add(usize, surface_blob_len, entry.surface.len);
             feature_blob_len = try std.math.add(usize, feature_blob_len, entry.feature.len);
         }
 
@@ -651,22 +658,22 @@ pub const Dictionary = struct {
         try appendBinaryPadding(allocator, &bytes);
         for (self.entries) |entry| try bytes.appendSlice(allocator, entry.feature);
 
-        // Surfaces and connection ids per entry. Large dictionaries tokenize
-        // through the trie and never read these; small ones rebuild `entries`.
-        try appendBinaryPadding(allocator, &bytes);
-        offset = 0;
-        for (self.entries) |entry| {
+        if (store_lexicon) {
+            try appendBinaryPadding(allocator, &bytes);
+            offset = 0;
+            for (self.entries) |entry| {
+                try appendU32(allocator, &bytes, @intCast(offset));
+                offset += entry.surface.len;
+            }
             try appendU32(allocator, &bytes, @intCast(offset));
-            offset += entry.surface.len;
-        }
-        try appendU32(allocator, &bytes, @intCast(offset));
-        try appendBinaryPadding(allocator, &bytes);
-        for (self.entries) |entry| try bytes.appendSlice(allocator, entry.surface);
-        try appendBinaryPadding(allocator, &bytes);
-        for (self.entries) |entry| {
-            try appendU16(allocator, &bytes, entry.left_id);
-            try appendU16(allocator, &bytes, entry.right_id);
-            try appendI32(allocator, &bytes, entry.word_cost);
+            try appendBinaryPadding(allocator, &bytes);
+            for (self.entries) |entry| try bytes.appendSlice(allocator, entry.surface);
+            try appendBinaryPadding(allocator, &bytes);
+            for (self.entries) |entry| {
+                try appendU16(allocator, &bytes, entry.left_id);
+                try appendU16(allocator, &bytes, entry.right_id);
+                try appendI32(allocator, &bytes, entry.word_cost);
+            }
         }
 
         try appendBinaryPadding(allocator, &bytes);
@@ -781,26 +788,32 @@ pub const Dictionary = struct {
         const borrow_binary_tables = !copy_feature_blob and builtin.cpu.arch.endian() == .little;
 
         const entry_len: usize = entry_count;
-        const offsets_len = entry_len + 1;
+        const offsets_len = try std.math.add(usize, entry_len, 1);
         try skipBinaryPadding(bytes, &cursor);
         const feature_offsets = try readU32Slice(allocator, bytes, &cursor, offsets_len, borrow_binary_tables);
         var owns_feature_offsets = !borrow_binary_tables;
         errdefer if (owns_feature_offsets) freeU32Slice(allocator, feature_offsets);
         try skipBinaryPadding(bytes, &cursor);
         const feature_blob = try readSlice(bytes, &cursor, feature_blob_len);
-        try skipBinaryPadding(bytes, &cursor);
-        const surface_offsets = try readSlice(bytes, &cursor, try std.math.mul(usize, offsets_len, 4));
-        try skipBinaryPadding(bytes, &cursor);
-        const surface_blob = try readSlice(bytes, &cursor, surface_blob_len);
-        try skipBinaryPadding(bytes, &cursor);
-        const entry_ids = try readSlice(bytes, &cursor, try std.math.mul(usize, entry_len, 8));
 
         // Large dictionaries only need the feature offset table and blob, which
         // are borrowed (or copied) wholesale without touching any per-entry
         // data. `entryFeature` clamps every lookup to the blob, so a corrupt
         // table cannot read out of bounds. Small dictionaries use the linear
-        // entry index and rebuild `Entry` values instead.
-        const compact_entry_features = entry_count > 32;
+        // entry index and rebuild `Entry` values from the lexicon tables that
+        // only they store.
+        const compact_entry_features = entry_count > small_dictionary_entry_limit;
+        var surface_offsets: []const u8 = &.{};
+        var surface_blob: []const u8 = &.{};
+        var entry_ids: []const u8 = &.{};
+        if (!compact_entry_features) {
+            try skipBinaryPadding(bytes, &cursor);
+            surface_offsets = try readSlice(bytes, &cursor, offsets_len * 4);
+            try skipBinaryPadding(bytes, &cursor);
+            surface_blob = try readSlice(bytes, &cursor, surface_blob_len);
+            try skipBinaryPadding(bytes, &cursor);
+            entry_ids = try readSlice(bytes, &cursor, entry_len * 8);
+        } else if (surface_blob_len != 0) return error.InvalidDictionary;
         var entries = emptyEntrySlice();
         errdefer if (entries.len != 0) allocator.free(entries);
         var entry_blob_owned = emptyU8Slice();
@@ -948,7 +961,7 @@ pub const Dictionary = struct {
         };
         // No `errdefer char_property.deinit()`: the per-component errdefers
         // above already release these buffers on failure.
-        const entry_index = if (entries.len <= 32) try buildEntryIndex(allocator, entries) else EntryIndex.empty();
+        const entry_index = if (entries.len <= small_dictionary_entry_limit) try buildEntryIndex(allocator, entries) else EntryIndex.empty();
         errdefer entry_index.deinit(allocator);
         const unk_index = try buildUnkIndex(allocator, @intCast(category_count), unk_entries, &matrix);
         errdefer unk_index.deinit(allocator);
@@ -1204,9 +1217,9 @@ fn buildTrieTables(allocator: Allocator, entries: []const Entry, matrix: *const 
     }
     // Large dictionaries use the trie path exclusively; small ones scan the
     // first-byte entry index and skip the dense root tables.
-    const pair = if (entries.len <= 32) emptyU32Slice() else try buildTriePair(allocator, built.nodes, built.edges);
+    const pair = if (entries.len <= small_dictionary_entry_limit) emptyU32Slice() else try buildTriePair(allocator, built.nodes, built.edges);
     errdefer if (pair.len != 0) freeU32Slice(allocator, pair);
-    const bmp = if (entries.len <= 32) emptyU32Slice() else try buildTrieBmp(allocator, built.nodes, built.edges);
+    const bmp = if (entries.len <= small_dictionary_entry_limit) emptyU32Slice() else try buildTrieBmp(allocator, built.nodes, built.edges);
     errdefer if (bmp.len != 0) freeU32Slice(allocator, bmp);
     const triple = try buildTrieTriple(allocator, built.nodes, built.edges);
     errdefer if (triple.len != 0) freeU32Slice(allocator, triple);
@@ -1667,6 +1680,7 @@ fn buildDoubleArray(allocator: Allocator, nodes: []const BuiltTrieNode, edges: [
 
     try ensureDoubleArrayCapacity(allocator, &free, &check, &child, 512);
     var next_free: usize = 1;
+    var used_len: usize = 0;
     for (order) |node_index| {
         const node = nodes[node_index];
         const edge_len: usize = @intCast(node.edge_len);
@@ -1683,6 +1697,7 @@ fn buildDoubleArray(allocator: Allocator, nodes: []const BuiltTrieNode, edges: [
         var max_slot: usize = 0;
         for (node_edges) |edge| max_slot = @max(max_slot, candidate + edge.byte);
         try ensureDoubleArrayCapacity(allocator, &free, &check, &child, max_slot + 1);
+        used_len = @max(used_len, max_slot + 1);
 
         base[node_index] = @intCast(candidate);
         for (node_edges) |edge| {
@@ -1694,6 +1709,10 @@ fn buildDoubleArray(allocator: Allocator, nodes: []const BuiltTrieNode, edges: [
         next_free = @min(free.nextFree(next_free), check.items.len);
     }
 
+    // Capacity grows by doubling; slots past the last used one only ever
+    // fail the `check` test, which the bounds check already covers.
+    check.shrinkAndFree(allocator, used_len);
+    child.shrinkAndFree(allocator, used_len);
     return .{
         .base = base,
         .check = try check.toOwnedSlice(allocator),
