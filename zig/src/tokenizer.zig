@@ -25,8 +25,9 @@ const Node = struct {
     word_id: u32,
     // Full-token lattice nodes are transient and can become numerous on long
     // documents. Keep byte offsets and linked-list indexes at 32 bits while
-    // widening back to usize only when producing public Token values.
-    start: u32,
+    // widening back to usize only when producing public Token values. A node's
+    // start offset is not stored: it always equals `end` of its best
+    // predecessor (`prev_node`), which backtrace reads anyway.
     end: u32,
     right_id: u16,
     min_cost: i32,
@@ -36,7 +37,6 @@ const Node = struct {
     fn bos() Node {
         return .{
             .word_id = unknown_word_id,
-            .start = 0,
             .end = 0,
             .right_id = 0,
             .min_cost = 0,
@@ -669,11 +669,11 @@ pub const Worker = struct {
     }
 
     fn appendBestNodeWithBest(self: *Worker, begin: usize, end: usize, candidate: Candidate, best: BestPath) !void {
+        _ = begin;
         const index = self.nodes.items.len;
         if (index >= invalid_node) return error.InputTooLarge;
         try self.nodes.append(self.allocator, .{
             .word_id = candidate.word_id,
-            .start = try narrowInputOffset(begin),
             .end = try narrowInputOffset(end),
             .right_id = candidate.right_id,
             .min_cost = best.cost,
@@ -829,7 +829,7 @@ pub const Worker = struct {
             const node = self.nodes.items[index];
             const feature = self.featureFor(node.word_id);
             self.tokens.items[out] = .{
-                .start = @intCast(node.start),
+                .start = @intCast(self.nodes.items[node.prev_node].end),
                 .end = @intCast(node.end),
                 .word_id = node.word_id,
                 .feature = feature,
