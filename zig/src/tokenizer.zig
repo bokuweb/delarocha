@@ -808,35 +808,36 @@ pub const Worker = struct {
         return best_index;
     }
 
-    fn countPath(self: *const Worker, start_index: u32) usize {
+    fn backtrace(self: *Worker, input: []const u8, start_index: u32) !void {
+        // The per-position list heads are dead once the best end node is
+        // known, and a path has at most one node per input byte, so the heads
+        // buffer doubles as scratch for the path's node indexes. Collecting
+        // them in one (serially dependent) walk lets the fill loop below read
+        // the nodes in ascending order with independent loads instead of
+        // walking the `prev_node` chain a second time.
+        _ = input;
+        const path = self.end_heads.items;
         var count: usize = 0;
         var index = start_index;
         while (self.nodes.items[index].prev_node != invalid_node) {
+            path[count] = index;
             count += 1;
             index = self.nodes.items[index].prev_node;
         }
-        return count;
-    }
-
-    fn backtrace(self: *Worker, input: []const u8, start_index: u32) !void {
-        const count = self.countPath(start_index);
 
         try self.tokens.resize(self.allocator, count);
-        var index = start_index;
-        var out = count;
-        while (self.nodes.items[index].prev_node != invalid_node) {
-            out -= 1;
-            const node = self.nodes.items[index];
-            const feature = self.featureFor(node.word_id);
-            self.tokens.items[out] = .{
-                .start = @intCast(self.nodes.items[node.prev_node].end),
-                .end = @intCast(node.end),
+        var start: usize = 0;
+        for (self.tokens.items, 0..) |*token, i| {
+            const node = self.nodes.items[path[count - 1 - i]];
+            const end: usize = @intCast(node.end);
+            token.* = .{
+                .start = start,
+                .end = end,
                 .word_id = node.word_id,
-                .feature = feature,
+                .feature = self.featureFor(node.word_id),
                 .total_cost = node.min_cost,
             };
-            _ = input;
-            index = node.prev_node;
+            start = end;
         }
     }
 
