@@ -15,6 +15,13 @@ fn setLastError(comptime fmt: []const u8, args: anytype) void {
     @memset(last_error_buf[msg.len..], 0);
 }
 
+fn binaryLoadHint(err: anyerror) []const u8 {
+    return if (err == error.UnsupportedDictionaryVersion)
+        " (the file was written by an older delarocha binary format; rebuild it from the raw dictionary)"
+    else
+        "";
+}
+
 pub export fn delarocha_last_error() [*:0]const u8 {
     return @ptrCast(&last_error_buf);
 }
@@ -86,7 +93,7 @@ pub export fn delarocha_tokenizer_new_binary(path: [*:0]const u8) ?*Tokenizer {
     };
     tokenizer.* = Tokenizer.initBinaryFile(c_allocator, std.mem.span(path)) catch |err| {
         c_allocator.destroy(tokenizer);
-        setLastError("failed to load binary dictionary: {s}", .{@errorName(err)});
+        setLastError("failed to load binary dictionary: {s}{s}", .{ @errorName(err), binaryLoadHint(err) });
         return null;
     };
     return tokenizer;
@@ -101,7 +108,7 @@ pub export fn delarocha_tokenizer_new_binary_bytes(bytes_ptr: [*]const u8, bytes
         .allocator = c_allocator,
         .dictionary = Dictionary.fromBinaryBytes(c_allocator, bytes_ptr[0..bytes_len]) catch |err| {
             c_allocator.destroy(tokenizer);
-            setLastError("failed to load binary dictionary bytes: {s}", .{@errorName(err)});
+            setLastError("failed to load binary dictionary bytes: {s}{s}", .{ @errorName(err), binaryLoadHint(err) });
             return null;
         },
     };
@@ -117,7 +124,7 @@ pub export fn delarocha_tokenizer_new_binary_borrowed_bytes(bytes_ptr: [*]const 
         .allocator = c_allocator,
         .dictionary = Dictionary.fromBorrowedBinaryBytes(c_allocator, bytes_ptr[0..bytes_len]) catch |err| {
             c_allocator.destroy(tokenizer);
-            setLastError("failed to load borrowed binary dictionary bytes: {s}", .{@errorName(err)});
+            setLastError("failed to load borrowed binary dictionary bytes: {s}{s}", .{ @errorName(err), binaryLoadHint(err) });
             return null;
         },
     };

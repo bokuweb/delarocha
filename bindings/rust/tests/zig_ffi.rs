@@ -195,6 +195,26 @@ fn zig_ffi_mmap_count_only_compact_dictionary_and_truncated_files() {
         assert!(ZigTokenizer::count_only_from_binary_path(&truncated).is_err());
         assert!(ZigTokenizer::from_binary_bytes(&bytes[..len]).is_err());
     }
+
+    // Dictionaries written by an older binary format version are rejected
+    // with an explicit error instead of being misread.
+    for magic in [b"DLRDIC01", b"DLRDIC02"] {
+        let mut legacy = bytes.clone();
+        legacy[..magic.len()].copy_from_slice(magic);
+        let legacy_path = temp_dir.path().join("legacy.dic");
+        std::fs::write(&legacy_path, &legacy).expect("write legacy binary");
+        for result in [
+            ZigTokenizer::from_binary_path(&legacy_path),
+            ZigTokenizer::count_only_from_binary_path(&legacy_path),
+            ZigTokenizer::from_binary_bytes(&legacy),
+        ] {
+            let message = result.err().expect("legacy format is rejected").to_string();
+            assert!(
+                message.contains("UnsupportedDictionaryVersion"),
+                "unexpected error: {message}"
+            );
+        }
+    }
 }
 
 #[test]
