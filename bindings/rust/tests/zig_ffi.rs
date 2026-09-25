@@ -235,6 +235,177 @@ fn zig_ffi_returns_zero_copy_token_views() {
 }
 
 #[test]
+fn zig_ffi_token_views_expose_char_ranges() {
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let tokenizer = ZigTokenizer::from_raw_paths(
+        fixture_dir.join("lex.csv"),
+        fixture_dir.join("matrix.def"),
+        fixture_dir.join("char.def"),
+        fixture_dir.join("unk.def"),
+    )
+    .expect("Zig tokenizer loads raw fixture");
+    let mut worker = tokenizer.create_worker().expect("Zig worker is created");
+
+    let views = worker
+        .tokenize_borrowed_views("本X🍛カレー")
+        .expect("Zig borrowed views succeed");
+    let tokens: Vec<_> = views
+        .iter()
+        .map(|view| {
+            (
+                view.surface(),
+                view.range_byte(),
+                view.range_char(),
+                view.is_unknown(),
+            )
+        })
+        .collect();
+    assert_eq!(views.iter().len(), tokens.len());
+    assert_eq!(tokens.first(), Some(&("本", 0..3, 0..1, false)));
+    // The fixture's DEFAULT unknown category groups the remaining characters,
+    // including the 4-byte emoji, into one unknown token.
+    assert_eq!(tokens.last(), Some(&("X🍛カレー", 3..17, 1..6, true)));
+    assert!(views.get(tokens.len()).is_none());
+}
+
+#[test]
+fn zig_ffi_borrowed_views_match_owned_tokens() {
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let binary_path = temp_dir.path().join("fixture.dic");
+    ZigTokenizer::write_binary_from_raw_paths(
+        fixture_dir.join("lex.csv"),
+        fixture_dir.join("matrix.def"),
+        fixture_dir.join("char.def"),
+        fixture_dir.join("unk.def"),
+        &binary_path,
+    )
+    .expect("Zig writes binary dictionary");
+
+    let raw = ZigTokenizer::from_raw_paths(
+        fixture_dir.join("lex.csv"),
+        fixture_dir.join("matrix.def"),
+        fixture_dir.join("char.def"),
+        fixture_dir.join("unk.def"),
+    )
+    .expect("Zig tokenizer loads raw fixture");
+    let mmap = ZigTokenizer::from_binary_path(&binary_path).expect("Zig mmaps binary fixture");
+
+    for tokenizer in [&raw, &mmap] {
+        let mut worker = tokenizer.create_worker().expect("Zig worker is created");
+        let mut reused_tokens = Vec::new();
+        let mut reused_spans = Vec::new();
+        let fixed = [
+            "本とカレー",
+            "本\0カレー",
+            "",
+            " 本 と ",
+            "カレー本と本とカレー",
+        ];
+        let inputs = fixed
+            .iter()
+            .map(|input| input.to_string())
+            .chain((0..fuzz_seed_count()).map(|seed| fuzz_string(seed, fuzz_max_len())));
+        for input in inputs {
+            let owned = worker.tokenize(&input).expect("owned tokenize succeeds");
+
+            let views = worker
+                .tokenize_borrowed_views(&input)
+                .expect("borrowed views succeed");
+            assert_eq!(views.len(), owned.len(), "{input:?}");
+            let from_views: Vec<_> = views.iter().map(|view| view.to_token()).collect();
+            assert_eq!(from_views, owned, "{input:?}");
+            for (index, token) in owned.iter().enumerate() {
+                let view = views.get(index).expect("view exists");
+                assert_eq!(view.surface(), token.surface(), "{input:?}");
+                assert_eq!(view.feature(), token.feature(), "{input:?}");
+                assert_eq!(view.range_byte(), token.range_byte(), "{input:?}");
+                assert_eq!(view.range_char(), token.range_char(), "{input:?}");
+                assert_eq!(view.is_unknown(), token.is_unknown(), "{input:?}");
+            }
+
+            let collected: Vec<delarocha::Token> = worker
+                .tokenize_views(&input)
+                .expect("views succeed")
+                .into_iter()
+                .map(Into::into)
+                .collect();
+            assert_eq!(collected, owned, "{input:?}");
+
+            // Reusing the output vector across sentences of different lengths
+            // must not leak stale token data.
+            worker
+                .tokenize_into(&input, &mut reused_tokens)
+                .expect("tokenize_into succeeds");
+            assert_eq!(reused_tokens, owned, "{input:?}");
+
+            worker
+                .tokenize_spans_into(&input, &mut reused_spans)
+                .expect("tokenize_spans_into succeeds");
+            let spans: Vec<_> = owned
+                .iter()
+                .map(|token| (token.start, token.end, token.word_id))
+                .collect();
+            assert_eq!(
+                reused_spans
+                    .iter()
+                    .map(|span| (span.start, span.end, span.word_id))
+                    .collect::<Vec<_>>(),
+                spans,
+                "{input:?}"
+            );
+            assert_eq!(
+                worker.tokenize_spans(&input).expect("spans succeed"),
+                reused_spans,
+                "{input:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn zig_ffi_invalid_utf8_feature_is_empty_on_every_path() {
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let lex_path = temp_dir.path().join("lex.csv");
+    let mut lexicon = std::fs::read(fixture_dir.join("lex.csv")).expect("read fixture lexicon");
+    lexicon.extend_from_slice(b"\xe8\xaa\x9e,0,0,1,bad-\xff-feature\n");
+    std::fs::write(&lex_path, lexicon).expect("write lexicon with invalid feature");
+
+    let tokenizer = ZigTokenizer::from_raw_paths(
+        &lex_path,
+        fixture_dir.join("matrix.def"),
+        fixture_dir.join("char.def"),
+        fixture_dir.join("unk.def"),
+    )
+    .expect("Zig tokenizer loads raw lexicon");
+    let mut worker = tokenizer.create_worker().expect("Zig worker is created");
+
+    // Tokenize twice so the second pass exercises the per-word UTF-8 memo.
+    for _ in 0..2 {
+        let owned = worker
+            .tokenize("本語カレー")
+            .expect("owned tokenize succeeds");
+        let bad = owned
+            .iter()
+            .find(|token| token.surface == "語")
+            .expect("invalid-feature word is tokenized");
+        assert_eq!(bad.feature, "");
+        let good = owned
+            .iter()
+            .find(|token| token.surface == "カレー")
+            .expect("valid word is tokenized");
+        assert_eq!(good.feature, "noun,curry");
+
+        let views = worker
+            .tokenize_borrowed_views("本語カレー")
+            .expect("borrowed views succeed");
+        let from_views: Vec<_> = views.iter().map(|view| view.to_token()).collect();
+        assert_eq!(from_views, owned);
+    }
+}
+
+#[test]
 fn zig_ffi_seeded_fuzz_count_only_matches_full_tokenization() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
     let temp_dir = tempfile::tempdir().expect("create temp dir");

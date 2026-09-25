@@ -1860,10 +1860,86 @@ pub mod ffi {
         raw: NonNull<RawWorker>,
         span_starts: Vec<u32>,
         span_ends: Vec<u32>,
+        span_start_chars: Vec<u32>,
+        span_end_chars: Vec<u32>,
         span_word_ids: Vec<u32>,
         feature_ptrs: Vec<*const u8>,
         feature_lens: Vec<usize>,
+        feature_utf8: FeatureUtf8Cache,
+        spare_tokens: Vec<Token>,
         _tokenizer: PhantomData<&'tokenizer ZigTokenizer>,
+    }
+
+    // Upper bound on tokens `ZigWorker::tokenize_into` keeps for reuse, so one
+    // huge document does not pin its token strings for the worker lifetime.
+    const SPARE_TOKEN_LIMIT: usize = 4096;
+
+    /// Per-worker memo of dictionary features already proven to be UTF-8.
+    ///
+    /// The Zig core returns feature bytes without validating them, and binary
+    /// dictionaries may come from untrusted files. Instead of running
+    /// `str::from_utf8` on every emitted token (about 11% of the full FFI
+    /// tokenize profile), each distinct word id is validated the first time it
+    /// appears and remembered in a bitset. Dictionary data is immutable for the
+    /// tokenizer lifetime, and the Zig side derives the feature slice solely
+    /// from the word id, so a validated word id stays valid for every later
+    /// token. Validating lazily keeps mmap-backed dictionaries from paging in
+    /// the whole feature blob at load time.
+    #[derive(Default)]
+    struct FeatureUtf8Cache {
+        known: Vec<u64>,
+        unknown: Vec<u64>,
+    }
+
+    // Bound the bitset for pathological word ids. Larger ids are still
+    // validated, just without memoization.
+    const FEATURE_UTF8_CACHE_LIMIT: u32 = 1 << 24;
+
+    impl FeatureUtf8Cache {
+        #[inline(always)]
+        fn bits(&self, word_id: u32) -> Option<(&[u64], usize)> {
+            let (bits, index) = if word_id < USER_WORD_BASE {
+                (&self.known, word_id)
+            } else if word_id >= UNKNOWN_WORD_BASE {
+                (&self.unknown, word_id - UNKNOWN_WORD_BASE)
+            } else {
+                // User entries are not exposed through the FFI bindings.
+                return None;
+            };
+            (index < FEATURE_UTF8_CACHE_LIMIT).then_some((bits.as_slice(), index as usize))
+        }
+
+        /// Fast path: whether `word_id`'s feature was already proven UTF-8.
+        #[inline(always)]
+        fn is_validated(&self, word_id: u32) -> bool {
+            self.bits(word_id).is_some_and(|(bits, index)| {
+                bits.get(index / 64)
+                    .is_some_and(|word| word & (1u64 << (index % 64)) != 0)
+            })
+        }
+
+        /// Slow path: validates `bytes`, the feature of `word_id`, and
+        /// memoizes success.
+        #[cold]
+        #[inline(never)]
+        fn validate(&mut self, word_id: u32, bytes: &[u8]) -> bool {
+            if std::str::from_utf8(bytes).is_err() {
+                return false;
+            }
+            if self.bits(word_id).is_some() {
+                let (bits, index) = if word_id >= UNKNOWN_WORD_BASE {
+                    (&mut self.unknown, (word_id - UNKNOWN_WORD_BASE) as usize)
+                } else {
+                    (&mut self.known, word_id as usize)
+                };
+                let word = index / 64;
+                if bits.len() <= word {
+                    bits.resize(word + 1, 0);
+                }
+                bits[word] |= 1u64 << (index % 64);
+            }
+            true
+        }
     }
 
     // The Zig handles are opaque pointers to native tokenizer/worker state.
@@ -1887,20 +1963,79 @@ pub mod ffi {
         pub word_id: u32,
     }
 
+    /// Zero-copy token: `surface` borrows the tokenized input and `feature`
+    /// borrows dictionary storage, so producing one allocates nothing.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct ZigTokenView<'a> {
         pub surface: &'a str,
         pub feature: &'a str,
         pub start: usize,
         pub end: usize,
+        pub start_char: usize,
+        pub end_char: usize,
         pub word_id: u32,
     }
 
+    impl<'a> ZigTokenView<'a> {
+        pub fn surface(&self) -> &'a str {
+            self.surface
+        }
+
+        pub fn feature(&self) -> &'a str {
+            self.feature
+        }
+
+        pub fn range_byte(&self) -> Range<usize> {
+            self.start..self.end
+        }
+
+        pub fn range_char(&self) -> Range<usize> {
+            self.start_char..self.end_char
+        }
+
+        pub fn word_id(&self) -> u32 {
+            self.word_id
+        }
+
+        pub fn is_unknown(&self) -> bool {
+            self.word_id >= UNKNOWN_WORD_BASE
+        }
+
+        /// Copies the borrowed strings into an owned [`Token`], matching the
+        /// output of [`ZigWorker::tokenize`].
+        pub fn to_token(&self) -> Token {
+            Token {
+                surface: self.surface.to_owned(),
+                start: self.start,
+                end: self.end,
+                start_char: self.start_char,
+                end_char: self.end_char,
+                word_id: self.word_id,
+                feature: self.feature.to_owned(),
+                total_cost: 0,
+            }
+        }
+    }
+
+    impl From<ZigTokenView<'_>> for Token {
+        fn from(view: ZigTokenView<'_>) -> Self {
+            view.to_token()
+        }
+    }
+
+    /// Token views over the worker's reusable metadata buffers.
+    ///
+    /// Only [`ZigWorker::tokenize_borrowed_views`] constructs this type, after
+    /// `ZigWorker::load_tokens` has checked every span against `input` and
+    /// proven every feature slice to be UTF-8. `get` relies on that invariant
+    /// to skip per-token validation.
     #[derive(Clone, Copy, Debug)]
     pub struct ZigTokenViews<'a> {
         input: &'a str,
         starts: &'a [u32],
         ends: &'a [u32],
+        start_chars: &'a [u32],
+        end_chars: &'a [u32],
         word_ids: &'a [u32],
         feature_ptrs: &'a [*const u8],
         feature_lens: &'a [usize],
@@ -1916,31 +2051,64 @@ pub mod ffi {
         }
 
         pub fn get(&self, index: usize) -> Option<ZigTokenView<'a>> {
-            let start = *self.starts.get(index)? as usize;
-            let end = *self.ends.get(index)? as usize;
-            let feature_ptr = *self.feature_ptrs.get(index)?;
-            let feature_len = *self.feature_lens.get(index)?;
-            let feature = if feature_ptr.is_null() {
-                ""
-            } else {
-                std::str::from_utf8(unsafe { std::slice::from_raw_parts(feature_ptr, feature_len) })
-                    .unwrap_or_default()
-            };
-            Some(ZigTokenView {
-                surface: self.input.get(start..end)?,
-                feature,
-                start,
-                end,
-                word_id: *self.word_ids.get(index)?,
-            })
+            if index >= self.len() {
+                return None;
+            }
+            // SAFETY: all metadata slices have the same length (see
+            // `tokenize_borrowed_views`), `index` is in bounds, and
+            // `load_tokens` validated the span and feature at `index`.
+            unsafe { Some(self.get_unchecked(index)) }
         }
 
-        pub fn iter(&self) -> impl Iterator<Item = ZigTokenView<'a>> + '_ {
-            (0..self.len()).map(|index| {
-                self.get(index)
-                    .expect("token metadata returned by Zig must be internally consistent")
-            })
+        pub fn iter(&self) -> impl ExactSizeIterator<Item = ZigTokenView<'a>> + '_ {
+            // SAFETY: `index < self.len()`; see `get`.
+            (0..self.len()).map(|index| unsafe { self.get_unchecked(index) })
         }
+
+        /// # Safety
+        /// `index` must be less than `self.len()`.
+        #[inline]
+        unsafe fn get_unchecked(&self, index: usize) -> ZigTokenView<'a> {
+            unsafe {
+                let start = *self.starts.get_unchecked(index) as usize;
+                let end = *self.ends.get_unchecked(index) as usize;
+                ZigTokenView {
+                    // SAFETY: `load_tokens` checked `start <= end <= input.len()`
+                    // and that both offsets are char boundaries of `input`.
+                    surface: self.input.get_unchecked(start..end),
+                    // SAFETY: `load_tokens` proved these bytes are UTF-8 (or
+                    // replaced them with an empty slice); they live in the
+                    // tokenizer's immutable dictionary, which outlives 'a.
+                    feature: feature_str(
+                        *self.feature_ptrs.get_unchecked(index),
+                        *self.feature_lens.get_unchecked(index),
+                    ),
+                    start,
+                    end,
+                    start_char: *self.start_chars.get_unchecked(index) as usize,
+                    end_char: *self.end_chars.get_unchecked(index) as usize,
+                    word_id: *self.word_ids.get_unchecked(index),
+                }
+            }
+        }
+    }
+
+    /// # Safety
+    /// `ptr[..len]` must be valid UTF-8 that stays alive and unmodified for
+    /// `'a`, and `ptr` must be non-null when `len > 0`.
+    #[inline(always)]
+    unsafe fn feature_str<'a>(ptr: *const u8, len: usize) -> &'a str {
+        if len == 0 {
+            return "";
+        }
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }
+    }
+
+    // Counts UTF-8 scalar values by skipping continuation bytes. `bytes` must
+    // come from a `str` sliced at char boundaries.
+    #[inline(always)]
+    fn count_chars(bytes: &[u8]) -> usize {
+        bytes.iter().filter(|&&byte| (byte as i8) >= -0x40).count()
     }
 
     impl<'input> ZigBatch<'input> {
@@ -2102,9 +2270,13 @@ pub mod ffi {
                 raw,
                 span_starts: Vec::new(),
                 span_ends: Vec::new(),
+                span_start_chars: Vec::new(),
+                span_end_chars: Vec::new(),
                 span_word_ids: Vec::new(),
                 feature_ptrs: Vec::new(),
                 feature_lens: Vec::new(),
+                feature_utf8: FeatureUtf8Cache::default(),
+                spare_tokens: Vec::new(),
                 _tokenizer: PhantomData,
             })
         }
@@ -2163,7 +2335,9 @@ pub mod ffi {
             }
         }
 
-        pub fn tokenize(&mut self, input: &str) -> Result<Vec<Token>> {
+        /// Runs Zig tokenization and copies token metadata into the worker's
+        /// reusable buffers. Returns the number of tokens copied.
+        fn copy_metadata(&mut self, input: &str) -> Result<usize> {
             let status =
                 unsafe { delarocha_tokenize_bytes(self.raw.as_ptr(), input.as_ptr(), input.len()) };
             if status != 0 {
@@ -2190,127 +2364,181 @@ pub mod ffi {
             if copied == usize::MAX {
                 return Err(last_error());
             }
-            let mut tokens = Vec::with_capacity(count);
-            // Token byte ranges are emitted in sentence order. Keep the
-            // character cursor moving forward so long inputs do not rescan the
-            // whole prefix for every token.
+            Ok(copied)
+        }
+
+        /// [`Self::copy_metadata`] plus the checks that let every token
+        /// accessor use unchecked `str` construction:
+        ///
+        /// - each span satisfies `previous_end <= start <= end <= input.len()`
+        ///   and both offsets are char boundaries of `input`;
+        /// - each feature slice is valid UTF-8 (memoized per word id, see
+        ///   [`FeatureUtf8Cache`]); invalid features are replaced with `""`,
+        ///   matching the previous `from_utf8(..).unwrap_or_default()`.
+        ///
+        /// Character offsets are computed in the same forward pass.
+        fn load_tokens(&mut self, input: &str) -> Result<usize> {
+            let copied = self.copy_metadata(input)?;
+            self.span_start_chars.resize(copied, 0);
+            self.span_end_chars.resize(copied, 0);
+
+            let bytes = input.as_bytes();
+            let cache = &mut self.feature_utf8;
+            let tokens = self.span_starts[..copied]
+                .iter()
+                .zip(&self.span_ends[..copied])
+                .zip(&self.span_word_ids[..copied])
+                .zip(&self.feature_ptrs[..copied])
+                .zip(&mut self.feature_lens[..copied])
+                .zip(&mut self.span_start_chars[..copied])
+                .zip(&mut self.span_end_chars[..copied]);
             let mut previous_byte = 0usize;
             let mut current_char = 0usize;
-            for index in 0..copied {
-                let start = self.span_starts[index] as usize;
-                let end = self.span_ends[index] as usize;
-                let word_id = self.span_word_ids[index];
-                let feature_ptr = self.feature_ptrs[index];
-                let feature_len = self.feature_lens[index];
-                let feature = if feature_ptr.is_null() {
-                    ""
-                } else {
-                    std::str::from_utf8(unsafe {
-                        std::slice::from_raw_parts(feature_ptr.cast::<u8>(), feature_len)
-                    })
-                    .unwrap_or_default()
-                };
-                current_char += input[previous_byte..start].chars().count();
-                let start_char = current_char;
-                current_char += input[start..end].chars().count();
-                let end_char = current_char;
+            for (
+                (((((&start, &end), &word_id), &feature_ptr), feature_len), start_char),
+                end_char,
+            ) in tokens
+            {
+                let (start, end) = (start as usize, end as usize);
+                if previous_byte > start
+                    || start > end
+                    || !input.is_char_boundary(start)
+                    || !input.is_char_boundary(end)
+                {
+                    return Err(Error::Tokenization(format!(
+                        "Zig returned an invalid token span {start}..{end}"
+                    )));
+                }
+                // Token byte ranges are emitted in sentence order. Keep the
+                // character cursor moving forward so long inputs do not rescan
+                // the whole prefix for every token.
+                if previous_byte != start {
+                    current_char += count_chars(&bytes[previous_byte..start]);
+                }
+                *start_char = current_char as u32;
+                current_char += count_chars(&bytes[start..end]);
+                *end_char = current_char as u32;
                 previous_byte = end;
-                tokens.push(Token {
-                    surface: input[start..end].to_owned(),
-                    start,
-                    end,
-                    start_char,
-                    end_char,
-                    word_id,
-                    feature: feature.to_owned(),
-                    total_cost: 0,
-                });
+
+                if *feature_len != 0 && !cache.is_validated(word_id) {
+                    // SAFETY: Zig returns a pointer/length pair into the
+                    // tokenizer's dictionary, which outlives this worker.
+                    let valid = !feature_ptr.is_null()
+                        && cache.validate(word_id, unsafe {
+                            std::slice::from_raw_parts(feature_ptr, *feature_len)
+                        });
+                    if !valid {
+                        *feature_len = 0;
+                    }
+                }
             }
+            Ok(copied)
+        }
+
+        /// # Safety
+        /// `index` must be less than the count returned by the preceding
+        /// [`Self::load_tokens`] call for `input`.
+        #[inline(always)]
+        unsafe fn token_parts<'a>(&'a self, input: &'a str, index: usize) -> (&'a str, &'a str) {
+            unsafe {
+                let start = *self.span_starts.get_unchecked(index) as usize;
+                let end = *self.span_ends.get_unchecked(index) as usize;
+                (
+                    // SAFETY: `load_tokens` checked bounds and char boundaries.
+                    input.get_unchecked(start..end),
+                    // SAFETY: `load_tokens` validated the feature bytes.
+                    feature_str(
+                        *self.feature_ptrs.get_unchecked(index),
+                        *self.feature_lens.get_unchecked(index),
+                    ),
+                )
+            }
+        }
+
+        pub fn tokenize(&mut self, input: &str) -> Result<Vec<Token>> {
+            let mut tokens = Vec::new();
+            self.tokenize_into(input, &mut tokens)?;
             Ok(tokens)
         }
 
-        pub fn tokenize_views<'a>(&'a mut self, input: &'a str) -> Result<Vec<ZigTokenView<'a>>> {
-            let status =
-                unsafe { delarocha_tokenize_bytes(self.raw.as_ptr(), input.as_ptr(), input.len()) };
-            if status != 0 {
-                return Err(last_error());
+        /// Owned tokenization into a caller-provided vector.
+        ///
+        /// Tokens already in `tokens` are overwritten in place, so their
+        /// `surface`/`feature` string buffers are reused instead of
+        /// reallocated. When a sentence yields fewer tokens, the surplus is
+        /// parked in the worker (up to a small bound) for later sentences.
+        /// Callers tokenizing many sentences with one vector therefore pay the
+        /// two per-token string allocations only while the buffers warm up.
+        pub fn tokenize_into(&mut self, input: &str, tokens: &mut Vec<Token>) -> Result<()> {
+            let copied = self.load_tokens(input)?;
+            if tokens.len() > copied {
+                // Park surplus tokens instead of dropping them so a later,
+                // longer sentence can reuse their string buffers.
+                let room = SPARE_TOKEN_LIMIT.saturating_sub(self.spare_tokens.len());
+                let keep_end = tokens.len().min(copied + room);
+                self.spare_tokens.extend(tokens.drain(copied..keep_end));
+                tokens.truncate(copied);
             }
-
-            let count = unsafe { delarocha_token_count(self.raw.as_ptr()) };
-            self.span_starts.resize(count, 0);
-            self.span_ends.resize(count, 0);
-            self.span_word_ids.resize(count, 0);
-            self.feature_ptrs.resize(count, std::ptr::null());
-            self.feature_lens.resize(count, 0);
-            let copied = unsafe {
-                delarocha_tokens_copy_metadata(
-                    self.raw.as_ptr(),
-                    self.span_starts.as_mut_ptr(),
-                    self.span_ends.as_mut_ptr(),
-                    self.span_word_ids.as_mut_ptr(),
-                    self.feature_ptrs.as_mut_ptr(),
-                    self.feature_lens.as_mut_ptr(),
-                    count,
-                )
-            };
-            if copied == usize::MAX {
-                return Err(last_error());
-            }
-
-            let mut views = Vec::with_capacity(copied);
+            tokens.reserve(copied - tokens.len());
             for index in 0..copied {
+                if index == tokens.len()
+                    && let Some(token) = self.spare_tokens.pop()
+                {
+                    tokens.push(token);
+                }
+                // SAFETY: `index < copied`, the `load_tokens` result for `input`.
+                let (surface, feature) = unsafe { self.token_parts(input, index) };
                 let start = self.span_starts[index] as usize;
                 let end = self.span_ends[index] as usize;
-                let feature = std::str::from_utf8(unsafe {
-                    std::slice::from_raw_parts(self.feature_ptrs[index], self.feature_lens[index])
-                })
-                .unwrap_or_default();
-                views.push(ZigTokenView {
-                    surface: &input[start..end],
-                    feature,
-                    start,
-                    end,
-                    word_id: self.span_word_ids[index],
-                });
+                let start_char = self.span_start_chars[index] as usize;
+                let end_char = self.span_end_chars[index] as usize;
+                let word_id = self.span_word_ids[index];
+                let Some(token) = tokens.get_mut(index) else {
+                    tokens.push(Token {
+                        surface: surface.to_owned(),
+                        start,
+                        end,
+                        start_char,
+                        end_char,
+                        word_id,
+                        feature: feature.to_owned(),
+                        total_cost: 0,
+                    });
+                    continue;
+                };
+                token.surface.clear();
+                token.surface.push_str(surface);
+                token.feature.clear();
+                token.feature.push_str(feature);
+                token.start = start;
+                token.end = end;
+                token.start_char = start_char;
+                token.end_char = end_char;
+                token.word_id = word_id;
+                token.total_cost = 0;
             }
-            Ok(views)
+            Ok(())
         }
 
+        pub fn tokenize_views<'a>(&'a mut self, input: &'a str) -> Result<Vec<ZigTokenView<'a>>> {
+            Ok(self.tokenize_borrowed_views(input)?.iter().collect())
+        }
+
+        /// Zero-copy tokenization: returns views whose surfaces borrow `input`
+        /// and whose features borrow dictionary storage. The views live in the
+        /// worker's reusable buffers, so steady-state calls allocate nothing.
+        /// [`ZigTokenView::to_token`] reproduces [`Self::tokenize`] exactly.
         pub fn tokenize_borrowed_views<'a>(
             &'a mut self,
             input: &'a str,
         ) -> Result<ZigTokenViews<'a>> {
-            let status =
-                unsafe { delarocha_tokenize_bytes(self.raw.as_ptr(), input.as_ptr(), input.len()) };
-            if status != 0 {
-                return Err(last_error());
-            }
-
-            let count = unsafe { delarocha_token_count(self.raw.as_ptr()) };
-            self.span_starts.resize(count, 0);
-            self.span_ends.resize(count, 0);
-            self.span_word_ids.resize(count, 0);
-            self.feature_ptrs.resize(count, std::ptr::null());
-            self.feature_lens.resize(count, 0);
-            let copied = unsafe {
-                delarocha_tokens_copy_metadata(
-                    self.raw.as_ptr(),
-                    self.span_starts.as_mut_ptr(),
-                    self.span_ends.as_mut_ptr(),
-                    self.span_word_ids.as_mut_ptr(),
-                    self.feature_ptrs.as_mut_ptr(),
-                    self.feature_lens.as_mut_ptr(),
-                    count,
-                )
-            };
-            if copied == usize::MAX {
-                return Err(last_error());
-            }
-
+            let copied = self.load_tokens(input)?;
             Ok(ZigTokenViews {
                 input,
                 starts: &self.span_starts[..copied],
                 ends: &self.span_ends[..copied],
+                start_chars: &self.span_start_chars[..copied],
+                end_chars: &self.span_end_chars[..copied],
                 word_ids: &self.span_word_ids[..copied],
                 feature_ptrs: &self.feature_ptrs[..copied],
                 feature_lens: &self.feature_lens[..copied],
@@ -2345,39 +2573,33 @@ pub mod ffi {
         }
 
         pub fn tokenize_spans(&mut self, input: &str) -> Result<Vec<ZigTokenSpan>> {
-            let status =
-                unsafe { delarocha_tokenize_bytes(self.raw.as_ptr(), input.as_ptr(), input.len()) };
-            if status != 0 {
-                return Err(last_error());
-            }
+            let mut spans = Vec::new();
+            self.tokenize_spans_into(input, &mut spans)?;
+            Ok(spans)
+        }
 
-            let count = unsafe { delarocha_token_count(self.raw.as_ptr()) };
-            self.span_starts.resize(count, 0);
-            self.span_ends.resize(count, 0);
-            self.span_word_ids.resize(count, 0);
-            self.feature_ptrs.resize(count, std::ptr::null());
-            self.feature_lens.resize(count, 0);
-            let copied = unsafe {
-                delarocha_tokens_copy_metadata(
-                    self.raw.as_ptr(),
-                    self.span_starts.as_mut_ptr(),
-                    self.span_ends.as_mut_ptr(),
-                    self.span_word_ids.as_mut_ptr(),
-                    self.feature_ptrs.as_mut_ptr(),
-                    self.feature_lens.as_mut_ptr(),
-                    count,
-                )
-            };
-            if copied == usize::MAX {
-                return Err(last_error());
-            }
-            Ok((0..copied)
-                .map(|index| ZigTokenSpan {
-                    start: self.span_starts[index] as usize,
-                    end: self.span_ends[index] as usize,
-                    word_id: self.span_word_ids[index],
-                })
-                .collect())
+        /// Like [`Self::tokenize_spans`], but clears and refills `spans` so a
+        /// caller tokenizing many sentences can reuse one output allocation.
+        pub fn tokenize_spans_into(
+            &mut self,
+            input: &str,
+            spans: &mut Vec<ZigTokenSpan>,
+        ) -> Result<()> {
+            let copied = self.copy_metadata(input)?;
+            spans.clear();
+            spans.reserve(copied);
+            spans.extend(
+                self.span_starts[..copied]
+                    .iter()
+                    .zip(&self.span_ends[..copied])
+                    .zip(&self.span_word_ids[..copied])
+                    .map(|((&start, &end), &word_id)| ZigTokenSpan {
+                        start: start as usize,
+                        end: end as usize,
+                        word_id,
+                    }),
+            );
+            Ok(())
         }
 
         pub fn tokenize_count_batch(&mut self, batch: &ZigBatch<'_>) -> Result<usize> {
