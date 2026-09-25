@@ -669,14 +669,21 @@ pub const Worker = struct {
         _ = begin;
         const index = self.nodes.items.len;
         if (index >= invalid_node) return error.InputTooLarge;
-        try self.nodes.append(self.allocator, .{
+        const node: Node = .{
             .word_id = candidate.word_id,
             .end = try narrowInputOffset(end),
             .right_id = candidate.right_id,
             .min_cost = best.cost,
             .prev_node = best.index,
             .next_end = self.end_heads.items[end],
-        });
+        };
+        // Reused workers have usually grown the lattice already; keep the
+        // steady-state append inline and leave growth to the out-of-line path.
+        if (index < self.nodes.capacity) {
+            self.nodes.appendAssumeCapacity(node);
+        } else {
+            try self.nodes.append(self.allocator, node);
+        }
         self.end_heads.items[end] = @intCast(index);
     }
 
