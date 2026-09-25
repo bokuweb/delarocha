@@ -1107,8 +1107,23 @@ fn addSizes(initial: usize, values: anytype) !usize {
 }
 
 const BuildTrieNode = struct {
-    edges: std.ArrayList(TrieEdge) = .empty,
-    word_ids: std.ArrayList(u32) = .empty,
+    /// This node's outgoing edges in the shared edge pool, linked in insertion
+    /// order through `BuildTrieEdge.next`.
+    first_edge: u32 = invalid_trie_node,
+    last_edge: u32 = invalid_trie_node,
+    edge_len: u32 = 0,
+    word_len: u32 = 0,
+    /// Index of a 256-entry child table in the dense pool once the node has
+    /// `build_trie_dense_threshold` edges; lookups then skip the list walk.
+    dense: u32 = invalid_trie_node,
+};
+
+const build_trie_dense_threshold = 8;
+
+const BuildTrieEdge = struct {
+    child: u32,
+    next: u32,
+    byte: u8,
 };
 
 const TrieBuildResult = struct {
@@ -1222,74 +1237,118 @@ fn buildEntryIndex(allocator: Allocator, entries: []const Entry) !EntryIndex {
 }
 
 fn buildTrie(allocator: Allocator, entries: []const Entry, matrix: *const ConnectionMatrix) !TrieBuildResult {
+    // Nodes and edges live in two flat pools (no per-node allocations); each
+    // node's edges form a linked list in insertion order. `word_nodes[i]` is
+    // the terminal node of entries[i], later grouped per node by a stable
+    // counting sort so each node's terms keep ascending word id order.
     var build_nodes: std.ArrayList(BuildTrieNode) = .empty;
-    defer {
-        for (build_nodes.items) |*node| {
-            node.edges.deinit(allocator);
-            node.word_ids.deinit(allocator);
-        }
-        build_nodes.deinit(allocator);
-    }
+    defer build_nodes.deinit(allocator);
+    var build_edges: std.ArrayList(BuildTrieEdge) = .empty;
+    defer build_edges.deinit(allocator);
+    var dense_children: std.ArrayList(u32) = .empty;
+    defer dense_children.deinit(allocator);
+    const word_nodes = try allocator.alloc(u32, entries.len);
+    defer allocator.free(word_nodes);
 
     try build_nodes.append(allocator, .{});
     for (entries, 0..) |entry, word_id| {
         var node_index: usize = 0;
         for (entry.surface) |byte| {
-            if (findEdgeSlice(build_nodes.items[node_index].edges.items, byte)) |child| {
-                node_index = child;
+            const node = build_nodes.items[node_index];
+            const found = if (node.dense != invalid_trie_node)
+                dense_children.items[@as(usize, node.dense) * 256 + byte]
+            else
+                findBuildEdge(build_edges.items, node.first_edge, byte);
+            if (found != invalid_trie_node) {
+                node_index = found;
             } else {
-                const child = build_nodes.items.len;
+                const child: u32 = @intCast(build_nodes.items.len);
                 try build_nodes.append(allocator, .{});
-                try build_nodes.items[node_index].edges.append(allocator, .{ .byte = byte, .child = @intCast(child) });
+                const edge_index: u32 = @intCast(build_edges.items.len);
+                try build_edges.append(allocator, .{ .byte = byte, .child = child, .next = invalid_trie_node });
+                const parent = &build_nodes.items[node_index];
+                if (parent.last_edge == invalid_trie_node) {
+                    parent.first_edge = edge_index;
+                } else {
+                    build_edges.items[parent.last_edge].next = edge_index;
+                }
+                parent.last_edge = edge_index;
+                parent.edge_len += 1;
+                if (parent.dense != invalid_trie_node) {
+                    dense_children.items[@as(usize, parent.dense) * 256 + byte] = child;
+                } else if (parent.edge_len == build_trie_dense_threshold) {
+                    parent.dense = @intCast(dense_children.items.len / 256);
+                    const table = try dense_children.addManyAsArray(allocator, 256);
+                    @memset(table, invalid_trie_node);
+                    var e = parent.first_edge;
+                    while (e != invalid_trie_node) : (e = build_edges.items[e].next) {
+                        table[build_edges.items[e].byte] = build_edges.items[e].child;
+                    }
+                }
                 node_index = child;
             }
         }
-        try build_nodes.items[node_index].word_ids.append(allocator, @intCast(word_id));
-    }
-
-    var edge_count: usize = 0;
-    var word_id_count: usize = 0;
-    for (build_nodes.items) |*node| {
-        std.mem.sort(TrieEdge, node.edges.items, {}, trieEdgeLessThan);
-        edge_count += node.edges.items.len;
-        word_id_count += node.word_ids.items.len;
+        build_nodes.items[node_index].word_len += 1;
+        word_nodes[word_id] = @intCast(node_index);
     }
 
     const nodes = try allocator.alloc(TrieNode, build_nodes.items.len);
     errdefer allocator.free(nodes);
-    const edges = try allocator.alloc(TrieEdge, edge_count);
+    const edges = try allocator.alloc(TrieEdge, build_edges.items.len);
     errdefer allocator.free(edges);
-    const terms = try allocator.alloc(TrieTerm, word_id_count);
+    const terms = try allocator.alloc(TrieTerm, entries.len);
     errdefer allocator.free(terms);
     var count_terms: std.ArrayList(TrieCountTerm) = .empty;
     errdefer count_terms.deinit(allocator);
 
-    var edge_offset: usize = 0;
-    var word_offset: usize = 0;
-    for (build_nodes.items, 0..) |node, i| {
-        @memcpy(edges[edge_offset .. edge_offset + node.edges.items.len], node.edges.items);
-        const count_start = count_terms.items.len;
-        for (node.word_ids.items, 0..) |word_id, j| {
+    // word_starts[i] = offset of node i's first term.
+    const word_starts = try allocator.alloc(u32, build_nodes.items.len);
+    defer allocator.free(word_starts);
+    {
+        var offset: usize = 0;
+        for (build_nodes.items, word_starts) |node, *word_start| {
+            word_start.* = try narrowTrieOffset(offset);
+            offset += node.word_len;
+        }
+        const cursor = try allocator.dupe(u32, word_starts);
+        defer allocator.free(cursor);
+        for (word_nodes, 0..) |node_index, word_id| {
             const entry = entries[word_id];
-            const term: TrieTerm = .{
-                .word_id = word_id,
+            terms[cursor[node_index]] = .{
+                .word_id = @intCast(word_id),
                 .left_id = entry.left_id,
                 .right_id = entry.right_id,
                 .word_cost = entry.word_cost,
             };
-            terms[word_offset + j] = term;
+            cursor[node_index] += 1;
+        }
+    }
+
+    var edge_offset: usize = 0;
+    for (build_nodes.items, 0..) |node, i| {
+        const node_edges = edges[edge_offset .. edge_offset + node.edge_len];
+        var edge_index = node.first_edge;
+        for (node_edges) |*edge| {
+            const build_edge = build_edges.items[edge_index];
+            edge.* = .{ .byte = build_edge.byte, .child = build_edge.child };
+            edge_index = build_edge.next;
+        }
+        std.mem.sort(TrieEdge, node_edges, {}, trieEdgeLessThan);
+
+        const word_offset: usize = word_starts[i];
+        const count_start = count_terms.items.len;
+        for (terms[word_offset .. word_offset + node.word_len]) |term| {
             try appendCountTerm(allocator, &count_terms, term, count_start, matrix);
         }
         nodes[i] = .{
             .edge_start = try narrowTrieOffset(edge_offset),
-            .edge_len = @intCast(node.edges.items.len),
+            .edge_len = @intCast(node.edge_len),
             .word_start = try narrowTrieOffset(word_offset),
-            .word_len = try narrowTrieTermLen(node.word_ids.items.len),
+            .word_len = try narrowTrieTermLen(node.word_len),
             .count_word_start = try narrowTrieOffset(count_start),
             .count_word_len = try narrowTrieTermLen(count_terms.items.len - count_start),
         };
-        edge_offset += node.edges.items.len;
-        word_offset += node.word_ids.items.len;
+        edge_offset += node.edge_len;
     }
 
     return .{ .nodes = nodes, .edges = edges, .terms = terms, .count_terms = try count_terms.toOwnedSlice(allocator) };
@@ -1337,11 +1396,14 @@ fn countTermDominates(matrix: *const ConnectionMatrix, lhs: TrieCountTerm, rhs: 
     return true;
 }
 
-fn findEdgeSlice(edges: []const TrieEdge, byte: u8) ?usize {
-    for (edges) |edge| {
-        if (edge.byte == byte) return @intCast(edge.child);
+fn findBuildEdge(edges: []const BuildTrieEdge, first_edge: u32, byte: u8) u32 {
+    var edge_index = first_edge;
+    while (edge_index != invalid_trie_node) {
+        const edge = edges[edge_index];
+        if (edge.byte == byte) return edge.child;
+        edge_index = edge.next;
     }
-    return null;
+    return invalid_trie_node;
 }
 
 fn buildTrieFirst(nodes: []const TrieNode, edges: []const TrieEdge) [256]u32 {
@@ -1446,14 +1508,20 @@ fn buildDoubleArray(allocator: Allocator, nodes: []const TrieNode, edges: []cons
     for (order, 0..) |*item, i| item.* = i;
     std.mem.sort(usize, order, nodes, trieNodeFanoutGreater);
 
-    var used: std.ArrayList(u8) = .empty;
-    defer used.deinit(allocator);
+    // `free` is a bitmap over double-array slots (bit set = slot unused).
+    // Slots past its end are implicitly free. Searching for a base value then
+    // tests 64 consecutive candidates per word: AND-ing the free bits at each
+    // edge's offset yields the candidates where every edge slot is free, and
+    // @ctz picks the smallest. This finds exactly the same base as a linear
+    // candidate-by-candidate scan, so the layout is unchanged.
+    var free: DoubleArrayFreeBits = .{};
+    defer free.deinit(allocator);
     var check: std.ArrayList(u32) = .empty;
     errdefer check.deinit(allocator);
     var child: std.ArrayList(u32) = .empty;
     errdefer child.deinit(allocator);
 
-    try ensureDoubleArrayCapacity(allocator, &used, &check, &child, 512);
+    try ensureDoubleArrayCapacity(allocator, &free, &check, &child, 512);
     var next_free: usize = 1;
     for (order) |node_index| {
         const node = nodes[node_index];
@@ -1466,26 +1534,20 @@ fn buildDoubleArray(allocator: Allocator, nodes: []const TrieNode, edges: []cons
         const edge_start: usize = @intCast(node.edge_start);
         const node_edges = edges[edge_start .. edge_start + edge_len];
         const first_byte: usize = node_edges[0].byte;
-        var candidate = if (next_free > first_byte) next_free - first_byte else 1;
-
-        while (true) : (candidate += 1) {
-            const first_slot = candidate + first_byte;
-            if (first_slot < used.items.len and used.items[first_slot] != 0) continue;
-            if (doubleArrayBaseFits(used.items, node_edges, candidate)) break;
-        }
+        const candidate = free.findBase(node_edges, if (next_free > first_byte) next_free - first_byte else 1);
 
         var max_slot: usize = 0;
         for (node_edges) |edge| max_slot = @max(max_slot, candidate + edge.byte);
-        try ensureDoubleArrayCapacity(allocator, &used, &check, &child, max_slot + 1);
+        try ensureDoubleArrayCapacity(allocator, &free, &check, &child, max_slot + 1);
 
         base[node_index] = @intCast(candidate);
         for (node_edges) |edge| {
             const slot = candidate + edge.byte;
-            used.items[slot] = 1;
+            free.markUsed(slot);
             check.items[slot] = @intCast(node_index);
             child.items[slot] = edge.child;
         }
-        while (next_free < used.items.len and used.items[next_free] != 0) next_free += 1;
+        next_free = @min(free.nextFree(next_free), check.items.len);
     }
 
     return .{
@@ -1507,32 +1569,103 @@ fn narrowTrieOffset(offset: usize) !u32 {
     return std.math.cast(u32, offset) orelse error.InvalidDictionary;
 }
 
-fn doubleArrayBaseFits(used: []const u8, node_edges: []const TrieEdge, candidate: usize) bool {
-    for (node_edges) |edge| {
-        const slot = candidate + edge.byte;
-        if (slot < used.len and used[slot] != 0) return false;
+const DoubleArrayFreeBits = struct {
+    /// Bit set = slot free. The slice always extends `padding_words` all-ones
+    /// words past the double-array length so that windows starting at any
+    /// candidate <= length plus any edge byte stay in bounds without checks.
+    words: std.ArrayList(u64) = .empty,
+
+    // A window reads `lanes + 1` words starting at most (length + 255) / 64,
+    // i.e. up to word length / 64 + 4 + lanes.
+    const padding_words = 16;
+
+    fn deinit(self: *DoubleArrayFreeBits, allocator: Allocator) void {
+        self.words.deinit(allocator);
     }
-    return true;
-}
+
+    fn grow(self: *DoubleArrayFreeBits, allocator: Allocator, slot_len: usize) !void {
+        std.debug.assert(slot_len % 64 == 0);
+        const target = slot_len / 64 + padding_words;
+        if (self.words.items.len < target) {
+            try self.words.appendNTimes(allocator, ~@as(u64, 0), target - self.words.items.len);
+        }
+    }
+
+    const lanes = 8;
+    const Lanes = @Vector(lanes, u64);
+
+    /// Free bits for slots [bit, bit + 64 * lanes): lane k bit j = slot
+    /// bit + 64 * k + j.
+    inline fn window(words: []const u64, bit: usize) Lanes {
+        const index = bit >> 6;
+        const shift: u6 = @truncate(bit);
+        const lo: Lanes = words[index..][0..lanes].*;
+        const hi: Lanes = words[index + 1 ..][0..lanes].*;
+        // `(hi << 1) << (63 - shift)` is `hi << (64 - shift)` without the
+        // undefined shift-by-64 when shift == 0.
+        const s: @Vector(lanes, u6) = @splat(shift);
+        const t: @Vector(lanes, u6) = @splat(63 - shift);
+        const one: @Vector(lanes, u6) = @splat(1);
+        return (lo >> s) | ((hi << one) << t);
+    }
+
+    /// Smallest base >= start such that base + edge.byte is free for every
+    /// edge. `start` must not exceed the double-array length, which bounds the
+    /// search: a base equal to the length always fits. Candidates are tested
+    /// 64 * lanes at a time; the result equals a linear candidate scan.
+    fn findBase(self: *const DoubleArrayFreeBits, node_edges: []const TrieEdge, start: usize) usize {
+        const words = self.words.items;
+        var chunk = start;
+        while (true) : (chunk += 64 * lanes) {
+            var mask: Lanes = @splat(~@as(u64, 0));
+            for (node_edges) |edge| {
+                mask &= window(words, chunk + edge.byte);
+                if (@reduce(.Or, mask) == 0) break;
+            }
+            if (@reduce(.Or, mask) == 0) continue;
+            const arr: [lanes]u64 = mask;
+            for (arr, 0..) |bits, k| {
+                if (bits != 0) return chunk + 64 * k + @ctz(bits);
+            }
+            unreachable;
+        }
+    }
+
+    /// Smallest free slot >= start. Terminates in the all-ones padding.
+    fn nextFree(self: *const DoubleArrayFreeBits, start: usize) usize {
+        const words = self.words.items;
+        var index = start >> 6;
+        var bits = words[index] & (~@as(u64, 0) << @as(u6, @truncate(start)));
+        while (bits == 0) {
+            index += 1;
+            bits = words[index];
+        }
+        return index * 64 + @ctz(bits);
+    }
+
+    inline fn markUsed(self: *DoubleArrayFreeBits, slot: usize) void {
+        self.words.items[slot >> 6] &= ~(@as(u64, 1) << @as(u6, @truncate(slot)));
+    }
+};
 
 fn ensureDoubleArrayCapacity(
     allocator: Allocator,
-    used: *std.ArrayList(u8),
+    free: *DoubleArrayFreeBits,
     check: *std.ArrayList(u32),
     child: *std.ArrayList(u32),
     required: usize,
 ) !void {
-    if (used.items.len >= required) return;
-    var new_len = @max(used.items.len, @as(usize, 512));
+    if (check.items.len >= required) return;
+    var new_len = @max(check.items.len, @as(usize, 512));
     while (new_len < required) new_len *= 2;
 
-    const old_len = used.items.len;
-    try used.resize(allocator, new_len);
+    const old_len = check.items.len;
     try check.resize(allocator, new_len);
     try child.resize(allocator, new_len);
-    @memset(used.items[old_len..], 0);
     @memset(check.items[old_len..], invalid_trie_node);
     @memset(child.items[old_len..], invalid_trie_node);
+    // new_len is a multiple of 64 (512 doubled).
+    try free.grow(allocator, new_len);
 }
 
 fn freeDoubleArray(allocator: Allocator, double_array: DoubleArray) void {
@@ -1686,8 +1819,9 @@ fn appendU8(allocator: Allocator, bytes: *std.ArrayList(u8), value: u8) !void {
 }
 
 fn appendU16(allocator: Allocator, bytes: *std.ArrayList(u8), value: u16) !void {
-    try appendU8(allocator, bytes, @intCast(value & 0xff));
-    try appendU8(allocator, bytes, @intCast(value >> 8));
+    var buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &buf, value, .little);
+    try bytes.appendSlice(allocator, &buf);
 }
 
 fn appendI16(allocator: Allocator, bytes: *std.ArrayList(u8), value: i16) !void {
@@ -1695,10 +1829,9 @@ fn appendI16(allocator: Allocator, bytes: *std.ArrayList(u8), value: i16) !void 
 }
 
 fn appendU32(allocator: Allocator, bytes: *std.ArrayList(u8), value: u32) !void {
-    try appendU8(allocator, bytes, @intCast(value & 0xff));
-    try appendU8(allocator, bytes, @intCast((value >> 8) & 0xff));
-    try appendU8(allocator, bytes, @intCast((value >> 16) & 0xff));
-    try appendU8(allocator, bytes, @intCast(value >> 24));
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .little);
+    try bytes.appendSlice(allocator, &buf);
 }
 
 fn appendI32(allocator: Allocator, bytes: *std.ArrayList(u8), value: i32) !void {
@@ -2075,4 +2208,50 @@ fn freeUnkSlice(allocator: Allocator, entries: []UnkEntry) void {
 
 fn freeUnks(allocator: Allocator, entries: []UnkEntry) void {
     for (entries) |entry| allocator.free(entry.feature);
+}
+
+test "double-array free bitmap search matches a linear scan" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+
+    var round: usize = 0;
+    while (round < 200) : (round += 1) {
+        const slot_len: usize = 64 * (1 + random.uintLessThan(usize, 64));
+        var free: DoubleArrayFreeBits = .{};
+        defer free.deinit(allocator);
+        try free.grow(allocator, slot_len);
+        const used = try allocator.alloc(bool, slot_len);
+        defer allocator.free(used);
+        const density = random.uintLessThan(u32, 100);
+        for (used, 0..) |*u, slot| {
+            u.* = random.uintLessThan(u32, 100) < density;
+            if (u.*) free.markUsed(slot);
+        }
+
+        var edge_buf: [256]TrieEdge = undefined;
+        const edge_len = 1 + random.uintLessThan(usize, 12);
+        var byte_set = std.StaticBitSet(256).initEmpty();
+        while (byte_set.count() < edge_len) byte_set.set(random.int(u8));
+        var it = byte_set.iterator(.{});
+        var n: usize = 0;
+        while (it.next()) |byte| : (n += 1) edge_buf[n] = .{ .byte = @intCast(byte), .child = 0 };
+        const node_edges = edge_buf[0..n];
+
+        const start = 1 + random.uintLessThan(usize, slot_len);
+        var expected = start;
+        while (true) : (expected += 1) {
+            var fits = true;
+            for (node_edges) |edge| {
+                const slot = expected + edge.byte;
+                if (slot < slot_len and used[slot]) fits = false;
+            }
+            if (fits) break;
+        }
+        try std.testing.expectEqual(expected, free.findBase(node_edges, start));
+
+        var expected_free = start;
+        while (expected_free < slot_len and used[expected_free]) expected_free += 1;
+        try std.testing.expectEqual(expected_free, @min(free.nextFree(start), slot_len));
+    }
 }

@@ -230,3 +230,7 @@ test "binary file loaders (mmap, copy, borrowed, count-only) agree" {
         }
     }
 }
+
+test {
+    _ = dictionary;
+}
