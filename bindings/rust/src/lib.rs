@@ -28,14 +28,13 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-type EntryIndex = [Vec<usize>; 256];
 
 #[derive(Clone, Debug)]
 pub struct Dictionary {
     entries: Vec<Entry>,
-    entry_index: EntryIndex,
+    entry_index: PrefixIndex,
     user_entries: Vec<Entry>,
-    user_entry_index: EntryIndex,
+    user_entry_index: PrefixIndex,
     matrix: ConnectionMatrix,
     char_property: CharProperty,
     unk_entries: Vec<UnkEntry>,
@@ -169,9 +168,9 @@ impl Dictionary {
         }
 
         Ok(Self {
-            entry_index: build_entry_index(&entries),
+            entry_index: PrefixIndex::build(&entries),
             entries,
-            user_entry_index: empty_entry_index(),
+            user_entry_index: PrefixIndex::default(),
             user_entries: Vec::new(),
             matrix,
             char_property: CharProperty::default(),
@@ -227,9 +226,9 @@ impl SystemDictionaryBuilder {
         let unk_index = build_unk_index(char_property.categories.len(), &unk_entries);
 
         Ok(Dictionary {
-            entry_index: build_entry_index(&entries),
+            entry_index: PrefixIndex::build(&entries),
             entries,
-            user_entry_index: empty_entry_index(),
+            user_entry_index: PrefixIndex::default(),
             user_entries: Vec::new(),
             matrix,
             char_property,
@@ -253,7 +252,7 @@ impl Dictionary {
         } else {
             Vec::new()
         };
-        self.user_entry_index = build_entry_index(&self.user_entries);
+        self.user_entry_index = PrefixIndex::build(&self.user_entries);
         Ok(self)
     }
 }
@@ -691,6 +690,19 @@ impl Tokenizer {
         self
     }
 
+    /// Returns a tokenizer with the given options that shares this
+    /// tokenizer's dictionary instead of copying it.
+    #[cfg(any(test, all(feature = "wasm", target_arch = "wasm32")))]
+    fn configured(&self, ignore_space: bool, max_grouping_len: usize) -> Result<Self> {
+        Ok(Self {
+            dictionary: Arc::clone(&self.dictionary),
+            ignore_space_category: None,
+            max_grouping_len: None,
+        }
+        .ignore_space(ignore_space)?
+        .max_grouping_len(max_grouping_len))
+    }
+
     pub fn tokenize(&self, input: &str) -> Result<Vec<Token>> {
         let mut worker = self.create_worker();
         worker.tokenize(input).map(ToOwned::to_owned)
@@ -715,6 +727,7 @@ impl Tokenizer {
             end_links: Vec::new(),
             tokens: Vec::new(),
             unknown_group_cache: None,
+            matches: Vec::new(),
             _dictionary_lifetime: PhantomData,
         }
     }
@@ -763,10 +776,7 @@ impl CompatWorker<'_> {
 #[wasm_bindgen]
 #[derive(Debug)]
 pub struct WasmTokenizer {
-    tokenizer: Tokenizer,
-    worker: Worker<'static>,
-    ignore_space: bool,
-    max_grouping_len: usize,
+    session: TokenizerSession,
 }
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
@@ -775,13 +785,8 @@ impl WasmTokenizer {
     #[wasm_bindgen(constructor)]
     pub fn new() -> std::result::Result<WasmTokenizer, JsValue> {
         let dictionary = build_fixture_dictionary().map_err(js_error)?;
-        let tokenizer = build_configured_tokenizer(dictionary, false, 24).map_err(js_error)?;
-        let worker = tokenizer.create_owned_worker();
         Ok(Self {
-            tokenizer,
-            worker,
-            ignore_space: false,
-            max_grouping_len: 24,
+            session: TokenizerSession::new(dictionary, false, 24).map_err(js_error)?,
         })
     }
 
@@ -791,16 +796,9 @@ impl WasmTokenizer {
         ignore_space: bool,
         max_grouping_len: usize,
     ) -> std::result::Result<(), JsValue> {
-        self.ignore_space = ignore_space;
-        self.max_grouping_len = max_grouping_len;
-        self.tokenizer = build_configured_tokenizer(
-            self.tokenizer.dictionary.as_ref().clone(),
-            ignore_space,
-            max_grouping_len,
-        )
-        .map_err(js_error)?;
-        self.worker = self.tokenizer.create_owned_worker();
-        Ok(())
+        self.session
+            .set_options(ignore_space, max_grouping_len)
+            .map_err(js_error)
     }
 
     #[wasm_bindgen(js_name = resetDictionary)]
@@ -818,56 +816,117 @@ impl WasmTokenizer {
             unk_def.as_bytes(),
         )
         .map_err(js_error)?;
-        self.tokenizer =
-            build_configured_tokenizer(dictionary, self.ignore_space, self.max_grouping_len)
-                .map_err(js_error)?;
-        self.worker = self.tokenizer.create_owned_worker();
-        Ok(())
+        self.session.reset_dictionary(dictionary).map_err(js_error)
     }
 
     #[wasm_bindgen(js_name = resetFixtureDictionary)]
     pub fn reset_fixture_dictionary(&mut self) -> std::result::Result<(), JsValue> {
-        self.tokenizer = build_configured_tokenizer(
-            build_fixture_dictionary().map_err(js_error)?,
-            self.ignore_space,
-            self.max_grouping_len,
-        )
-        .map_err(js_error)?;
-        self.worker = self.tokenizer.create_owned_worker();
-        Ok(())
+        self.session
+            .reset_dictionary(build_fixture_dictionary().map_err(js_error)?)
+            .map_err(js_error)
     }
 
     #[wasm_bindgen(js_name = tokenizeJson)]
     pub fn tokenize_json(&mut self, input: &str) -> std::result::Result<String, JsValue> {
-        let tokens = self.worker.tokenize(input).map_err(js_error)?;
-        Ok(tokens_to_json(&tokens))
+        let tokens = self.session.tokenize(input).map_err(js_error)?;
+        Ok(tokens_to_json(tokens))
     }
 
     #[wasm_bindgen(js_name = tokenizeWakati)]
     pub fn tokenize_wakati(&mut self, input: &str) -> std::result::Result<String, JsValue> {
-        let tokens = self.worker.tokenize(input).map_err(js_error)?;
-        Ok(tokens
-            .iter()
-            .map(|token| token.surface.as_str())
-            .collect::<Vec<_>>()
-            .join(" "))
+        let tokens = self.session.tokenize(input).map_err(js_error)?;
+        Ok(tokens_to_wakati(tokens))
     }
 
     #[wasm_bindgen(js_name = tokenizeCount)]
     pub fn tokenize_count(&mut self, input: &str) -> std::result::Result<usize, JsValue> {
-        self.worker.tokenize_count(input).map_err(js_error)
+        self.session.tokenize_count(input).map_err(js_error)
     }
 }
 
-#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
-fn build_configured_tokenizer(
-    dictionary: Dictionary,
+/// Long-lived tokenizer state behind [`WasmTokenizer`].
+///
+/// The dictionary, tokenizer and worker are built once and only rebuilt when
+/// the options or the dictionary actually change. The tokens of the last
+/// input are kept so that consecutive calls for the same input (the
+/// playground asks for JSON and wakati output of every edit) run the lattice
+/// once.
+#[cfg(any(test, all(feature = "wasm", target_arch = "wasm32")))]
+#[derive(Debug)]
+struct TokenizerSession {
+    tokenizer: Tokenizer,
+    worker: Worker<'static>,
     ignore_space: bool,
     max_grouping_len: usize,
-) -> Result<Tokenizer> {
-    Ok(Tokenizer::new(dictionary)
-        .ignore_space(ignore_space)?
-        .max_grouping_len(max_grouping_len))
+    cached_input: String,
+    cache_valid: bool,
+}
+
+#[cfg(any(test, all(feature = "wasm", target_arch = "wasm32")))]
+impl TokenizerSession {
+    fn new(dictionary: Dictionary, ignore_space: bool, max_grouping_len: usize) -> Result<Self> {
+        let tokenizer = Tokenizer::new(dictionary).configured(ignore_space, max_grouping_len)?;
+        Ok(Self {
+            worker: tokenizer.create_owned_worker(),
+            tokenizer,
+            ignore_space,
+            max_grouping_len,
+            cached_input: String::new(),
+            cache_valid: false,
+        })
+    }
+
+    fn set_options(&mut self, ignore_space: bool, max_grouping_len: usize) -> Result<()> {
+        if ignore_space == self.ignore_space && max_grouping_len == self.max_grouping_len {
+            return Ok(());
+        }
+        let tokenizer = self.tokenizer.configured(ignore_space, max_grouping_len)?;
+        self.install(tokenizer);
+        self.ignore_space = ignore_space;
+        self.max_grouping_len = max_grouping_len;
+        Ok(())
+    }
+
+    fn reset_dictionary(&mut self, dictionary: Dictionary) -> Result<()> {
+        let tokenizer =
+            Tokenizer::new(dictionary).configured(self.ignore_space, self.max_grouping_len)?;
+        self.install(tokenizer);
+        Ok(())
+    }
+
+    fn install(&mut self, tokenizer: Tokenizer) {
+        self.worker = tokenizer.create_owned_worker();
+        self.tokenizer = tokenizer;
+        self.cache_valid = false;
+    }
+
+    fn tokenize(&mut self, input: &str) -> Result<&[Token]> {
+        if !(self.cache_valid && self.cached_input == input) {
+            self.cache_valid = false;
+            self.worker.tokenize(input)?;
+            self.cached_input.clear();
+            self.cached_input.push_str(input);
+            self.cache_valid = true;
+        }
+        Ok(&self.worker.tokens)
+    }
+
+    fn tokenize_count(&mut self, input: &str) -> Result<usize> {
+        self.cache_valid = false;
+        self.worker.tokenize_count(input)
+    }
+}
+
+#[cfg(any(test, all(feature = "wasm", target_arch = "wasm32")))]
+fn tokens_to_wakati(tokens: &[Token]) -> String {
+    let mut wakati = String::new();
+    for (i, token) in tokens.iter().enumerate() {
+        if i != 0 {
+            wakati.push(' ');
+        }
+        wakati.push_str(&token.surface);
+    }
+    wakati
 }
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
@@ -977,14 +1036,15 @@ pub struct Worker<'dict> {
     end_links: Vec<EndLink>,
     tokens: Vec<Token>,
     unknown_group_cache: Option<UnknownGroupCache>,
+    matches: Vec<u32>,
     _dictionary_lifetime: PhantomData<&'dict Dictionary>,
 }
 
 #[derive(Clone, Debug)]
 struct Node {
     word_id: u32,
-    start: usize,
-    end: usize,
+    start: u32,
+    end: u32,
     right_id: u16,
     min_cost: i32,
     prev_node: u32,
@@ -1033,6 +1093,10 @@ impl<'dict> Worker<'dict> {
 
     fn build_best_path(&mut self, input: &str) -> Result<Option<usize>> {
         let dictionary = Arc::clone(&self.dictionary);
+        // Lattice nodes store byte offsets as u32.
+        if u32::try_from(input.len()).is_err() {
+            return Err(Error::Tokenization("input is too long".into()));
+        }
         self.reset(input.len());
         if input.is_empty() {
             return Ok(None);
@@ -1064,41 +1128,41 @@ impl<'dict> Worker<'dict> {
                 }
             }
 
+            // Candidates are appended in ascending word id order (user entries
+            // first) because lattice tie-breaking depends on node order.
+            let mut matches = std::mem::take(&mut self.matches);
             let mut emitted = false;
-            for &word_id in &dictionary.user_entry_index[input_bytes[begin] as usize] {
-                let entry = &dictionary.user_entries[word_id];
-                if input_bytes[begin..].starts_with(entry.surface.as_bytes()) {
-                    let end = begin + entry.surface.len();
-                    self.append_best_node(
+            for (index, entries, word_base) in [
+                (
+                    &dictionary.user_entry_index,
+                    &dictionary.user_entries,
+                    USER_WORD_BASE,
+                ),
+                (&dictionary.entry_index, &dictionary.entries, 0),
+            ] {
+                matches.clear();
+                index.common_prefix_word_ids(&input_bytes[begin..], &mut matches);
+                matches.sort_unstable();
+                for &word_id in &matches {
+                    let entry = &entries[word_id as usize];
+                    let result = self.append_best_node(
                         begin,
-                        end,
+                        begin + entry.surface.len(),
                         Candidate {
-                            word_id: USER_WORD_BASE + word_id as u32,
+                            word_id: word_base + word_id,
                             left_id: entry.left_id,
                             right_id: entry.right_id,
                             word_cost: entry.word_cost,
                         },
-                    )?;
+                    );
+                    if let Err(err) = result {
+                        self.matches = matches;
+                        return Err(err);
+                    }
                     emitted = true;
                 }
             }
-            for &word_id in &dictionary.entry_index[input_bytes[begin] as usize] {
-                let entry = &dictionary.entries[word_id];
-                if input_bytes[begin..].starts_with(entry.surface.as_bytes()) {
-                    let end = begin + entry.surface.len();
-                    self.append_best_node(
-                        begin,
-                        end,
-                        Candidate {
-                            word_id: word_id as u32,
-                            left_id: entry.left_id,
-                            right_id: entry.right_id,
-                            word_cost: entry.word_cost,
-                        },
-                    )?;
-                    emitted = true;
-                }
-            }
+            self.matches = matches;
 
             self.append_unknown_nodes(&dictionary, input, begin, emitted)?;
         }
@@ -1139,8 +1203,8 @@ impl<'dict> Worker<'dict> {
         let index = self.nodes.len();
         self.nodes.push(Node {
             word_id: candidate.word_id,
-            start: begin,
-            end,
+            start: begin as u32,
+            end: end as u32,
             right_id: candidate.right_id,
             min_cost,
             prev_node: narrow_lattice_index(prev_node)?,
@@ -1420,7 +1484,7 @@ impl<'dict> Worker<'dict> {
                     .unk_entries
                     .get(unk_index)
                     .map_or("UNK", |entry| entry.feature.as_str());
-                (&input[node.start..node.end], feature)
+                (&input[node.start as usize..node.end as usize], feature)
             } else if node.word_id >= USER_WORD_BASE {
                 let entry = self
                     .dictionary
@@ -1438,8 +1502,8 @@ impl<'dict> Worker<'dict> {
             };
             self.tokens.push(Token {
                 surface: surface.to_owned(),
-                start: node.start,
-                end: node.end,
+                start: node.start as usize,
+                end: node.end as usize,
                 start_char: 0,
                 end_char: 0,
                 word_id: node.word_id,
@@ -1618,18 +1682,124 @@ fn parse_mecab_entries(bytes: &[u8], name: &str) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-fn empty_entry_index() -> EntryIndex {
-    std::array::from_fn(|_| Vec::new())
+/// Common-prefix search index over entry surfaces.
+///
+/// Distinct surfaces are sorted bytewise and stored back to back in `keys`.
+/// A lookup narrows the sorted key range one input byte at a time with two
+/// binary searches, so the work per lattice position is proportional to the
+/// matched depth times `log(keys)` instead of the number of entries sharing
+/// the first byte.
+#[derive(Clone, Debug)]
+struct PrefixIndex {
+    /// Concatenated distinct surfaces in sorted order.
+    keys: Vec<u8>,
+    /// `keys[key_offsets[k]..key_offsets[k + 1]]` is the k-th surface.
+    key_offsets: Vec<u32>,
+    /// `word_ids[id_offsets[k]..id_offsets[k + 1]]` are the entries of the
+    /// k-th surface, in ascending word id order.
+    id_offsets: Vec<u32>,
+    word_ids: Vec<u32>,
+    /// Key range for each leading byte: `first_byte[b]..first_byte[b + 1]`.
+    first_byte: Box<[u32; 257]>,
 }
 
-fn build_entry_index(entries: &[Entry]) -> EntryIndex {
-    let mut index = empty_entry_index();
-    for (word_id, entry) in entries.iter().enumerate() {
-        if let Some(&first) = entry.surface.as_bytes().first() {
-            index[usize::from(first)].push(word_id);
+impl Default for PrefixIndex {
+    fn default() -> Self {
+        Self {
+            keys: Vec::new(),
+            key_offsets: vec![0],
+            id_offsets: vec![0],
+            word_ids: Vec::new(),
+            first_byte: Box::new([0; 257]),
         }
     }
-    index
+}
+
+impl PrefixIndex {
+    fn build(entries: &[Entry]) -> Self {
+        let mut order: Vec<(&[u8], u32)> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !entry.surface.is_empty())
+            .map(|(word_id, entry)| (entry.surface.as_bytes(), word_id as u32))
+            .collect();
+        // (surface, word_id) pairs are unique, so an unstable sort is
+        // deterministic and keeps word ids ascending within a surface.
+        order.sort_unstable();
+
+        let mut index = Self::default();
+        index.word_ids.reserve_exact(order.len());
+        let mut previous: Option<&[u8]> = None;
+        for (surface, word_id) in order {
+            if previous != Some(surface) {
+                if previous.is_some() {
+                    index.id_offsets.push(index.word_ids.len() as u32);
+                }
+                index.keys.extend_from_slice(surface);
+                index.key_offsets.push(index.keys.len() as u32);
+                index.first_byte[usize::from(surface[0]) + 1] += 1;
+                previous = Some(surface);
+            }
+            index.word_ids.push(word_id);
+        }
+        if previous.is_some() {
+            index.id_offsets.push(index.word_ids.len() as u32);
+        }
+        for byte in 0..256 {
+            index.first_byte[byte + 1] += index.first_byte[byte];
+        }
+        index
+    }
+
+    #[inline]
+    fn key(&self, key: usize) -> &[u8] {
+        &self.keys[self.key_offsets[key] as usize..self.key_offsets[key + 1] as usize]
+    }
+
+    /// First key in `lo..hi` whose byte at `depth` is not less than `byte`.
+    /// Every key in the range must be longer than `depth`.
+    #[inline]
+    fn lower_bound(&self, mut lo: usize, mut hi: usize, depth: usize, byte: u8) -> usize {
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.keys[self.key_offsets[mid] as usize + depth] < byte {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Appends the word ids of every surface that is a prefix of `input`.
+    fn common_prefix_word_ids(&self, input: &[u8], out: &mut Vec<u32>) {
+        let Some(&first) = input.first() else {
+            return;
+        };
+        let mut lo = self.first_byte[usize::from(first)] as usize;
+        let mut hi = self.first_byte[usize::from(first) + 1] as usize;
+        let mut depth = 1;
+        while lo < hi {
+            // Every key in lo..hi starts with input[..depth]; the one equal to
+            // it, if any, sorts first.
+            if self.key(lo).len() == depth {
+                out.extend_from_slice(
+                    &self.word_ids[self.id_offsets[lo] as usize..self.id_offsets[lo + 1] as usize],
+                );
+                lo += 1;
+            }
+            if depth == input.len() || lo == hi {
+                break;
+            }
+            let byte = input[depth];
+            lo = self.lower_bound(lo, hi, depth, byte);
+            hi = match byte.checked_add(1) {
+                Some(next) => self.lower_bound(lo, hi, depth, next),
+                None => hi,
+            };
+            depth += 1;
+        }
+    }
 }
 
 const INVALID_CHAR_RANGE: usize = usize::MAX;
@@ -2672,5 +2842,171 @@ pub mod ffi {
                 .to_string_lossy()
                 .into_owned(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEX_CSV: &str = include_str!("../../../fixtures/vibrato/lex.csv");
+    const MATRIX_DEF: &str = include_str!("../../../fixtures/vibrato/matrix.def");
+    const CHAR_DEF: &str = include_str!("../../../fixtures/vibrato/char.def");
+    const UNK_DEF: &str = include_str!("../../../fixtures/vibrato/unk.def");
+    const USER_CSV: &str = include_str!("../../../fixtures/vibrato/user.csv");
+
+    fn fixture_dictionary() -> Dictionary {
+        SystemDictionaryBuilder::from_readers(
+            LEX_CSV.as_bytes(),
+            MATRIX_DEF.as_bytes(),
+            CHAR_DEF.as_bytes(),
+            UNK_DEF.as_bytes(),
+        )
+        .expect("fixture dictionary builds")
+    }
+
+    fn entry(surface: &str) -> Entry {
+        Entry {
+            surface: surface.to_owned(),
+            left_id: 0,
+            right_id: 0,
+            word_cost: 0,
+            feature: String::new(),
+        }
+    }
+
+    fn brute_force_matches(entries: &[Entry], input: &[u8]) -> Vec<u32> {
+        (0..entries.len() as u32)
+            .filter(|&id| {
+                let surface = entries[id as usize].surface.as_bytes();
+                !surface.is_empty() && input.starts_with(surface)
+            })
+            .collect()
+    }
+
+    fn assert_index_matches_brute_force(entries: &[Entry], inputs: &[&str]) {
+        let index = PrefixIndex::build(entries);
+        for input in inputs {
+            for (begin, _) in input.char_indices() {
+                let rest = &input.as_bytes()[begin..];
+                let mut found = Vec::new();
+                index.common_prefix_word_ids(rest, &mut found);
+                found.sort_unstable();
+                assert_eq!(
+                    found,
+                    brute_force_matches(entries, rest),
+                    "{:?}",
+                    &input[begin..]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_index_matches_linear_scan() {
+        let entries: Vec<_> = [
+            "東",
+            "東京",
+            "東京都",
+            "東京",
+            "",
+            "京都",
+            "都",
+            "a",
+            "ab",
+            "abc",
+            "abd",
+            "b",
+            "東京",
+            "ab",
+            "\u{7f}",
+            "\u{80}",
+            "🍛",
+            "🍛カレー",
+            "カ",
+            "カレー",
+            "カレーライス",
+        ]
+        .into_iter()
+        .map(entry)
+        .collect();
+        assert_index_matches_brute_force(
+            &entries,
+            &[
+                "東京都に行く",
+                "abcabdab",
+                "🍛カレーライス\u{7f}\u{80}",
+                "カレカレー",
+                "",
+                "x",
+            ],
+        );
+        assert_index_matches_brute_force(&[], &["東京"]);
+
+        let fixture = parse_mecab_entries(LEX_CSV.as_bytes(), "lex.csv").unwrap();
+        assert_index_matches_brute_force(&fixture, &["京都東京都に行った", "アイウエオ東京"]);
+    }
+
+    #[test]
+    fn session_reuses_dictionary_and_matches_fresh_tokenizer() {
+        let dictionary = fixture_dictionary()
+            .reset_user_lexicon_from_reader(Some(USER_CSV.as_bytes()))
+            .unwrap();
+        let mut session = TokenizerSession::new(dictionary.clone(), false, 24).unwrap();
+        let shared = Arc::clone(&session.tokenizer.dictionary);
+        let inputs = [
+            "京都東京都に行った",
+            "  東京 🍛 アイウエオ",
+            "",
+            "京都東京都に行った",
+        ];
+
+        for (ignore_space, max_grouping_len) in [(false, 24), (false, 24), (true, 0), (true, 2)] {
+            session.set_options(ignore_space, max_grouping_len).unwrap();
+            assert!(Arc::ptr_eq(&shared, &session.tokenizer.dictionary));
+            let fresh = Tokenizer::new(dictionary.clone())
+                .ignore_space(ignore_space)
+                .unwrap()
+                .max_grouping_len(max_grouping_len);
+            for input in inputs {
+                let expected = fresh.tokenize(input).unwrap();
+                assert_eq!(session.tokenize(input).unwrap(), expected.as_slice());
+                // Served from the cache for the same input.
+                assert_eq!(session.tokenize(input).unwrap(), expected.as_slice());
+                assert_eq!(
+                    tokens_to_wakati(session.tokenize(input).unwrap()),
+                    expected
+                        .iter()
+                        .map(|token| token.surface.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                assert_eq!(session.tokenize_count(input).unwrap(), expected.len());
+                assert_eq!(session.tokenize(input).unwrap(), expected.as_slice());
+            }
+        }
+
+        session.reset_dictionary(fixture_dictionary()).unwrap();
+        assert!(!Arc::ptr_eq(&shared, &session.tokenizer.dictionary));
+        let fresh = Tokenizer::new(fixture_dictionary())
+            .ignore_space(true)
+            .unwrap()
+            .max_grouping_len(2);
+        let input = "京都東京都に行った";
+        assert_eq!(
+            session.tokenize(input).unwrap(),
+            fresh.tokenize(input).unwrap().as_slice()
+        );
+    }
+
+    #[test]
+    fn session_keeps_previous_options_when_reconfiguration_fails() {
+        let dictionary = Dictionary::parse("matrix\t1\t1\n0\nentry\t本\t0\t0\t1\tNOUN\n").unwrap();
+        let mut session = TokenizerSession::new(dictionary, false, 0).unwrap();
+        let before = session.tokenize("本本").unwrap().to_vec();
+        assert!(session.set_options(true, 0).is_err());
+        assert!(!session.ignore_space);
+        assert!(session.set_options(true, 0).is_err());
+        assert_eq!(session.tokenize("本本").unwrap(), before.as_slice());
     }
 }
