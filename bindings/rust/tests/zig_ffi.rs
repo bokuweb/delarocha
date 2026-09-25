@@ -150,6 +150,54 @@ fn zig_ffi_mmap_binary_dictionary_keeps_compact_features() {
 }
 
 #[test]
+fn zig_ffi_mmap_count_only_compact_dictionary_and_truncated_files() {
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let lex_path = temp_dir.path().join("lex.csv");
+    let binary_path = temp_dir.path().join("compact.dic");
+    let mut lexicon = String::new();
+    for index in 0..40 {
+        lexicon.push_str(&format!("語{index},0,0,10,feature-{index}\n"));
+    }
+    std::fs::write(&lex_path, lexicon).expect("write large enough lexicon");
+    ZigTokenizer::write_binary_from_raw_paths(
+        &lex_path,
+        fixture_dir.join("matrix.def"),
+        fixture_dir.join("char.def"),
+        fixture_dir.join("unk.def"),
+        &binary_path,
+    )
+    .expect("Zig writes compact binary dictionary");
+
+    let full = ZigTokenizer::from_binary_path(&binary_path).expect("Zig mmaps full binary");
+    let count_only =
+        ZigTokenizer::count_only_from_binary_path(&binary_path).expect("Zig mmaps count-only");
+    let mut full_worker = full.create_worker().expect("full worker is created");
+    let mut count_worker = count_only.create_worker().expect("count worker is created");
+    for sentence in ["語1語22語39", "語3X🍛語0", ""] {
+        assert_eq!(
+            count_worker.tokenize_count(sentence).unwrap(),
+            full_worker.tokenize_count(sentence).unwrap()
+        );
+    }
+    drop(count_worker);
+    drop(count_only);
+    let tokens = full_worker
+        .tokenize("語39")
+        .expect("full tokenize succeeds");
+    assert_eq!(tokens[0].feature, "feature-39");
+
+    let bytes = std::fs::read(&binary_path).expect("read binary");
+    for len in [0, 8, bytes.len() / 2, bytes.len() - 1] {
+        let truncated = temp_dir.path().join(format!("truncated-{len}.dic"));
+        std::fs::write(&truncated, &bytes[..len]).expect("write truncated binary");
+        assert!(ZigTokenizer::from_binary_path(&truncated).is_err());
+        assert!(ZigTokenizer::count_only_from_binary_path(&truncated).is_err());
+        assert!(ZigTokenizer::from_binary_bytes(&bytes[..len]).is_err());
+    }
+}
+
+#[test]
 fn zig_ffi_count_only_matches_full_count() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
     let temp_dir = tempfile::tempdir().expect("create temp dir");
