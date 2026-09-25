@@ -90,6 +90,18 @@ fn bench_zig_ffi(c: &mut Criterion) {
         });
     });
 
+    let mut tokens = Vec::new();
+    c.bench_function("delarocha/zig-ffi-tokenize-into", |b| {
+        b.iter(|| {
+            for sentence in SENTENCES {
+                worker
+                    .tokenize_into(black_box(sentence), &mut tokens)
+                    .unwrap();
+                black_box(&tokens);
+            }
+        });
+    });
+
     c.bench_function("delarocha/zig-ffi-tokenize-views", |b| {
         b.iter(|| {
             for sentence in SENTENCES {
