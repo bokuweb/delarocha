@@ -2,9 +2,23 @@
 name = "delarocha"
 version = "0.1.0"
 edition.workspace = true
+rust-version = "1.88"
 license.workspace = true
 repository.workspace = true
+description = "Japanese morphological analyzer (MeCab/Vibrato-compatible tokenizer) in Rust with an optional Zig core"
+readme = "../../README.md"
+homepage = "https://github.com/bokuweb/delarocha"
+documentation = "https://docs.rs/delarocha"
+keywords = ["japanese", "tokenizer", "morphological", "mecab", "nlp"]
+categories = ["text-processing", "parser-implementations"]
 build = "build.rs"
+include = [
+    "/src/**/*.rs",
+    "/build.rs",
+    "/prebuilt/**",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -31,3 +45,6 @@ tempfile = "3"
 [[bench]]
 name = "tokenize"
 harness = false
+
+[package.metadata.docs.rs]
+features = ["vibrato-system"]

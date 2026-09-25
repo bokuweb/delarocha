@@ -10,6 +10,16 @@
 - C ABI for Rust bindings
 - `cargo bench` harness for comparison with Vibrato
 
+## Installation
+
+```bash
+cargo add delarocha
+```
+
+Optional features: `vibrato-system` (load precompiled Vibrato `system.dic` /
+`system.dic.zst`), `zig-ffi` (link the Zig tokenizer core; see
+[Rust Binding To Zig C ABI](#rust-binding-to-zig-c-abi)), and `wasm`.
+
 ## Dictionary Fixture
 
 The Zig C ABI still accepts a deliberately small TSV fixture format:
@@ -265,3 +275,8 @@ ZIG_RAW_DIC_DIR=/path/to/raw-ipadic \
 VIBRATO_SYSTEM_DIC=/path/to/system.dic.zst \
   cargo run -p delarocha --release --features 'zig-ffi vibrato-bench' --example memory -- vibrato-system
 ```
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
