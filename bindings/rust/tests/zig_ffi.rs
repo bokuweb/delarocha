@@ -273,6 +273,53 @@ fn zig_ffi_seeded_fuzz_count_only_matches_full_tokenization() {
     }
 }
 
+#[test]
+fn pure_rust_matches_zig_ffi_on_fuzz_and_long_inputs() {
+    // Uses the MeCab-style minimal fixture. On fixtures/vibrato the two
+    // implementations already disagree (the " " lexicon surface and some
+    // unknown-word grouping), independent of the pure-Rust dictionary lookup.
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let open = |name: &str| std::fs::File::open(fixture_dir.join(name)).expect("fixture exists");
+    let pure = delarocha::Tokenizer::new(
+        delarocha::SystemDictionaryBuilder::from_readers(
+            open("lex.csv"),
+            open("matrix.def"),
+            open("char.def"),
+            open("unk.def"),
+        )
+        .expect("pure dictionary builds"),
+    );
+    let zig = ZigTokenizer::from_raw_paths(
+        fixture_dir.join("lex.csv"),
+        fixture_dir.join("matrix.def"),
+        fixture_dir.join("char.def"),
+        fixture_dir.join("unk.def"),
+    )
+    .expect("Zig tokenizer loads raw fixture");
+    let mut pure_worker = pure.create_worker();
+    let mut zig_worker = zig.create_worker().expect("Zig worker is created");
+
+    let long = "本とカレー 本X🍛カレー 東京に行く。abc 123\n".repeat(4096);
+    let inputs = (0..fuzz_seed_count())
+        .map(|seed| fuzz_string(seed, fuzz_max_len()))
+        .chain([long]);
+    for input in inputs {
+        let expected = zig_worker.tokenize(&input).expect("Zig tokenize succeeds");
+        let actual = pure_worker
+            .tokenize(&input)
+            .expect("pure tokenize succeeds");
+        let context = input.get(..input.len().min(120));
+        assert_eq!(actual.len(), expected.len(), "token count for {context:?}");
+        for (a, e) in actual.iter().zip(&expected) {
+            assert_eq!(a.surface, e.surface, "{context:?}");
+            assert_eq!(a.byte_range(), e.byte_range(), "{context:?}");
+            assert_eq!(a.range_char(), e.range_char(), "{context:?}");
+            assert_eq!(a.is_unknown(), e.is_unknown(), "{context:?}");
+            assert_eq!(a.feature, e.feature, "{context:?}");
+        }
+    }
+}
+
 fn fuzz_seed_count() -> u64 {
     std::env::var("DELAROCHA_FUZZ_SEEDS")
         .ok()
