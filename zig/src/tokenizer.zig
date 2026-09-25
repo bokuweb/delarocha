@@ -326,16 +326,14 @@ pub const Worker = struct {
     }
 
     inline fn findTrieEdge(self: *Worker, node_index: usize, byte: u8) ?usize {
-        if (self.dictionary.trie_base.len != 0 and self.dictionary.trie_nodes[node_index].edge_len >= 3) {
-            return dict_mod.findDoubleArray(
-                self.dictionary.trie_base,
-                self.dictionary.trie_check,
-                self.dictionary.trie_child,
-                node_index,
-                byte,
-            );
-        }
-        return dict_mod.findEdge(self.dictionary.trie_nodes, self.dictionary.trie_edges, node_index, byte);
+        return dict_mod.findTrieChild(
+            self.dictionary.trie_nodes,
+            self.dictionary.trie_edges,
+            self.dictionary.trie_check,
+            self.dictionary.trie_child,
+            node_index,
+            byte,
+        );
     }
 
     fn appendIndexedEntries(self: *Worker, input: []const u8, begin: usize, emitted: *bool) !void {
@@ -412,9 +410,8 @@ pub const Worker = struct {
         // Count-only trie nodes store a compact term stream. Iterating it here
         // avoids rebuilding slice values at every trie depth and keeps the
         // candidate append path shared across root, pair, triple, and edge hits.
-        const node = self.dictionary.trie_nodes[node_index];
-        var index: usize = @intCast(node.count_word_start);
-        const stop = index + @as(usize, @intCast(node.count_word_len));
+        var index: usize = self.dictionary.trie_nodes[node_index].count_word_start;
+        const stop: usize = self.dictionary.trie_nodes[node_index + 1].count_word_start;
         while (index < stop) : (index += 1) {
             const term = self.dictionary.trie_count_terms[index];
             self.appendBestCountNode(begin, end, term.left_id, term.right_id, term.word_cost);
