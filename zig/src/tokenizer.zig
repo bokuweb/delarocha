@@ -730,19 +730,23 @@ pub const Worker = struct {
     }
 
     fn findBestPrev(self: *Worker, begin: usize, candidate: Candidate) !BestPath {
-        var best_index: u32 = invalid_node;
-        var best_cost: i32 = std.math.maxInt(i32);
-        var prev_index = self.end_heads.items[begin];
-        while (prev_index != invalid_node) : (prev_index = self.nodes.items[prev_index].next_end) {
-            const prev = self.nodes.items[prev_index];
-            const cost = prev.min_cost + self.dictionary.matrix.trustedCost(prev.right_id, candidate.left_id) + candidate.word_cost;
-            if (best_index == invalid_node or cost < best_cost) {
+        const first_index = self.end_heads.items[begin];
+        if (first_index == invalid_node) return error.NoPath;
+        const row_start = @as(usize, candidate.left_id) * self.dictionary.matrix.right_size;
+        const matrix_row = self.dictionary.matrix.costs[row_start .. row_start + self.dictionary.matrix.right_size];
+        const nodes = self.nodes.items;
+        var best_index = first_index;
+        var best_cost: i32 = nodes[first_index].min_cost + @as(i32, matrix_row[nodes[first_index].right_id]);
+        var prev_index = nodes[first_index].next_end;
+        while (prev_index != invalid_node) : (prev_index = nodes[prev_index].next_end) {
+            const prev = nodes[prev_index];
+            const cost = prev.min_cost + @as(i32, matrix_row[prev.right_id]);
+            if (cost < best_cost) {
                 best_index = prev_index;
                 best_cost = cost;
             }
         }
-        if (best_index == invalid_node) return error.NoPath;
-        return .{ .index = best_index, .cost = best_cost };
+        return .{ .index = best_index, .cost = best_cost + candidate.word_cost };
     }
 
     inline fn findBestCountPrev(self: *Worker, begin: usize, left_id: u16, word_cost: i32) BestPath {
@@ -750,29 +754,22 @@ pub const Worker = struct {
         if (first_index == invalid_count_node) unreachable;
         const row_start = @as(usize, left_id) * self.dictionary.matrix.right_size;
         const matrix_row = self.dictionary.matrix.costs[row_start .. row_start + self.dictionary.matrix.right_size];
-        const first = self.count_nodes.items[first_index];
-        if (first.next_end == invalid_count_node) {
-            // Most positions in short Japanese input have a single best
-            // predecessor after count-term deduplication. Returning here avoids
-            // a linked-list walk on the hottest count-only transition path.
-            return .{
-                .index = first_index,
-                .cost = first.min_cost + @as(i32, matrix_row[first.right_id]) + word_cost,
-            };
-        }
-
-        var best_index: u32 = invalid_count_node;
-        var best_cost: i32 = std.math.maxInt(i32);
-        var prev_index = first_index;
-        while (prev_index != invalid_count_node) : (prev_index = self.count_nodes.items[prev_index].next_end) {
-            const prev = self.count_nodes.items[prev_index];
-            const cost = prev.min_cost + @as(i32, matrix_row[prev.right_id]) + word_cost;
-            if (best_index == invalid_count_node or cost <= best_cost) {
+        const nodes = self.count_nodes.items;
+        // The first predecessor seeds the scan; for the common single-
+        // predecessor position the loop below does not run at all.
+        var best_index = first_index;
+        var best_cost: i32 = nodes[first_index].min_cost + @as(i32, matrix_row[nodes[first_index].right_id]);
+        var prev_index = nodes[first_index].next_end;
+        while (prev_index != invalid_count_node) : (prev_index = nodes[prev_index].next_end) {
+            const prev = nodes[prev_index];
+            const cost = prev.min_cost + @as(i32, matrix_row[prev.right_id]);
+            // Ties keep the later list entry.
+            if (cost <= best_cost) {
                 best_index = prev_index;
                 best_cost = cost;
             }
         }
-        return .{ .index = best_index, .cost = best_cost };
+        return .{ .index = best_index, .cost = best_cost + word_cost };
     }
 
     fn bestEndNode(self: *Worker, end: usize) !u32 {
