@@ -15,7 +15,7 @@ const TRIALS: usize = 10;
 #[cfg(feature = "zig-ffi")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse()?;
-    let tokenizer = if args.full {
+    let tokenizer = if args.mode != Mode::Count {
         TokenizerMode::Full(delarocha::ffi::ZigTokenizer::from_binary_path(&args.dic)?)
     } else {
         TokenizerMode::CountOnly(delarocha::ffi::ZigTokenizer::count_only_from_binary_path(
@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..args.runs {
             timer.start();
             for line in &lines {
-                n_words = n_words.wrapping_add(worker.benchmark_tokenize_count(line, args.full));
+                n_words = n_words.wrapping_add(worker.benchmark_tokenize_count(line, args.mode));
             }
             timer.stop();
         }
@@ -73,7 +73,7 @@ fn main() {
 #[cfg(feature = "zig-ffi")]
 struct Args {
     dic: PathBuf,
-    full: bool,
+    mode: Mode,
     runs: usize,
     trials: usize,
 }
@@ -83,6 +83,7 @@ impl Args {
     fn parse() -> Result<Self, Box<dyn std::error::Error>> {
         let mut dic = None;
         let mut full = false;
+        let mut owned = false;
         let mut runs = RUNS;
         let mut trials = TRIALS;
         let mut args = std::env::args_os().skip(1);
@@ -92,6 +93,7 @@ impl Args {
                     dic = args.next().map(PathBuf::from);
                 }
                 "--full" => full = true,
+                "--owned" => owned = true,
                 "--runs" => {
                     runs = args
                         .next()
@@ -114,6 +116,9 @@ impl Args {
             }
         }
 
+        if owned && !full {
+            return Err("--owned requires --full".into());
+        }
         if runs < 3 {
             return Err("--runs must be at least 3 because min/max runs are discarded".into());
         }
@@ -123,7 +128,11 @@ impl Args {
 
         Ok(Self {
             dic: dic.ok_or("set -i/--dic to a delarocha binary dictionary")?,
-            full,
+            mode: match (full, owned) {
+                (false, _) => Mode::Count,
+                (true, false) => Mode::Borrowed,
+                (true, true) => Mode::Owned,
+            },
             runs,
             trials,
         })
@@ -133,10 +142,22 @@ impl Args {
 #[cfg(feature = "zig-ffi")]
 fn print_help() {
     println!(
-        "Usage: vibrato_style_benchmark -i <delarocha.dic> [--full] [--runs N] [--trials N]\n\n\
+        "Usage: vibrato_style_benchmark -i <delarocha.dic> [--full [--owned]] [--runs N] [--trials N]\n\n\
          Reads newline-separated sentences from stdin and prints the same summary fields as \
-         daac-tools/vibrato's benchmark runner. Defaults match Vibrato: RUNS=10, TRIALS=10."
+         daac-tools/vibrato's benchmark runner. Defaults match Vibrato: RUNS=10, TRIALS=10.\n\n\
+         Without --full, only token counts are computed (count-only dictionary).\n\
+         --full materializes zero-copy token views (surface/feature borrowed, byte and char \
+         ranges), matching Vibrato's worker whose tokens borrow the sentence and dictionary.\n\
+         --full --owned additionally copies every token into an owned Vec<Token>."
     );
+}
+
+#[cfg(feature = "zig-ffi")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Count,
+    Borrowed,
+    Owned,
 }
 
 #[cfg(feature = "zig-ffi")]
@@ -156,18 +177,23 @@ impl TokenizerMode {
 
 #[cfg(feature = "zig-ffi")]
 trait BenchmarkWorker {
-    fn benchmark_tokenize_count(&mut self, input: &str, full: bool) -> usize;
+    fn benchmark_tokenize_count(&mut self, input: &str, mode: Mode) -> usize;
 }
 
 #[cfg(feature = "zig-ffi")]
 impl BenchmarkWorker for delarocha::ffi::ZigWorker<'_> {
-    fn benchmark_tokenize_count(&mut self, input: &str, full: bool) -> usize {
-        if full {
-            self.tokenize(black_box(input))
+    fn benchmark_tokenize_count(&mut self, input: &str, mode: Mode) -> usize {
+        match mode {
+            Mode::Count => self.tokenize_count_assume_valid(black_box(input)),
+            Mode::Borrowed => black_box(
+                self.tokenize_borrowed_views(black_box(input))
+                    .expect("full tokenization succeeds"),
+            )
+            .len(),
+            Mode::Owned => self
+                .tokenize(black_box(input))
                 .expect("full tokenization succeeds")
-                .len()
-        } else {
-            self.tokenize_count_assume_valid(black_box(input))
+                .len(),
         }
     }
 }

@@ -97,8 +97,15 @@ pub const Tokenizer = struct {
         };
     }
 
+    /// Memory-maps the dictionary file where supported (see
+    /// `Dictionary.fromBinaryFile`); the mapping lives until `deinit`.
     pub fn initBinaryFile(allocator: Allocator, dict_path: []const u8) !Tokenizer {
         return .{ .allocator = allocator, .dictionary = try dict_mod.Dictionary.fromBinaryFile(allocator, dict_path) };
+    }
+
+    /// Reads and copies the dictionary file; nothing refers to it afterwards.
+    pub fn initBinaryFileCopy(allocator: Allocator, dict_path: []const u8) !Tokenizer {
+        return .{ .allocator = allocator, .dictionary = try dict_mod.Dictionary.fromBinaryFileCopy(allocator, dict_path) };
     }
 
     pub fn deinit(self: *Tokenizer) void {

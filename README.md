@@ -181,11 +181,32 @@ sources, so those environments still need Zig installed.
 cargo test -p delarocha --features zig-ffi
 ```
 
+Binary dictionaries loaded from a path (`ZigTokenizer::from_binary_path`,
+`ZigTokenizer::count_only_from_binary_path`, and Zig's
+`Tokenizer.initBinaryFile` / `Dictionary.fromBinaryFile`) are memory-mapped
+read-only and borrowed for the tokenizer's lifetime: features, the connection
+matrix, and all trie tables are used in place instead of being copied. Do not
+truncate or rewrite such a file in place while a tokenizer uses it (write a new
+file and rename it instead). `ZigTokenizer::from_binary_bytes` and Zig's
+`Dictionary.fromBinaryFileCopy` keep a private copy when that cannot be
+guaranteed.
+
 For output-sensitive callers, `ZigWorker::tokenize_borrowed_views` returns a
 `ZigTokenViews` collection backed by the worker's reusable metadata buffers.
 Iterating it avoids both owned surface/feature strings and the per-call
 `Vec<ZigTokenView>` allocation. The collection and its token views remain valid
-until the worker is mutably used again.
+until the worker is mutably used again. Each `ZigTokenView` carries the borrowed
+surface and feature plus byte and character ranges (`range_byte`,
+`range_char`), and `to_token()` reproduces the owned `ZigWorker::tokenize`
+output exactly.
+
+Callers that need owned tokens can pass a reusable vector to
+`ZigWorker::tokenize_into`; existing `Token` string buffers are overwritten in
+place, so a sentence loop stops allocating once the buffers warm up.
+`tokenize_spans_into` does the same for span-only output.
+
+Feature strings are checked for UTF-8 once per dictionary word id per worker
+and memoized, rather than on every emitted token.
 
 ## Benchmarks
 
@@ -232,6 +253,12 @@ Use `--full` to benchmark full token materialization instead of the count-only
 path. The default count-only mode matches Vibrato's benchmark loop shape by
 tokenizing each sentence and accumulating token counts without formatting
 token output.
+
+`--full` materializes zero-copy token views (`tokenize_borrowed_views`: borrowed
+surface and feature, byte and character ranges). This is the like-for-like
+comparison with Vibrato, whose worker tokens also borrow the sentence and the
+dictionary instead of allocating strings. Add `--owned` (`--full --owned`) to
+measure the owned `Vec<Token>` API, which allocates two strings per token.
 
 ### Yokohama Ordinance Text Benchmark
 

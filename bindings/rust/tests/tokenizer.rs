@@ -222,3 +222,56 @@ fn max_grouping_len_limits_unknown_grouping() {
         ["ABC"]
     );
 }
+
+#[test]
+fn long_input_keeps_byte_and_char_offsets_consistent() {
+    let fixture_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/vibrato");
+    let open = |name: &str| std::fs::File::open(fixture_dir.join(name)).expect("fixture exists");
+    let dictionary = SystemDictionaryBuilder::from_readers(
+        open("lex.csv"),
+        open("matrix.def"),
+        open("char.def"),
+        open("unk.def"),
+    )
+    .expect("fixture dictionary builds");
+    let tokenizer = Tokenizer::new(dictionary);
+
+    let unit = "京都東京都に行った。 アイウエオ本とカレー🍛 abc 123\n";
+    let input = unit.repeat(4096);
+    assert!(input.len() > 256 * 1024);
+
+    let mut worker = tokenizer.create_worker();
+    let tokens = worker.tokenize(&input).expect("tokenize succeeds").to_vec();
+    assert_eq!(worker.tokenize_count(&input).unwrap(), tokens.len());
+
+    let unit_tokens = tokenizer.tokenize(unit).expect("tokenize succeeds");
+    let unit_chars = unit.chars().count();
+    let mut byte = 0;
+    let mut chars = 0;
+    for (i, token) in tokens.iter().enumerate() {
+        assert_eq!(
+            token.start, byte,
+            "token {i} starts where the previous ended"
+        );
+        assert_eq!(token.start_char, chars, "token {i} char start");
+        assert_eq!(&input[token.byte_range()], token.surface);
+        chars += token.surface.chars().count();
+        byte = token.end;
+        assert_eq!(token.end_char, chars, "token {i} char end");
+
+        // Every unit ends with a newline, so the long input is the unit's
+        // tokenization repeated with shifted offsets.
+        let unit_token = &unit_tokens[i % unit_tokens.len()];
+        let repeat = i / unit_tokens.len();
+        assert_eq!(token.surface, unit_token.surface);
+        assert_eq!(token.word_id, unit_token.word_id);
+        assert_eq!(token.start, unit_token.start + repeat * unit.len());
+        assert_eq!(
+            token.start_char,
+            unit_token.start_char + repeat * unit_chars
+        );
+    }
+    assert_eq!(byte, input.len());
+    assert_eq!(chars, input.chars().count());
+}
