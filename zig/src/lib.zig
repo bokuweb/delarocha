@@ -154,3 +154,7 @@ test "roundtrips binary dictionary" {
     try std.testing.expectEqual(@as(usize, 6), tokens[1].end);
     try std.testing.expect(tokens[1].isUnknown());
 }
+
+test {
+    _ = dictionary;
+}
