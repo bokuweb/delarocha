@@ -1801,8 +1801,9 @@ pub mod ffi {
             bytes_ptr: *const u8,
             bytes_len: usize,
         ) -> *mut RawTokenizer;
-        fn delarocha_tokenizer_new_binary_count_only(
-            path: *const std::ffi::c_char,
+        fn delarocha_tokenizer_new_binary_borrowed_bytes_count_only(
+            bytes_ptr: *const u8,
+            bytes_len: usize,
         ) -> *mut RawTokenizer;
         fn delarocha_dictionary_write_binary(
             lex_path: *const std::ffi::c_char,
@@ -1853,6 +1854,11 @@ pub mod ffi {
 
     pub struct ZigTokenizer {
         raw: NonNull<RawTokenizer>,
+        // Backing storage for tokenizers created from a mapped binary file.
+        // The native dictionary borrows slices from it, so it must outlive
+        // `raw`: `Drop` frees `raw` first and only then are fields dropped.
+        // Workers and token views borrow `&ZigTokenizer`, so they cannot
+        // outlive the mapping either.
         _mmap: Option<memmap2::Mmap>,
     }
 
@@ -2023,19 +2029,15 @@ pub mod ffi {
             Ok(Self { raw, _mmap: None })
         }
 
+        /// Memory-maps a binary dictionary and borrows it for the tokenizer's
+        /// lifetime (features, matrix, and trie tables are not copied).
+        ///
+        /// The file must not be truncated or modified in place while the
+        /// tokenizer is alive; replace dictionaries by writing a new file and
+        /// renaming it over the old path. Use [`Self::from_binary_bytes`] to
+        /// load a private copy instead.
         pub fn from_binary_path(path: impl AsRef<Path>) -> Result<Self> {
-            let file = File::open(path)?;
-            // Keep the mmap alive for the tokenizer lifetime. The Zig loader
-            // borrows feature/surface slices from these bytes and only copies
-            // the hot lookup tables needed during Viterbi search.
-            let mmap = unsafe { memmap2::Mmap::map(&file)? };
-            let raw =
-                unsafe { delarocha_tokenizer_new_binary_borrowed_bytes(mmap.as_ptr(), mmap.len()) };
-            let raw = NonNull::new(raw).ok_or_else(last_error)?;
-            Ok(Self {
-                raw,
-                _mmap: Some(mmap),
-            })
+            Self::from_mapped_binary_path(path, delarocha_tokenizer_new_binary_borrowed_bytes)
         }
 
         pub fn from_binary_bytes(bytes: &[u8]) -> Result<Self> {
@@ -2046,11 +2048,33 @@ pub mod ffi {
             Ok(Self { raw, _mmap: None })
         }
 
+        /// Count-only variant of [`Self::from_binary_path`] with the same
+        /// mapping requirements. Full-token data is dropped after loading, and
+        /// count tokenization never touches the mapped feature bytes.
         pub fn count_only_from_binary_path(path: impl AsRef<Path>) -> Result<Self> {
-            let path = CString::new(path.as_ref().as_os_str().to_string_lossy().as_bytes())?;
-            let raw = unsafe { delarocha_tokenizer_new_binary_count_only(path.as_ptr()) };
+            Self::from_mapped_binary_path(
+                path,
+                delarocha_tokenizer_new_binary_borrowed_bytes_count_only,
+            )
+        }
+
+        fn from_mapped_binary_path(
+            path: impl AsRef<Path>,
+            load: unsafe extern "C" fn(*const u8, usize) -> *mut RawTokenizer,
+        ) -> Result<Self> {
+            let file = File::open(path)?;
+            // SAFETY: the mapping is read-only and moved into the returned
+            // tokenizer, which frees the native tokenizer (the only holder of
+            // pointers into it) before dropping the mapping. Truncation of the
+            // file by another process is outside Rust's control; see the
+            // public constructors' docs.
+            let mmap = unsafe { memmap2::Mmap::map(&file)? };
+            let raw = unsafe { load(mmap.as_ptr(), mmap.len()) };
             let raw = NonNull::new(raw).ok_or_else(last_error)?;
-            Ok(Self { raw, _mmap: None })
+            Ok(Self {
+                raw,
+                _mmap: Some(mmap),
+            })
         }
 
         pub fn write_binary_from_raw_paths(

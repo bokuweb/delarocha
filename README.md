@@ -171,6 +171,16 @@ sources, so those environments still need Zig installed.
 cargo test -p delarocha --features zig-ffi
 ```
 
+Binary dictionaries loaded from a path (`ZigTokenizer::from_binary_path`,
+`ZigTokenizer::count_only_from_binary_path`, and Zig's
+`Tokenizer.initBinaryFile` / `Dictionary.fromBinaryFile`) are memory-mapped
+read-only and borrowed for the tokenizer's lifetime: features, the connection
+matrix, and all trie tables are used in place instead of being copied. Do not
+truncate or rewrite such a file in place while a tokenizer uses it (write a new
+file and rename it instead). `ZigTokenizer::from_binary_bytes` and Zig's
+`Dictionary.fromBinaryFileCopy` keep a private copy when that cannot be
+guaranteed.
+
 For output-sensitive callers, `ZigWorker::tokenize_borrowed_views` returns a
 `ZigTokenViews` collection backed by the worker's reusable metadata buffers.
 Iterating it avoids both owned surface/feature strings and the per-call
