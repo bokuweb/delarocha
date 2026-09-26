@@ -34,6 +34,12 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Check Darwin prebuilt archive alignment
+        shell: bash
+        run: |
+          py="$(command -v python3 || command -v python)"
+          "$py" scripts/check_ar_alignment.py
+
       - name: Rust tests
         run: cargo test --workspace --all-targets
 

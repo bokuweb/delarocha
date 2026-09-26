@@ -181,6 +181,11 @@ sources, so those environments still need Zig installed.
 cargo test -p delarocha --features zig-ffi
 ```
 
+To regenerate the checked-in libraries after changing the Zig sources, run
+`scripts/build_prebuilt.sh` (on macOS, so the Darwin archives can be repacked
+with 8-byte aligned members); see
+[bindings/rust/prebuilt/README.md](https://github.com/bokuweb/delarocha/blob/main/bindings/rust/prebuilt/README.md).
+
 Binary dictionaries loaded from a path (`ZigTokenizer::from_binary_path`,
 `ZigTokenizer::count_only_from_binary_path`, and Zig's
 `Tokenizer.initBinaryFile` / `Dictionary.fromBinaryFile`) are memory-mapped
