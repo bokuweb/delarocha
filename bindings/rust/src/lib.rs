@@ -2057,10 +2057,13 @@ pub mod ffi {
     /// `str::from_utf8` on every emitted token (about 11% of the full FFI
     /// tokenize profile), each distinct word id is validated the first time it
     /// appears and remembered in a bitset. Dictionary data is immutable for the
-    /// tokenizer lifetime, and the Zig side derives the feature slice solely
-    /// from the word id, so a validated word id stays valid for every later
-    /// token. Validating lazily keeps mmap-backed dictionaries from paging in
-    /// the whole feature blob at load time.
+    /// tokenizer lifetime, and the Zig side derives the feature bytes from the
+    /// word id alone; compact features also copy the token surface, but the
+    /// decoder only copies whole UTF-8 sequences of the (valid UTF-8) input,
+    /// so whether a decoded feature is valid still depends on the word id
+    /// only. A validated word id therefore stays valid for every later token.
+    /// Validating lazily keeps mmap-backed dictionaries from paging in the
+    /// whole feature blob at load time.
     #[derive(Default)]
     struct FeatureUtf8Cache {
         known: Vec<u64>,
@@ -2140,7 +2143,8 @@ pub mod ffi {
     }
 
     /// Zero-copy token: `surface` borrows the tokenized input and `feature`
-    /// borrows dictionary storage, so producing one allocates nothing.
+    /// borrows dictionary storage (or, for dictionaries with compact features,
+    /// the worker's decoded-feature cache), so producing one allocates nothing.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct ZigTokenView<'a> {
         pub surface: &'a str,
@@ -2530,8 +2534,10 @@ pub mod ffi {
         }
 
         /// Runs Zig tokenization and copies token metadata into the worker's
-        /// reusable buffers. Returns the number of tokens copied.
-        fn copy_metadata(&mut self, input: &str) -> Result<usize> {
+        /// reusable buffers. Returns the number of tokens copied. Without
+        /// `with_features` only spans and word ids are copied, and the Zig side
+        /// skips feature lookup and decoding.
+        fn copy_metadata(&mut self, input: &str, with_features: bool) -> Result<usize> {
             let status =
                 unsafe { delarocha_tokenize_bytes(self.raw.as_ptr(), input.as_ptr(), input.len()) };
             if status != 0 {
@@ -2542,16 +2548,24 @@ pub mod ffi {
             self.span_starts.resize(count, 0);
             self.span_ends.resize(count, 0);
             self.span_word_ids.resize(count, 0);
-            self.feature_ptrs.resize(count, std::ptr::null());
-            self.feature_lens.resize(count, 0);
+            let (feature_ptrs, feature_lens) = if with_features {
+                self.feature_ptrs.resize(count, std::ptr::null());
+                self.feature_lens.resize(count, 0);
+                (
+                    self.feature_ptrs.as_mut_ptr(),
+                    self.feature_lens.as_mut_ptr(),
+                )
+            } else {
+                (std::ptr::null_mut(), std::ptr::null_mut())
+            };
             let copied = unsafe {
                 delarocha_tokens_copy_metadata(
                     self.raw.as_ptr(),
                     self.span_starts.as_mut_ptr(),
                     self.span_ends.as_mut_ptr(),
                     self.span_word_ids.as_mut_ptr(),
-                    self.feature_ptrs.as_mut_ptr(),
-                    self.feature_lens.as_mut_ptr(),
+                    feature_ptrs,
+                    feature_lens,
                     count,
                 )
             };
@@ -2572,7 +2586,7 @@ pub mod ffi {
         ///
         /// Character offsets are computed in the same forward pass.
         fn load_tokens(&mut self, input: &str) -> Result<usize> {
-            let copied = self.copy_metadata(input)?;
+            let copied = self.copy_metadata(input, true)?;
             self.span_start_chars.resize(copied, 0);
             self.span_end_chars.resize(copied, 0);
 
@@ -2719,7 +2733,7 @@ pub mod ffi {
         }
 
         /// Zero-copy tokenization: returns views whose surfaces borrow `input`
-        /// and whose features borrow dictionary storage. The views live in the
+        /// and whose features borrow dictionary (or worker) storage. The views live in the
         /// worker's reusable buffers, so steady-state calls allocate nothing.
         /// [`ZigTokenView::to_token`] reproduces [`Self::tokenize`] exactly.
         pub fn tokenize_borrowed_views<'a>(
@@ -2779,7 +2793,7 @@ pub mod ffi {
             input: &str,
             spans: &mut Vec<ZigTokenSpan>,
         ) -> Result<()> {
-            let copied = self.copy_metadata(input)?;
+            let copied = self.copy_metadata(input, false)?;
             spans.clear();
             spans.reserve(copied);
             spans.extend(
