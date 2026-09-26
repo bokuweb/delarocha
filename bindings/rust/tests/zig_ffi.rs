@@ -478,10 +478,24 @@ fn zig_ffi_compact_features_match_raw_dictionary_on_every_path() {
     let mut raw_worker = raw.create_worker().expect("raw worker");
     for tokenizer in [&mmap, &copied] {
         let mut worker = tokenizer.create_worker().expect("worker");
+        let mut capped = tokenizer.create_worker().expect("worker");
+        capped.set_retained_capacity_limit(Some(512));
         for _ in 0..2 {
             for input in inputs {
                 let expected = raw_worker.tokenize(input).expect("raw tokenize");
                 assert_eq!(worker.tokenize(input).expect("tokenize"), expected);
+                // Trimming the decode cache and input copy keeps features.
+                assert_eq!(capped.tokenize(input).expect("tokenize"), expected);
+                let capped_views: Vec<_> = capped
+                    .tokenize_borrowed_views(input)
+                    .expect("borrowed views")
+                    .iter()
+                    .map(|view| view.to_token())
+                    .collect();
+                assert_eq!(capped_views, expected);
+                let before = worker.retained_bytes();
+                worker.shrink_to(before / 2);
+                assert!(worker.retained_bytes() <= before / 2);
                 let views = worker
                     .tokenize_borrowed_views(input)
                     .expect("borrowed views");
@@ -509,6 +523,77 @@ fn zig_ffi_compact_features_match_raw_dictionary_on_every_path() {
         valid[0].feature,
         "動詞,自立,*,*,五段・ラ行,基本形,ご3る,ゴ3,ゴー3"
     );
+}
+
+#[test]
+fn zig_ffi_worker_shrink_and_retained_limit_keep_results_identical() {
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let tokenizer = ZigTokenizer::from_raw_paths(
+        fixture_dir.join("lex.csv"),
+        fixture_dir.join("matrix.def"),
+        fixture_dir.join("char.def"),
+        fixture_dir.join("unk.def"),
+    )
+    .expect("Zig tokenizer loads raw fixture");
+    let unit = "本とカレー 本\0カレー🍛 abc カレー本と\n";
+    let long = unit.repeat(512);
+    let inputs = [
+        long.as_str(),
+        unit,
+        "",
+        "本とカレー",
+        &long[..unit.len() * 3],
+    ];
+    let limit = 16 * 1024;
+
+    let mut reference = tokenizer.create_worker().expect("Zig worker is created");
+    let mut shrinking = tokenizer.create_worker().expect("Zig worker is created");
+    let mut capped = tokenizer.create_worker().expect("Zig worker is created");
+    capped.set_retained_capacity_limit(Some(limit));
+    let mut reused = Vec::new();
+    for _ in 0..2 {
+        for input in inputs {
+            let expected = reference.tokenize(input).expect("tokenize");
+            let expected_count = reference.tokenize_count(input).expect("count");
+
+            assert_eq!(shrinking.tokenize(input).expect("tokenize"), expected);
+            shrinking
+                .tokenize_into(input, &mut reused)
+                .expect("tokenize_into");
+            assert_eq!(reused, expected);
+            reused.clear();
+            assert_eq!(
+                shrinking.tokenize_count(input).expect("count"),
+                expected_count
+            );
+            assert!(shrinking.retained_bytes() > 0);
+            shrinking.shrink_to(limit);
+            assert!(shrinking.retained_bytes() <= limit);
+            let views: Vec<delarocha::Token> = shrinking
+                .tokenize_views(input)
+                .expect("views")
+                .into_iter()
+                .map(Into::into)
+                .collect();
+            assert_eq!(views, expected);
+            shrinking.shrink_to_fit();
+            assert_eq!(shrinking.retained_bytes(), 0);
+            assert_eq!(
+                shrinking.tokenize_count(input).expect("count"),
+                expected_count
+            );
+            assert_eq!(shrinking.tokenize(input).expect("tokenize"), expected);
+
+            assert_eq!(capped.tokenize(input).expect("tokenize"), expected);
+            assert_eq!(capped.tokenize_count(input).expect("count"), expected_count);
+            let spans = capped.tokenize_spans(input).expect("spans");
+            assert_eq!(spans.len(), expected.len());
+            // Each part stays within the cap, except that the native token
+            // buffer may keep what the last result itself needs.
+            let bound = 2 * limit + expected.len() * 64 + 4096;
+            assert!(capped.retained_bytes() <= bound);
+        }
+    }
 }
 
 #[test]
@@ -684,5 +769,136 @@ impl XorShift64 {
         x ^= x << 17;
         self.0 = x;
         x
+    }
+}
+
+fn write_fixture_binary(dir: &std::path::Path) -> Vec<u8> {
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let binary_path = dir.join("fixture.dic");
+    ZigTokenizer::write_binary_from_raw_paths(
+        fixture_dir.join("lex.csv"),
+        fixture_dir.join("matrix.def"),
+        fixture_dir.join("char.def"),
+        fixture_dir.join("unk.def"),
+        &binary_path,
+    )
+    .expect("Zig writes binary dictionary");
+    std::fs::read(&binary_path).expect("read binary fixture")
+}
+
+// Walks the binary format v4 layout (magic, 21 u32 header fields, then
+// 16-byte aligned sections) up to the unknown-word records.
+fn first_unknown_record_offset(bytes: &[u8]) -> usize {
+    let header = |index: usize| {
+        let at = 8 + 4 * index;
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
+    };
+    let align16 = |offset: usize| offset.next_multiple_of(16);
+    let entry_count = header(0);
+    let feature_offsets = align16(8 + 21 * 4);
+    let feature_blob = align16(feature_offsets + 4 * (entry_count + 1));
+    // Compact-feature prefix table: offsets (header 19), strings (header 20).
+    let prefix_offsets = align16(feature_blob + header(6));
+    let prefix_blob = align16(prefix_offsets + 4 * header(19));
+    let mut cursor = prefix_blob + header(20);
+    // Dictionaries with at most 32 entries also store surfaces and entry ids.
+    if entry_count <= 32 {
+        let surface_offsets = align16(cursor);
+        let surface_blob = align16(surface_offsets + 4 * (entry_count + 1));
+        cursor = align16(surface_blob + header(7)) + 8 * entry_count;
+    }
+    align16(cursor)
+}
+
+// Loads through both the copying byte loader and the mmap-borrowing path
+// loader, which alias the file for the matrix and trie tables.
+fn load_binary_both_ways(dir: &std::path::Path, bytes: &[u8]) -> Vec<delarocha::Error> {
+    let path = dir.join("corrupt.dic");
+    std::fs::write(&path, bytes).expect("write corrupt dictionary");
+    vec![
+        ZigTokenizer::from_binary_bytes(bytes)
+            .err()
+            .expect("byte load must fail"),
+        ZigTokenizer::from_binary_path(&path)
+            .err()
+            .expect("mmap load must fail"),
+        ZigTokenizer::count_only_from_binary_path(&path)
+            .err()
+            .expect("count-only load must fail"),
+    ]
+}
+
+#[test]
+fn zig_ffi_rejects_stale_binary_dictionary_version() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let mut bytes = write_fixture_binary(temp_dir.path());
+    assert_eq!(&bytes[..8], b"DLRDIC04");
+    for magic in [b"DLRDIC02", b"DLRDIC03"] {
+        bytes[..8].copy_from_slice(magic);
+        for err in load_binary_both_ways(temp_dir.path(), &bytes) {
+            assert!(
+                matches!(&err, delarocha::Error::UnsupportedDictionaryVersion(message) if message.contains("rebuild")),
+                "unexpected error: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn zig_ffi_rejects_truncated_binary_dictionary() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let bytes = write_fixture_binary(temp_dir.path());
+    for len in [0, 7, 8, 20, bytes.len() / 2, bytes.len() - 1] {
+        for err in load_binary_both_ways(temp_dir.path(), &bytes[..len]) {
+            assert!(
+                matches!(&err, delarocha::Error::InvalidDictionary(message) if message.contains("InvalidDictionary")),
+                "unexpected error at len {len}: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn zig_ffi_rejects_out_of_range_connection_id() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let mut bytes = write_fixture_binary(temp_dir.path());
+    // The first unknown-word record starts with its u32 category id followed
+    // by the u16 left id.
+    let unk_offset = first_unknown_record_offset(&bytes);
+    let category_id = u32::from_le_bytes(bytes[unk_offset..unk_offset + 4].try_into().unwrap());
+    let category_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    assert!(
+        category_id < category_count,
+        "offset does not point at an unknown-word record"
+    );
+    let left_id_offset = unk_offset + 4;
+    bytes[left_id_offset..left_id_offset + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+    for err in load_binary_both_ways(temp_dir.path(), &bytes) {
+        assert!(
+            matches!(err, delarocha::Error::InvalidDictionary(_)),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn zig_ffi_rejects_stale_binary_dictionary_file() {
+    // Optional: point this at a DLRDIC02 dictionary built by an older release.
+    let Some(path) = std::env::var_os("DELAROCHA_STALE_BINARY_DIC") else {
+        return;
+    };
+    let bytes = std::fs::read(&path).expect("read stale dictionary");
+    let results = [
+        ZigTokenizer::from_binary_path(&path).err(),
+        ZigTokenizer::count_only_from_binary_path(&path).err(),
+        ZigTokenizer::from_binary_bytes(&bytes).err(),
+    ];
+    for err in results {
+        let err = err.expect("stale dictionary must be rejected");
+        assert!(
+            matches!(err, delarocha::Error::UnsupportedDictionaryVersion(_)),
+            "unexpected error: {err}"
+        );
+        println!("{err}");
     }
 }

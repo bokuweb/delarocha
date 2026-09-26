@@ -129,6 +129,9 @@ const FeatureCache = struct {
     slots: []Slot = &.{},
     len: usize = 0,
     shift: u5 = 0,
+    // Set by the worker's capacity trimming when `bytes` is still borrowed by
+    // tokens: the next fill frees it instead of reusing it.
+    release_on_next_fill: bool = false,
 
     const Slot = struct { key: u32, span: FeatureSpan };
     const empty_key: u32 = std.math.maxInt(u32);
@@ -141,11 +144,33 @@ const FeatureCache = struct {
         self.* = .{};
     }
 
-    fn startFill(self: *FeatureCache) void {
+    fn startFill(self: *FeatureCache, allocator: Allocator) void {
+        if (self.release_on_next_fill) {
+            self.release_on_next_fill = false;
+            self.freeBytes(allocator);
+            return;
+        }
         if (self.bytes.items.len <= byte_limit) return;
         self.bytes.clearRetainingCapacity();
         for (self.slots) |*entry| entry.key = empty_key;
         self.len = 0;
+    }
+
+    /// Frees the decoded bytes; the index refers to them, so it is emptied.
+    fn freeBytes(self: *FeatureCache, allocator: Allocator) void {
+        self.bytes.clearAndFree(allocator);
+        for (self.slots) |*entry| entry.key = empty_key;
+        self.len = 0;
+    }
+
+    /// Frees the index. Decoded bytes stay valid for tokens borrowing them
+    /// but are no longer reachable, so the next fill starts over.
+    fn freeIndex(self: *FeatureCache, allocator: Allocator) void {
+        allocator.free(self.slots);
+        self.slots = &.{};
+        self.len = 0;
+        self.shift = 0;
+        self.release_on_next_fill = self.release_on_next_fill or self.bytes.capacity != 0;
     }
 
     inline fn slot(self: *const FeatureCache, key: u32) usize {
@@ -210,6 +235,9 @@ pub const Worker = struct {
     // token surfaces after the caller's input may be gone.
     deferred_input: std.ArrayList(u8) = .empty,
     feature_state: std.atomic.Value(u8) = .init(features_resolved),
+    /// Optional cap on the capacity the worker keeps between calls; see
+    /// `setRetainedCapacityLimit`. `null` (the default) never trims.
+    retained_capacity_limit: ?usize = null,
 
     const features_resolved: u8 = 0;
     const features_pending: u8 = 1;
@@ -251,6 +279,7 @@ pub const Worker = struct {
         }
         const best = try self.buildBestPath(input);
         try self.backtrace(input, best, true);
+        if (self.retained_capacity_limit) |limit| if (self.retainedBytes() > limit) self.trimAfterCall(limit, true);
         return self.tokens.items;
     }
 
@@ -268,6 +297,7 @@ pub const Worker = struct {
             try self.deferred_input.appendSlice(self.allocator, input);
         }
         self.feature_state.store(features_pending, .release);
+        if (self.retained_capacity_limit) |limit| if (self.retainedBytes() > limit) self.trimAfterCall(limit, true);
         return self.tokens.items;
     }
 
@@ -283,7 +313,11 @@ pub const Worker = struct {
             return;
         }
         defer self.feature_state.store(features_resolved, .release);
-        return self.fillFeatures(self.deferred_input.items);
+        // Tokens become borrowers of the decode cache below, and the input
+        // copy is only needed until then.
+        const result = self.fillFeatures(self.deferred_input.items);
+        if (self.retained_capacity_limit) |limit| if (self.retainedBytes() > limit) self.trimAfterCall(limit, true);
+        return result;
     }
 
     fn tokenizeWithoutFeatures(self: *Worker, input: []const u8) !void {
@@ -309,7 +343,7 @@ pub const Worker = struct {
     /// Prepares decoding compact features for `count` tokens and returns the
     /// cache buffer address that `endCompactFeatures` compares against.
     fn beginCompactFeatures(self: *Worker, count: usize) Allocator.Error![*]u8 {
-        self.feature_cache.startFill();
+        self.feature_cache.startFill(self.allocator);
         try self.feature_spans.resize(self.allocator, count);
         return self.feature_cache.bytes.items.ptr;
     }
@@ -357,7 +391,9 @@ pub const Worker = struct {
             return 0;
         }
         const best = try self.buildBestCountPath(input);
-        return self.count_nodes.items[best].token_count;
+        const count = self.count_nodes.items[best].token_count;
+        if (self.retained_capacity_limit) |limit| if (self.retainedBytes() > limit) self.trimAfterCall(limit, false);
+        return count;
     }
 
     pub fn tokenizeCountAssumeValid(self: *Worker, input: []const u8) usize {
@@ -371,7 +407,118 @@ pub const Worker = struct {
             return 0;
         }
         const best = self.buildBestCountPath(input) catch unreachable;
-        return self.count_nodes.items[best].token_count;
+        const count = self.count_nodes.items[best].token_count;
+        if (self.retained_capacity_limit) |limit| if (self.retainedBytes() > limit) self.trimAfterCall(limit, false);
+        return count;
+    }
+
+    /// Bytes of buffer capacity the worker currently holds: the full and
+    /// count-only lattices, the token buffer, and, for dictionaries with
+    /// compact features, the decode cache (at most about 1 MiB of decoded
+    /// features plus its index) and the deferred input copy. Tokenizing grows these to
+    /// fit the largest input seen so far (roughly 60 bytes per input byte for
+    /// `tokenize` and 32 for `tokenizeCount` on IPADIC) and keeps them for
+    /// reuse; see `shrinkTo` and `setRetainedCapacityLimit`.
+    pub fn retainedBytes(self: *const Worker) usize {
+        return self.nodes.capacity * @sizeOf(Node) +
+            self.end_heads.capacity * @sizeOf(u32) +
+            self.count_nodes.capacity * @sizeOf(CountNode) +
+            self.count_end_heads.capacity * @sizeOf(u32) +
+            self.tokens.capacity * @sizeOf(Token) +
+            self.featureStateBytes();
+    }
+
+    /// Capacity held for compact-dictionary features: the decode cache (bytes
+    /// and index), the per-token offset scratch, and the deferred input copy.
+    fn featureStateBytes(self: *const Worker) usize {
+        return self.feature_cache.bytes.capacity +
+            self.feature_cache.slots.len * @sizeOf(FeatureCache.Slot) +
+            self.feature_spans.capacity * @sizeOf(FeatureSpan) +
+            self.deferred_input.capacity;
+    }
+
+    /// Releases every retained buffer. Equivalent to `shrinkTo(0)`.
+    pub fn shrink(self: *Worker) void {
+        self.shrinkTo(0);
+    }
+
+    /// Frees retained buffers, largest first, until `retainedBytes()` is at
+    /// most `max_bytes`. The token slice returned by the last `tokenize` call
+    /// is invalidated. Later calls regrow the buffers on demand and produce
+    /// the same results.
+    pub fn shrinkTo(self: *Worker, max_bytes: usize) void {
+        self.releaseLargestUntil(max_bytes, true);
+    }
+
+    /// Caps the capacity kept between calls. When set, a call that leaves
+    /// more than `limit` bytes retained releases the lattice buffers (largest
+    /// first) before returning, so one huge input does not pin its lattice for
+    /// the worker lifetime. The token buffer backing a `tokenize` result is
+    /// never freed by this; if it alone is over the limit it is shrunk to the
+    /// result's length (and trimmed further once a later call replaces it).
+    /// `null` disables the cap. Inputs below the limit never trim, so
+    /// steady-state reuse on small inputs is unaffected.
+    pub fn setRetainedCapacityLimit(self: *Worker, limit: ?usize) void {
+        self.retained_capacity_limit = limit;
+        if (limit) |max_bytes| self.trimAfterCall(max_bytes, true);
+    }
+
+    noinline fn trimAfterCall(self: *Worker, limit: usize, shrink_tokens: bool) void {
+        self.releaseLargestUntil(limit, false);
+        if (shrink_tokens and self.retainedBytes() > limit) {
+            // The token buffer holds the result being returned: shrink it to
+            // the result instead of freeing it.
+            self.tokens.shrinkAndFree(self.allocator, self.tokens.items.len);
+        }
+    }
+
+    fn releaseLargestUntil(self: *Worker, max_bytes: usize, include_tokens: bool) void {
+        defer self.group_cache = null;
+        // Unless the tokens are being released too, keep what the current
+        // tokens still need: the decode cache they borrow once features are
+        // filled, or the input copy that pending features are decoded from.
+        const pending = self.feature_state.load(.acquire) == features_pending;
+        const keep_cache_bytes = !include_tokens and !pending;
+        const keep_deferred_input = !include_tokens and pending;
+        while (self.retainedBytes() > max_bytes) {
+            const sizes = [_]usize{
+                self.nodes.capacity * @sizeOf(Node),
+                self.end_heads.capacity * @sizeOf(u32),
+                self.count_nodes.capacity * @sizeOf(CountNode),
+                self.count_end_heads.capacity * @sizeOf(u32),
+                if (include_tokens) self.tokens.capacity * @sizeOf(Token) else 0,
+                if (keep_cache_bytes) 0 else self.feature_cache.bytes.capacity,
+                self.feature_cache.slots.len * @sizeOf(FeatureCache.Slot),
+                self.feature_spans.capacity * @sizeOf(FeatureSpan),
+                if (keep_deferred_input) 0 else self.deferred_input.capacity,
+            };
+            const largest = std.mem.indexOfMax(usize, &sizes);
+            if (sizes[largest] == 0) break;
+            switch (largest) {
+                0 => self.nodes.clearAndFree(self.allocator),
+                1 => self.end_heads.clearAndFree(self.allocator),
+                2 => self.count_nodes.clearAndFree(self.allocator),
+                3 => self.count_end_heads.clearAndFree(self.allocator),
+                4 => self.tokens.clearAndFree(self.allocator),
+                5, 8 => {
+                    // Filled token features borrow the cache and pending ones
+                    // need the input copy; when the buffer they depend on goes
+                    // (only when tokens are released too), the already
+                    // invalidated token slice is emptied with it.
+                    const referenced = (largest == 5) != pending;
+                    if (largest == 5) self.feature_cache.freeBytes(self.allocator) else self.deferred_input.clearAndFree(self.allocator);
+                    if (referenced) {
+                        self.tokens.clearRetainingCapacity();
+                        self.feature_state.store(features_resolved, .release);
+                    }
+                },
+                6 => self.feature_cache.freeIndex(self.allocator),
+                else => self.feature_spans.clearAndFree(self.allocator),
+            }
+        }
+        // Cache bytes the current tokens borrow cannot be freed now; restart
+        // the cache (dropping its capacity) at the next fill instead.
+        if (keep_cache_bytes and self.retainedBytes() > max_bytes) self.feature_cache.release_on_next_fill = true;
     }
 
     fn buildBestPath(self: *Worker, input: []const u8) !u32 {

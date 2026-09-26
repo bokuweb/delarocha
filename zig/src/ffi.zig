@@ -9,21 +9,35 @@ const is_wasm = @import("builtin").target.cpu.arch.isWasm();
 
 var c_allocator = std.heap.page_allocator;
 threadlocal var last_error_buf: [256]u8 = [_]u8{0} ** 256;
+threadlocal var last_error_kind: u32 = error_kind_other;
+
+// Stable error categories for bindings that need more than the message text.
+const error_kind_other: u32 = 0;
+const error_kind_invalid_dictionary: u32 = 1;
+const error_kind_unsupported_dictionary_version: u32 = 2;
 
 fn setLastError(comptime fmt: []const u8, args: anytype) void {
     const msg = std.fmt.bufPrintZ(&last_error_buf, fmt, args) catch "error";
     @memset(last_error_buf[msg.len..], 0);
+    last_error_kind = error_kind_other;
 }
 
-fn binaryLoadHint(err: anyerror) []const u8 {
-    return if (err == error.UnsupportedDictionaryVersion)
-        " (the file was written by an older delarocha binary format; rebuild it from the raw dictionary)"
-    else
-        "";
+fn setLoadError(comptime context: []const u8, err: anyerror) void {
+    if (err == error.UnsupportedDictionaryVersion) {
+        setLastError(context ++ ": {s} (the file was written by an older or unknown delarocha binary format; rebuild it from the raw dictionary with this version)", .{@errorName(err)});
+        last_error_kind = error_kind_unsupported_dictionary_version;
+        return;
+    }
+    setLastError(context ++ ": {s}", .{@errorName(err)});
+    if (err == error.InvalidDictionary) last_error_kind = error_kind_invalid_dictionary;
 }
 
 pub export fn delarocha_last_error() [*:0]const u8 {
     return @ptrCast(&last_error_buf);
+}
+
+pub export fn delarocha_last_error_kind() u32 {
+    return last_error_kind;
 }
 
 pub export fn delarocha_tokenizer_new(path: [*:0]const u8) ?*Tokenizer {
@@ -93,7 +107,7 @@ pub export fn delarocha_tokenizer_new_binary(path: [*:0]const u8) ?*Tokenizer {
     };
     tokenizer.* = Tokenizer.initBinaryFile(c_allocator, std.mem.span(path)) catch |err| {
         c_allocator.destroy(tokenizer);
-        setLastError("failed to load binary dictionary: {s}{s}", .{ @errorName(err), binaryLoadHint(err) });
+        setLoadError("failed to load binary dictionary", err);
         return null;
     };
     return tokenizer;
@@ -108,7 +122,7 @@ pub export fn delarocha_tokenizer_new_binary_bytes(bytes_ptr: [*]const u8, bytes
         .allocator = c_allocator,
         .dictionary = Dictionary.fromBinaryBytes(c_allocator, bytes_ptr[0..bytes_len]) catch |err| {
             c_allocator.destroy(tokenizer);
-            setLastError("failed to load binary dictionary bytes: {s}{s}", .{ @errorName(err), binaryLoadHint(err) });
+            setLoadError("failed to load binary dictionary bytes", err);
             return null;
         },
     };
@@ -124,7 +138,7 @@ pub export fn delarocha_tokenizer_new_binary_borrowed_bytes(bytes_ptr: [*]const 
         .allocator = c_allocator,
         .dictionary = Dictionary.fromBorrowedBinaryBytes(c_allocator, bytes_ptr[0..bytes_len]) catch |err| {
             c_allocator.destroy(tokenizer);
-            setLastError("failed to load borrowed binary dictionary bytes: {s}{s}", .{ @errorName(err), binaryLoadHint(err) });
+            setLoadError("failed to load borrowed binary dictionary bytes", err);
             return null;
         },
     };
@@ -213,6 +227,28 @@ pub export fn delarocha_worker_free(worker: ?*Worker) void {
         ptr.deinit();
         c_allocator.destroy(ptr);
     }
+}
+
+/// Bytes of lattice/token buffer capacity the worker holds (see
+/// `Worker.retainedBytes`). Returns 0 for a null worker.
+pub export fn delarocha_worker_retained_bytes(worker: ?*const Worker) usize {
+    return if (worker) |ptr| ptr.retainedBytes() else 0;
+}
+
+/// Frees the worker's retained buffers, largest first, until at most
+/// `max_bytes` remain, and returns the bytes still retained. Token data from
+/// the previous tokenize call is invalidated. Pass 0 to release everything.
+pub export fn delarocha_worker_shrink_to(worker: ?*Worker, max_bytes: usize) usize {
+    const ptr = worker orelse return 0;
+    ptr.shrinkTo(max_bytes);
+    return ptr.retainedBytes();
+}
+
+/// Sets the worker's retained-capacity cap (see
+/// `Worker.setRetainedCapacityLimit`); `SIZE_MAX` removes the cap.
+pub export fn delarocha_worker_set_retained_limit(worker: ?*Worker, max_bytes: usize) void {
+    const ptr = worker orelse return;
+    ptr.setRetainedCapacityLimit(if (max_bytes == std.math.maxInt(usize)) null else max_bytes);
 }
 
 pub export fn delarocha_tokenize(worker: ?*Worker, input: [*:0]const u8) i32 {

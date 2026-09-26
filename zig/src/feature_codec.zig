@@ -43,7 +43,7 @@ const ref_first_column: u8 = 3;
 const explicit_len_bit: u8 = 0x10;
 const inline_literal_limit: usize = 15;
 /// Prefix column counts considered by the encoder.
-const max_prefix_fields: u32 = 16;
+pub const max_prefix_fields: u32 = 16;
 
 /// Runtime view of the prefix table. Entry `i` is
 /// `blob[offsets[i]..offsets[i + 1]]`; both slices may be borrowed from a
