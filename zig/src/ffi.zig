@@ -315,7 +315,9 @@ fn tokenizeSlice(worker: ?*Worker, input: []const u8) i32 {
         setLastError("worker is null", .{});
         return -1;
     };
-    _ = worker_ptr.tokenize(input) catch |err| {
+    // Features are resolved on first use (`delarocha_tokens_copy_metadata`,
+    // `delarocha_token_feature`), so span-only callers skip them.
+    _ = worker_ptr.tokenizeDeferred(input) catch |err| {
         setLastError("tokenize failed: {s}", .{@errorName(err)});
         return -1;
     };
@@ -367,8 +369,8 @@ pub export fn delarocha_tokens_copy_metadata(
     starts: [*]u32,
     ends: [*]u32,
     word_ids: [*]u32,
-    feature_ptrs: [*][*]const u8,
-    feature_lens: [*]usize,
+    feature_ptrs: ?[*][*]const u8,
+    feature_lens: ?[*]usize,
     cap: usize,
 ) usize {
     const worker_ptr = worker orelse {
@@ -380,20 +382,50 @@ pub export fn delarocha_tokens_copy_metadata(
         setLastError("token metadata output capacity is too small", .{});
         return std.math.maxInt(usize);
     }
+    // Null feature outputs copy spans only and leave features unresolved.
+    const out_ptrs = feature_ptrs orelse return copySpans(tokens, starts, ends, word_ids);
+    const out_lens = feature_lens orelse return copySpans(tokens, starts, ends, word_ids);
+    resolvedWorker(worker_ptr) catch {
+        setLastError("out of memory", .{});
+        return std.math.maxInt(usize);
+    };
     for (tokens, 0..) |token, index| {
         starts[index] = @intCast(token.start);
         ends[index] = @intCast(token.end);
         word_ids[index] = token.word_id;
-        feature_ptrs[index] = token.feature.ptr;
-        feature_lens[index] = token.feature.len;
+        out_ptrs[index] = token.feature.ptr;
+        out_lens[index] = token.feature.len;
     }
     return tokens.len;
 }
 
+fn copySpans(tokens: []const tokenizer_mod.Token, starts: [*]u32, ends: [*]u32, word_ids: [*]u32) usize {
+    for (tokens, 0..) |token, index| {
+        starts[index] = @intCast(token.start);
+        ends[index] = @intCast(token.end);
+        word_ids[index] = token.word_id;
+    }
+    return tokens.len;
+}
+
+/// Resolves deferred token features. The C API hands out `const` workers for
+/// feature reads; resolution is internally synchronized (see
+/// `Worker.resolveFeatures`) and the worker itself is heap-allocated mutable
+/// memory, so casting away `const` here is sound.
+fn resolvedWorker(worker: *const Worker) !void {
+    try @constCast(worker).resolveFeatures();
+}
+
 pub export fn delarocha_token_feature(worker: ?*const Worker, index: usize) [*]const u8 {
-    return if (worker) |ptr| ptr.tokens.items[index].feature.ptr else "UNK";
+    const ptr = worker orelse return "UNK";
+    // On allocation failure unresolved features stay empty; pointer and
+    // length still describe the same token feature.
+    resolvedWorker(ptr) catch {};
+    return ptr.tokens.items[index].feature.ptr;
 }
 
 pub export fn delarocha_token_feature_len(worker: ?*const Worker, index: usize) usize {
-    return if (worker) |ptr| ptr.tokens.items[index].feature.len else 3;
+    const ptr = worker orelse return 3;
+    resolvedWorker(ptr) catch {};
+    return ptr.tokens.items[index].feature.len;
 }

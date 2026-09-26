@@ -198,7 +198,7 @@ fn zig_ffi_mmap_count_only_compact_dictionary_and_truncated_files() {
 
     // Dictionaries written by an older binary format version are rejected
     // with an explicit error instead of being misread.
-    for magic in [b"DLRDIC01", b"DLRDIC02"] {
+    for magic in [b"DLRDIC01", b"DLRDIC02", b"DLRDIC03"] {
         let mut legacy = bytes.clone();
         legacy[..magic.len()].copy_from_slice(magic);
         let legacy_path = temp_dir.path().join("legacy.dic");
@@ -429,6 +429,100 @@ fn zig_ffi_borrowed_views_match_owned_tokens() {
             );
         }
     }
+}
+
+#[test]
+fn zig_ffi_compact_features_match_raw_dictionary_on_every_path() {
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let lex_path = temp_dir.path().join("lex.csv");
+    let binary_path = temp_dir.path().join("compact.dic");
+    // MeCab-style features: a shared part-of-speech prefix plus base form,
+    // reading, and pronunciation columns select the compact encoding. The
+    // last entry carries invalid UTF-8 in a literal column.
+    let mut lexicon = Vec::new();
+    for index in 0..40 {
+        lexicon.extend_from_slice(
+            format!("語{index},0,0,10,名詞,一般,*,*,*,*,語{index},ゴ{index},ゴ{index}\n")
+                .as_bytes(),
+        );
+        lexicon.extend_from_slice(
+            format!(
+                "ご{index},0,0,12,動詞,自立,*,*,五段・ラ行,基本形,ご{index}る,ゴ{index},ゴー{index}\n"
+            )
+            .as_bytes(),
+        );
+    }
+    lexicon.extend_from_slice("不正,0,0,1,名詞,一般,*,*,*,*,不正,フセイ\u{30fc},".as_bytes());
+    lexicon.extend_from_slice(b"\xff\n");
+    std::fs::write(&lex_path, lexicon).expect("write lexicon");
+
+    let paths = |lex: &std::path::Path| {
+        (
+            lex.to_path_buf(),
+            fixture_dir.join("matrix.def"),
+            fixture_dir.join("char.def"),
+            fixture_dir.join("unk.def"),
+        )
+    };
+    let (lex, matrix, char_def, unk) = paths(&lex_path);
+    ZigTokenizer::write_binary_from_raw_paths(&lex, &matrix, &char_def, &unk, &binary_path)
+        .expect("Zig writes binary dictionary");
+    let raw = ZigTokenizer::from_raw_paths(&lex, &matrix, &char_def, &unk)
+        .expect("Zig tokenizer loads raw lexicon");
+    let mmap = ZigTokenizer::from_binary_path(&binary_path).expect("Zig mmaps binary");
+    let bytes = std::fs::read(&binary_path).expect("read binary");
+    let copied = ZigTokenizer::from_binary_bytes(&bytes).expect("Zig copies binary");
+
+    let inputs = ["語1語22ご7ご39XYZ", "ご0語0不正ご0", "", "本とカレー🍛語39"];
+    let mut raw_worker = raw.create_worker().expect("raw worker");
+    for tokenizer in [&mmap, &copied] {
+        let mut worker = tokenizer.create_worker().expect("worker");
+        let mut capped = tokenizer.create_worker().expect("worker");
+        capped.set_retained_capacity_limit(Some(512));
+        for _ in 0..2 {
+            for input in inputs {
+                let expected = raw_worker.tokenize(input).expect("raw tokenize");
+                assert_eq!(worker.tokenize(input).expect("tokenize"), expected);
+                // Trimming the decode cache and input copy keeps features.
+                assert_eq!(capped.tokenize(input).expect("tokenize"), expected);
+                let capped_views: Vec<_> = capped
+                    .tokenize_borrowed_views(input)
+                    .expect("borrowed views")
+                    .iter()
+                    .map(|view| view.to_token())
+                    .collect();
+                assert_eq!(capped_views, expected);
+                let before = worker.retained_bytes();
+                worker.shrink_to(before / 2);
+                assert!(worker.retained_bytes() <= before / 2);
+                let views = worker
+                    .tokenize_borrowed_views(input)
+                    .expect("borrowed views");
+                let from_views: Vec<_> = views.iter().map(|view| view.to_token()).collect();
+                assert_eq!(from_views, expected);
+
+                // Features stay available after span-only tokenization and
+                // after the input buffer is gone.
+                let spans = worker.tokenize_spans(input).expect("spans");
+                assert_eq!(spans.len(), expected.len());
+                let owned_input = input.to_string();
+                let count = worker.tokenize_raw(&owned_input).expect("raw tokenize");
+                drop(owned_input);
+                assert_eq!(count, expected.len());
+                for (index, token) in expected.iter().enumerate() {
+                    assert_eq!(worker.token_feature(index), token.feature, "{input:?}");
+                }
+            }
+        }
+    }
+    let invalid = raw_worker.tokenize("不正").expect("tokenize invalid");
+    assert_eq!(invalid[0].feature, "");
+    let valid = raw_worker.tokenize("ご3").expect("tokenize valid");
+    assert_eq!(
+        valid[0].feature,
+        "動詞,自立,*,*,五段・ラ行,基本形,ご3る,ゴ3,ゴー3"
+    );
 }
 
 #[test]
@@ -692,7 +786,7 @@ fn write_fixture_binary(dir: &std::path::Path) -> Vec<u8> {
     std::fs::read(&binary_path).expect("read binary fixture")
 }
 
-// Walks the binary format v3 layout (magic, 17 u32 header fields, then
+// Walks the binary format v4 layout (magic, 21 u32 header fields, then
 // 16-byte aligned sections) up to the unknown-word records.
 fn first_unknown_record_offset(bytes: &[u8]) -> usize {
     let header = |index: usize| {
@@ -701,9 +795,12 @@ fn first_unknown_record_offset(bytes: &[u8]) -> usize {
     };
     let align16 = |offset: usize| offset.next_multiple_of(16);
     let entry_count = header(0);
-    let feature_offsets = align16(8 + 17 * 4);
+    let feature_offsets = align16(8 + 21 * 4);
     let feature_blob = align16(feature_offsets + 4 * (entry_count + 1));
-    let mut cursor = feature_blob + header(6);
+    // Compact-feature prefix table: offsets (header 19), strings (header 20).
+    let prefix_offsets = align16(feature_blob + header(6));
+    let prefix_blob = align16(prefix_offsets + 4 * header(19));
+    let mut cursor = prefix_blob + header(20);
     // Dictionaries with at most 32 entries also store surfaces and entry ids.
     if entry_count <= 32 {
         let surface_offsets = align16(cursor);
@@ -735,13 +832,15 @@ fn load_binary_both_ways(dir: &std::path::Path, bytes: &[u8]) -> Vec<delarocha::
 fn zig_ffi_rejects_stale_binary_dictionary_version() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let mut bytes = write_fixture_binary(temp_dir.path());
-    assert_eq!(&bytes[..8], b"DLRDIC03");
-    bytes[..8].copy_from_slice(b"DLRDIC02");
-    for err in load_binary_both_ways(temp_dir.path(), &bytes) {
-        assert!(
-            matches!(&err, delarocha::Error::UnsupportedDictionaryVersion(message) if message.contains("rebuild")),
-            "unexpected error: {err}"
-        );
+    assert_eq!(&bytes[..8], b"DLRDIC04");
+    for magic in [b"DLRDIC02", b"DLRDIC03"] {
+        bytes[..8].copy_from_slice(magic);
+        for err in load_binary_both_ways(temp_dir.path(), &bytes) {
+            assert!(
+                matches!(&err, delarocha::Error::UnsupportedDictionaryVersion(message) if message.contains("rebuild")),
+                "unexpected error: {err}"
+            );
+        }
     }
 }
 

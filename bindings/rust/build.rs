@@ -16,6 +16,7 @@ fn main() {
     if zig_dir.exists() {
         println!("cargo:rerun-if-changed=../../zig/src/lib.zig");
         println!("cargo:rerun-if-changed=../../zig/src/dictionary.zig");
+        println!("cargo:rerun-if-changed=../../zig/src/feature_codec.zig");
         println!("cargo:rerun-if-changed=../../zig/src/tokenizer.zig");
         println!("cargo:rerun-if-changed=../../zig/src/ffi.zig");
         println!("cargo:rerun-if-changed=../../zig/src/bench.zig");

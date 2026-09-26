@@ -191,17 +191,31 @@ file and rename it instead). `ZigTokenizer::from_binary_bytes` and Zig's
 `Dictionary.fromBinaryFileCopy` keep a private copy when that cannot be
 guaranteed.
 
-Binary dictionaries use format version 3 (magic `DLRDIC03`). Every table
+Binary dictionaries use format version 4 (magic `DLRDIC04`). Every table
 starts at a 16-byte aligned offset and entry features are located through a
 separate offset table, so loading a memory-mapped dictionary does not read any
 per-entry data: pages are only faulted in when tokenization touches them.
-Files written by earlier versions (`DLRDIC01`, `DLRDIC02`) or by an unknown
+Files written by earlier versions (`DLRDIC01`, `DLRDIC02`, `DLRDIC03`) or by an unknown
 format version are rejected with `UnsupportedDictionaryVersion` (Rust:
 `Error::UnsupportedDictionaryVersion`), and corrupt tables or out-of-range
 indices with `InvalidDictionary`; rebuild them from the raw MeCab dictionary
 files with `ZigTokenizer::write_binary_from_raw_paths` (or Zig's
 `Dictionary.toBinaryAlloc`). Rebuilding the same raw files produces
 byte-identical output.
+
+Large dictionaries store entry features compactly: the leading CSV columns
+(for IPADIC the six part-of-speech/conjugation columns) come from a small
+shared table, and the remaining columns are encoded as back-references to the
+surface, its katakana rendering, or an earlier column plus a literal suffix,
+with a raw fallback per entry. The builder picks the layout from the data and
+keeps raw features when the encoding would not be smaller (Zig:
+`Dictionary.toBinaryAllocWithOptions(.{ .compact_features = false })` forces
+raw). For IPADIC the feature data shrinks from 31.1 MB to 7.5 MB and the
+dictionary file from 63.6 MB to 40.0 MB. Tokens still expose byte-identical
+feature strings: they are decoded once per word into a small per-worker cache
+(bounded to about 1 MiB) when features are requested, so span/count-only
+tokenization does not decode anything, and features borrowed from a worker are
+valid until the worker is used again.
 
 For output-sensitive callers, `ZigWorker::tokenize_borrowed_views` returns a
 `ZigTokenViews` collection backed by the worker's reusable metadata buffers.

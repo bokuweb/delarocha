@@ -117,6 +117,104 @@ pub const Tokenizer = struct {
     }
 };
 
+const FeatureSpan = struct { start: u32, len: u32 };
+
+/// Per-worker memo of decoded compact features keyed by word id. Text repeats
+/// words heavily, so most tokens reuse an earlier decode instead of reading
+/// the dictionary record. Entries refer to `bytes` by offset, so growing the
+/// buffer never invalidates them; the whole cache restarts at the next fill
+/// once it holds more than `byte_limit` bytes, bounding its memory.
+const FeatureCache = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    slots: []Slot = &.{},
+    len: usize = 0,
+    shift: u5 = 0,
+    // Set by the worker's capacity trimming when `bytes` is still borrowed by
+    // tokens: the next fill frees it instead of reusing it.
+    release_on_next_fill: bool = false,
+
+    const Slot = struct { key: u32, span: FeatureSpan };
+    const empty_key: u32 = std.math.maxInt(u32);
+    const byte_limit: usize = 1 << 20;
+    const initial_bits: u5 = 10;
+
+    fn deinit(self: *FeatureCache, allocator: Allocator) void {
+        self.bytes.deinit(allocator);
+        allocator.free(self.slots);
+        self.* = .{};
+    }
+
+    fn startFill(self: *FeatureCache, allocator: Allocator) void {
+        if (self.release_on_next_fill) {
+            self.release_on_next_fill = false;
+            self.freeBytes(allocator);
+            return;
+        }
+        if (self.bytes.items.len <= byte_limit) return;
+        self.bytes.clearRetainingCapacity();
+        for (self.slots) |*entry| entry.key = empty_key;
+        self.len = 0;
+    }
+
+    /// Frees the decoded bytes; the index refers to them, so it is emptied.
+    fn freeBytes(self: *FeatureCache, allocator: Allocator) void {
+        self.bytes.clearAndFree(allocator);
+        for (self.slots) |*entry| entry.key = empty_key;
+        self.len = 0;
+    }
+
+    /// Frees the index. Decoded bytes stay valid for tokens borrowing them
+    /// but are no longer reachable, so the next fill starts over.
+    fn freeIndex(self: *FeatureCache, allocator: Allocator) void {
+        allocator.free(self.slots);
+        self.slots = &.{};
+        self.len = 0;
+        self.shift = 0;
+        self.release_on_next_fill = self.release_on_next_fill or self.bytes.capacity != 0;
+    }
+
+    inline fn slot(self: *const FeatureCache, key: u32) usize {
+        return @as(u32, key *% 0x9e3779b1) >> self.shift;
+    }
+
+    inline fn get(self: *const FeatureCache, key: u32) ?FeatureSpan {
+        if (self.slots.len == 0) return null;
+        const mask = self.slots.len - 1;
+        var index = self.slot(key);
+        while (true) : (index = (index + 1) & mask) {
+            const entry = self.slots[index];
+            if (entry.key == key) return entry.span;
+            if (entry.key == empty_key) return null;
+        }
+    }
+
+    fn put(self: *FeatureCache, allocator: Allocator, key: u32, span: FeatureSpan) Allocator.Error!void {
+        if ((self.len + 1) * 2 > self.slots.len) try self.grow(allocator);
+        self.insert(key, span);
+        self.len += 1;
+    }
+
+    fn insert(self: *FeatureCache, key: u32, span: FeatureSpan) void {
+        const mask = self.slots.len - 1;
+        var index = self.slot(key);
+        while (self.slots[index].key != empty_key) index = (index + 1) & mask;
+        self.slots[index] = .{ .key = key, .span = span };
+    }
+
+    fn grow(self: *FeatureCache, allocator: Allocator) Allocator.Error!void {
+        const bits: u5 = if (self.slots.len == 0) initial_bits else @intCast(std.math.log2_int(usize, self.slots.len) + 1);
+        const slots = try allocator.alloc(Slot, @as(usize, 1) << bits);
+        for (slots) |*entry| entry.key = empty_key;
+        const old_slots = self.slots;
+        self.slots = slots;
+        self.shift = @intCast(32 - @as(u6, bits));
+        for (old_slots) |entry| {
+            if (entry.key != empty_key) self.insert(entry.key, entry.span);
+        }
+        allocator.free(old_slots);
+    }
+};
+
 pub const Worker = struct {
     allocator: Allocator,
     dictionary: *const dict_mod.Dictionary,
@@ -127,9 +225,24 @@ pub const Worker = struct {
     count_end_heads: std.ArrayList(u32),
     tokens: std.ArrayList(Token),
     group_cache: ?GroupCache,
+    // Token features are filled in after the best path is known: eagerly by
+    // `tokenize`, or on demand after `tokenizeDeferred` (see
+    // `resolveFeatures`). Compact dictionary features are decoded into
+    // `feature_cache`, which the tokens then borrow until the next call.
+    feature_cache: FeatureCache = .{},
+    feature_spans: std.ArrayList(FeatureSpan) = .empty,
+    // Copy of the last deferred input; decoding compact features needs the
+    // token surfaces after the caller's input may be gone.
+    deferred_input: std.ArrayList(u8) = .empty,
+    feature_state: std.atomic.Value(u8) = .init(features_resolved),
     /// Optional cap on the capacity the worker keeps between calls; see
     /// `setRetainedCapacityLimit`. `null` (the default) never trims.
     retained_capacity_limit: ?usize = null,
+
+    const features_resolved: u8 = 0;
+    const features_pending: u8 = 1;
+    const features_resolving: u8 = 2;
+    const no_feature_span: u32 = std.math.maxInt(u32);
 
     pub fn init(allocator: Allocator, dictionary: *const dict_mod.Dictionary, max_grouping_len: ?usize) Worker {
         return .{
@@ -151,17 +264,125 @@ pub const Worker = struct {
         self.count_end_heads.deinit(self.allocator);
         self.count_nodes.deinit(self.allocator);
         self.tokens.deinit(self.allocator);
+        self.feature_cache.deinit(self.allocator);
+        self.feature_spans.deinit(self.allocator);
+        self.deferred_input.deinit(self.allocator);
     }
 
+    /// Tokenizes `input`. Token features borrow the dictionary or this
+    /// worker and stay valid until the next call on this worker.
     pub fn tokenize(self: *Worker, input: []const u8) ![]const Token {
+        self.feature_state.store(features_resolved, .monotonic);
         if (input.len == 0) {
             try self.reset(0);
             return self.tokens.items;
         }
         const best = try self.buildBestPath(input);
-        try self.backtrace(input, best);
+        try self.backtrace(input, best, true);
         if (self.retained_capacity_limit) |limit| if (self.retainedBytes() > limit) self.trimAfterCall(limit, true);
         return self.tokens.items;
+    }
+
+    /// Like `tokenize`, but token features are left empty until
+    /// `resolveFeatures` is called, so callers that only need spans or word
+    /// ids skip feature lookup and decoding. `input` may be freed afterwards.
+    pub fn tokenizeDeferred(self: *Worker, input: []const u8) ![]const Token {
+        try self.tokenizeWithoutFeatures(input);
+        if (self.tokens.items.len == 0) {
+            self.feature_state.store(features_resolved, .monotonic);
+            return self.tokens.items;
+        }
+        if (self.dictionary.features_compact) {
+            self.deferred_input.clearRetainingCapacity();
+            try self.deferred_input.appendSlice(self.allocator, input);
+        }
+        self.feature_state.store(features_pending, .release);
+        if (self.retained_capacity_limit) |limit| if (self.retainedBytes() > limit) self.trimAfterCall(limit, true);
+        return self.tokens.items;
+    }
+
+    /// Fills the features of the tokens from the last `tokenizeDeferred`
+    /// call; a no-op when they are already filled. Concurrent calls on a
+    /// worker that is otherwise not mutated are safe: one caller resolves and
+    /// the others wait for it. On allocation failure the remaining features
+    /// stay empty.
+    pub fn resolveFeatures(self: *Worker) Allocator.Error!void {
+        if (self.feature_state.load(.acquire) == features_resolved) return;
+        if (self.feature_state.cmpxchgStrong(features_pending, features_resolving, .acquire, .acquire) != null) {
+            while (self.feature_state.load(.acquire) != features_resolved) std.atomic.spinLoopHint();
+            return;
+        }
+        defer self.feature_state.store(features_resolved, .release);
+        // Tokens become borrowers of the decode cache below, and the input
+        // copy is only needed until then.
+        const result = self.fillFeatures(self.deferred_input.items);
+        if (self.retained_capacity_limit) |limit| if (self.retainedBytes() > limit) self.trimAfterCall(limit, true);
+        return result;
+    }
+
+    fn tokenizeWithoutFeatures(self: *Worker, input: []const u8) !void {
+        if (input.len == 0) {
+            try self.reset(0);
+            return;
+        }
+        const best = try self.buildBestPath(input);
+        try self.backtrace(input, best, false);
+    }
+
+    fn fillFeatures(self: *Worker, input: []const u8) Allocator.Error!void {
+        const tokens = self.tokens.items;
+        if (!self.dictionary.features_compact) {
+            for (tokens) |*token| token.feature = self.featureFor(token.word_id);
+            return;
+        }
+        const base = try self.beginCompactFeatures(tokens.len);
+        for (tokens, self.feature_spans.items) |*token, *span| try self.fillCompactFeature(input, token, span);
+        self.endCompactFeatures(base);
+    }
+
+    /// Prepares decoding compact features for `count` tokens and returns the
+    /// cache buffer address that `endCompactFeatures` compares against.
+    fn beginCompactFeatures(self: *Worker, count: usize) Allocator.Error![*]u8 {
+        self.feature_cache.startFill(self.allocator);
+        try self.feature_spans.resize(self.allocator, count);
+        return self.feature_cache.bytes.items.ptr;
+    }
+
+    /// Fills one token's feature from a compact dictionary through the
+    /// per-word cache. Tokens borrow the cache buffer directly and remember
+    /// their offsets in `span` in case the buffer moves while it grows.
+    inline fn fillCompactFeature(self: *Worker, input: []const u8, token: *Token, span: *FeatureSpan) Allocator.Error!void {
+        span.start = no_feature_span;
+        const word_id = token.word_id;
+        if (word_id >= (1 << 30)) {
+            token.feature = self.featureFor(word_id);
+            return;
+        }
+        const cache = &self.feature_cache;
+        const cached = cache.get(word_id) orelse decoded: {
+            switch (try self.dictionary.decodeEntryFeature(self.allocator, word_id, input[token.start..token.end], &cache.bytes)) {
+                .borrowed => |bytes| {
+                    token.feature = bytes;
+                    return;
+                },
+                .appended => |len| {
+                    const decoded: FeatureSpan = .{ .start = @intCast(cache.bytes.items.len - len), .len = @intCast(len) };
+                    try cache.put(self.allocator, word_id, decoded);
+                    break :decoded decoded;
+                },
+            }
+        };
+        span.* = cached;
+        token.feature = cache.bytes.items.ptr[cached.start..][0..cached.len];
+    }
+
+    /// Re-points token features at the cache buffer if it moved.
+    fn endCompactFeatures(self: *Worker, base: [*]u8) void {
+        const bytes = self.feature_cache.bytes.items;
+        if (bytes.ptr == base) return;
+        for (self.tokens.items, self.feature_spans.items) |*token, span| {
+            if (span.start != no_feature_span) token.feature = bytes[span.start..][0..span.len];
+        }
     }
 
     pub fn tokenizeCount(self: *Worker, input: []const u8) !usize {
@@ -192,7 +413,9 @@ pub const Worker = struct {
     }
 
     /// Bytes of buffer capacity the worker currently holds: the full and
-    /// count-only lattices plus the token buffer. Tokenizing grows these to
+    /// count-only lattices, the token buffer, and, for dictionaries with
+    /// compact features, the decode cache (at most about 1 MiB of decoded
+    /// features plus its index) and the deferred input copy. Tokenizing grows these to
     /// fit the largest input seen so far (roughly 60 bytes per input byte for
     /// `tokenize` and 32 for `tokenizeCount` on IPADIC) and keeps them for
     /// reuse; see `shrinkTo` and `setRetainedCapacityLimit`.
@@ -201,7 +424,17 @@ pub const Worker = struct {
             self.end_heads.capacity * @sizeOf(u32) +
             self.count_nodes.capacity * @sizeOf(CountNode) +
             self.count_end_heads.capacity * @sizeOf(u32) +
-            self.tokens.capacity * @sizeOf(Token);
+            self.tokens.capacity * @sizeOf(Token) +
+            self.featureStateBytes();
+    }
+
+    /// Capacity held for compact-dictionary features: the decode cache (bytes
+    /// and index), the per-token offset scratch, and the deferred input copy.
+    fn featureStateBytes(self: *const Worker) usize {
+        return self.feature_cache.bytes.capacity +
+            self.feature_cache.slots.len * @sizeOf(FeatureCache.Slot) +
+            self.feature_spans.capacity * @sizeOf(FeatureSpan) +
+            self.deferred_input.capacity;
     }
 
     /// Releases every retained buffer. Equivalent to `shrinkTo(0)`.
@@ -240,6 +473,13 @@ pub const Worker = struct {
     }
 
     fn releaseLargestUntil(self: *Worker, max_bytes: usize, include_tokens: bool) void {
+        defer self.group_cache = null;
+        // Unless the tokens are being released too, keep what the current
+        // tokens still need: the decode cache they borrow once features are
+        // filled, or the input copy that pending features are decoded from.
+        const pending = self.feature_state.load(.acquire) == features_pending;
+        const keep_cache_bytes = !include_tokens and !pending;
+        const keep_deferred_input = !include_tokens and pending;
         while (self.retainedBytes() > max_bytes) {
             const sizes = [_]usize{
                 self.nodes.capacity * @sizeOf(Node),
@@ -247,18 +487,38 @@ pub const Worker = struct {
                 self.count_nodes.capacity * @sizeOf(CountNode),
                 self.count_end_heads.capacity * @sizeOf(u32),
                 if (include_tokens) self.tokens.capacity * @sizeOf(Token) else 0,
+                if (keep_cache_bytes) 0 else self.feature_cache.bytes.capacity,
+                self.feature_cache.slots.len * @sizeOf(FeatureCache.Slot),
+                self.feature_spans.capacity * @sizeOf(FeatureSpan),
+                if (keep_deferred_input) 0 else self.deferred_input.capacity,
             };
             const largest = std.mem.indexOfMax(usize, &sizes);
-            if (sizes[largest] == 0) return;
+            if (sizes[largest] == 0) break;
             switch (largest) {
                 0 => self.nodes.clearAndFree(self.allocator),
                 1 => self.end_heads.clearAndFree(self.allocator),
                 2 => self.count_nodes.clearAndFree(self.allocator),
                 3 => self.count_end_heads.clearAndFree(self.allocator),
-                else => self.tokens.clearAndFree(self.allocator),
+                4 => self.tokens.clearAndFree(self.allocator),
+                5, 8 => {
+                    // Filled token features borrow the cache and pending ones
+                    // need the input copy; when the buffer they depend on goes
+                    // (only when tokens are released too), the already
+                    // invalidated token slice is emptied with it.
+                    const referenced = (largest == 5) != pending;
+                    if (largest == 5) self.feature_cache.freeBytes(self.allocator) else self.deferred_input.clearAndFree(self.allocator);
+                    if (referenced) {
+                        self.tokens.clearRetainingCapacity();
+                        self.feature_state.store(features_resolved, .release);
+                    }
+                },
+                6 => self.feature_cache.freeIndex(self.allocator),
+                else => self.feature_spans.clearAndFree(self.allocator),
             }
         }
-        self.group_cache = null;
+        // Cache bytes the current tokens borrow cannot be freed now; restart
+        // the cache (dropping its capacity) at the next fill instead.
+        if (keep_cache_bytes and self.retainedBytes() > max_bytes) self.feature_cache.release_on_next_fill = true;
     }
 
     fn buildBestPath(self: *Worker, input: []const u8) !u32 {
@@ -887,14 +1147,13 @@ pub const Worker = struct {
         return best_index;
     }
 
-    fn backtrace(self: *Worker, input: []const u8, start_index: u32) !void {
+    fn backtrace(self: *Worker, input: []const u8, start_index: u32, comptime with_features: bool) !void {
         // The per-position list heads are dead once the best end node is
         // known, and a path has at most one node per input byte, so the heads
         // buffer doubles as scratch for the path's node indexes. Collecting
         // them in one (serially dependent) walk lets the fill loop below read
         // the nodes in ascending order with independent loads instead of
         // walking the `prev_node` chain a second time.
-        _ = input;
         const path = self.end_heads.items;
         var count: usize = 0;
         var index = start_index;
@@ -905,6 +1164,10 @@ pub const Worker = struct {
         }
 
         try self.tokens.resize(self.allocator, count);
+        // Features are filled in the same pass when requested, so the token
+        // array is written once.
+        const compact = with_features and self.dictionary.features_compact;
+        const base = if (compact) try self.beginCompactFeatures(count) else undefined;
         var start: usize = 0;
         for (self.tokens.items, 0..) |*token, i| {
             const node = self.nodes.items[path[count - 1 - i]];
@@ -913,11 +1176,17 @@ pub const Worker = struct {
                 .start = start,
                 .end = end,
                 .word_id = node.word_id,
-                .feature = self.featureFor(node.word_id),
+                .feature = "",
                 .total_cost = node.min_cost,
             };
+            if (compact) {
+                try self.fillCompactFeature(input, token, &self.feature_spans.items[i]);
+            } else if (with_features) {
+                token.feature = self.featureFor(node.word_id);
+            }
             start = end;
         }
+        if (compact) self.endCompactFeatures(base);
     }
 
     fn featureFor(self: *const Worker, word_id: u32) []const u8 {

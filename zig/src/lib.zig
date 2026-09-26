@@ -178,19 +178,34 @@ test "binary file loaders (mmap, copy, borrowed, count-only) agree" {
     var large_lex: std.ArrayList(u8) = .empty;
     defer large_lex.deinit(allocator);
     for (0..40) |index| try large_lex.print(allocator, "語{d},0,0,{d},feature-{d}\n", .{ index, 10 + index % 3, index });
+    // MeCab-style features select the compact feature encoding.
+    var compact_lex: std.ArrayList(u8) = .empty;
+    defer compact_lex.deinit(allocator);
+    for (0..40) |index| {
+        try compact_lex.print(allocator, "語{d},0,0,{d},名詞,一般,*,*,*,*,語{d},ゴ{d},ゴ{d}\n", .{ index, 10 + index % 3, index, index, index });
+        try compact_lex.print(allocator, "ご{d},0,0,{d},動詞,自立,*,*,五段・ラ行,基本形,ご{d}る,ゴ{d},ゴー{d}\n", .{ index, 12 + index % 5, index, index, index });
+    }
     const small_lex = "本,0,0,10,noun,book\nと,0,0,1,particle,and\nカレー,0,0,10,noun,curry\n本と,0,0,0,compound,book-and\n";
     const matrix = "1 1\n0 0 0\n";
     const char_def = "DEFAULT 0 1 0\nALPHA 1 1 0\n0x0041..0x005A ALPHA\n";
     const unk = "DEFAULT,0,0,10000,*\nALPHA,0,0,10,alpha\n";
-    const inputs = [_][]const u8{ "語1語22語39", "本とカレーABC語3", "X🍛", "" };
+    const inputs = [_][]const u8{ "語1語22語39", "本とカレーABC語3", "X🍛", "", "ご1ご22語7ご39XYZ" };
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    for ([_][]const u8{ large_lex.items, small_lex }) |lex| {
+    const Case = struct { lex: []const u8, compact: bool, options: dictionary.BinaryOptions = .{} };
+    const cases = [_]Case{
+        .{ .lex = large_lex.items, .compact = false },
+        .{ .lex = small_lex, .compact = false },
+        .{ .lex = compact_lex.items, .compact = true },
+        .{ .lex = compact_lex.items, .compact = false, .options = .{ .compact_features = false } },
+    };
+    for (cases) |case| {
+        const lex = case.lex;
         var raw_dict = try Dictionary.fromRawBytes(allocator, lex, matrix, char_def, unk);
         defer raw_dict.deinit();
-        const binary = try raw_dict.toBinaryAlloc(allocator);
+        const binary = try raw_dict.toBinaryAllocWithOptions(allocator, case.options);
         defer allocator.free(binary);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dict.dic", .data = binary });
         var path_buf: [128]u8 = undefined;
@@ -204,6 +219,9 @@ test "binary file loaders (mmap, copy, borrowed, count-only) agree" {
         try std.testing.expect(copied.mapped_file == null);
         var borrowed = try Dictionary.fromBorrowedBinaryBytes(allocator, binary);
         defer borrowed.deinit();
+        try std.testing.expectEqual(case.compact, mapped.features_compact);
+        try std.testing.expectEqual(case.compact, copied.features_compact);
+        try std.testing.expectEqual(case.compact, borrowed.features_compact);
         var count_only = try Dictionary.fromBinaryFile(allocator, path);
         defer count_only.deinit();
         count_only.discardFullTokenDataForCount();
@@ -224,6 +242,15 @@ test "binary file loaders (mmap, copy, borrowed, count-only) agree" {
             try expectSameTokens(expected, try copied_worker.tokenize(input));
             try expectSameTokens(expected, try borrowed_worker.tokenize(input));
             try std.testing.expectEqual(expected.len, try count_worker.tokenizeCount(input));
+            // Deferred features resolve to the same bytes after the input
+            // buffer is gone.
+            const scratch = try allocator.dupe(u8, input);
+            const deferred = try mapped_worker.tokenizeDeferred(scratch);
+            @memset(scratch, 0);
+            allocator.free(scratch);
+            try mapped_worker.resolveFeatures();
+            try mapped_worker.resolveFeatures();
+            try expectSameTokens(expected, deferred);
         }
 
         for ([_]usize{ 0, 8, binary.len / 2, binary.len - 1 }) |len| {
@@ -237,7 +264,7 @@ test "binary file loaders (mmap, copy, borrowed, count-only) agree" {
         // instead of being misread with the current layout.
         const legacy = try allocator.dupe(u8, binary);
         defer allocator.free(legacy);
-        for ([_][]const u8{ "DLRDIC01", "DLRDIC02" }) |magic| {
+        for ([_][]const u8{ "DLRDIC01", "DLRDIC02", "DLRDIC03" }) |magic| {
             @memcpy(legacy[0..magic.len], magic);
             try std.testing.expectError(error.UnsupportedDictionaryVersion, Dictionary.fromBinaryBytes(allocator, legacy));
             try std.testing.expectError(error.UnsupportedDictionaryVersion, Dictionary.fromBorrowedBinaryBytes(allocator, legacy));
@@ -331,4 +358,5 @@ test "worker shrink and retained-capacity limit keep results identical" {
 
 test {
     _ = dictionary;
+    _ = dictionary.feature_codec;
 }
