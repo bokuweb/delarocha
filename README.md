@@ -1,162 +1,109 @@
 # delarocha
 
 [![CI](https://github.com/bokuweb/delarocha/actions/workflows/ci.yml/badge.svg)](https://github.com/bokuweb/delarocha/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/delarocha.svg)](https://crates.io/crates/delarocha)
+[![docs.rs](https://docs.rs/delarocha/badge.svg)](https://docs.rs/delarocha)
 
-- runtime dictionary loader
-- `Tokenizer` / reusable `Worker`
-- AoS nodes
-- dense row-major connection matrix
-- minimal unknown word handling
-- C ABI for Rust bindings
-- `cargo bench` harness for comparison with Vibrato
+delarocha is a Japanese morphological analyzer (tokenizer) for Rust that
+reads MeCab-format system dictionaries such as IPADIC and produces
+MeCab/Vibrato-compatible segmentation. Its fast path is a Viterbi tokenizer
+core written in Zig, shipped as prebuilt static libraries behind the `zig-ffi`
+feature so you do not need Zig installed; dictionaries are compiled once into a
+binary file that loads in milliseconds through a read-only memory map. A
+dependency-light pure-Rust tokenizer is always available as a fallback, and
+precompiled Vibrato dictionaries can be loaded with the `vibrato-system`
+feature.
 
 ## Installation
 
 ```bash
-cargo add delarocha
+cargo add delarocha --features zig-ffi
 ```
 
-Optional features: `vibrato-system` (load precompiled Vibrato `system.dic` /
-`system.dic.zst`), `zig-ffi` (link the Zig tokenizer core; see
-[Rust Binding To Zig C ABI](#rust-binding-to-zig-c-abi)), and `wasm`.
+Features:
 
-## Dictionary Fixture
+- `zig-ffi`: link the Zig tokenizer core (`delarocha::ffi`). Recommended; see
+  [Supported targets](#supported-targets).
+- `vibrato-system`: load precompiled Vibrato `system.dic` / `system.dic.zst`.
+- `wasm`: `wasm-bindgen` bindings used by the browser playground.
 
-The Zig C ABI still accepts a deliberately small TSV fixture format:
+Without features, `cargo add delarocha` gives the pure-Rust tokenizer.
 
-```text
-matrix	<right_size>	<left_size>
-<row 0 i16 costs...>
-entry	<surface>	<left_id>	<right_id>	<word_cost>	<feature>
-```
+## Quick start
 
-The Rust binding now also accepts MeCab/Vibrato-style raw dictionary readers:
-
-- `lex.csv`
-- `matrix.def`
-- `char.def`
-- `unk.def`
-
-This matches the input shape of `vibrato::SystemDictionaryBuilder::from_readers` and is the current compatibility path for differential tests and the CLI.
-
-The `vibrato-system` feature can also load precompiled Vibrato dictionaries
-directly from `system.dic` or zstd-compressed `system.dic.zst`:
-
-```rust
-let tokenizer = delarocha::VibratoSystemDictionary::from_path("system.dic.zst")?
-    .into_tokenizer()
-    .ignore_space(true)?
-    .max_grouping_len(24);
-let tokens = tokenizer.tokenize("これはテストです。")?;
-```
-
-## Rust Tests
+delarocha reads the four raw MeCab dictionary files as UTF-8: `lex.csv` (all
+lexicon CSV files concatenated), `matrix.def`, `char.def`, and `unk.def`. For
+[mecab-ipadic](https://taku910.github.io/mecab/) (EUC-JP), prepare them once:
 
 ```bash
-cargo test
+mkdir -p dic
+cat mecab-ipadic-2.7.0-20070801/*.csv | iconv -f EUC-JP -t UTF-8 > dic/lex.csv
+for f in matrix.def char.def unk.def; do
+  iconv -f EUC-JP -t UTF-8 "mecab-ipadic-2.7.0-20070801/$f" > "dic/$f"
+done
 ```
 
-The CI workflow runs the Rust, Vibrato system dictionary, and Zig unit tests on
-Linux, macOS, and Windows. It also runs `zig-ffi` tests and compiles the
-Yokohama text benchmark on Linux and macOS; Windows currently exercises the
-pure Rust, `vibrato-system`, and Zig test suites while the MSVC Zig FFI link
-path is kept out of the matrix.
+The recommended fast path compiles the raw files into a binary dictionary once,
+then memory-maps it and tokenizes with a reusable worker, reading surfaces and
+features as borrowed views (no per-token allocation):
 
-## Fuzzing
+```rust,no_run
+use delarocha::ffi::ZigTokenizer;
 
-The repository has deterministic seeded fuzz-style tests that generate mixed
-Japanese, ASCII, whitespace, punctuation, and emoji inputs on every CI run:
+fn main() -> delarocha::Result<()> {
+    // Once (e.g. at build or deploy time): compile the raw MeCab files.
+    ZigTokenizer::write_binary_from_raw_paths(
+        "dic/lex.csv",
+        "dic/matrix.def",
+        "dic/char.def",
+        "dic/unk.def",
+        "ipadic.dic",
+    )?;
 
-- `bindings/rust/tests/fuzz_tokenizer.rs` verifies Rust tokenization does not
-  fail and that emitted token spans rebuild the original UTF-8 input.
-- `bindings/rust/tests/zig_ffi.rs` verifies Zig binary count-only tokenization
-  returns the same token count as full Zig tokenization for seeded random inputs.
+    // At startup: memory-map the binary dictionary (nothing is copied).
+    let tokenizer = ZigTokenizer::from_binary_path("ipadic.dic")?;
 
-Run them locally with:
-
-```bash
-cargo test -p delarocha
-cargo test -p delarocha --features zig-ffi
+    // Reuse one worker per thread; its buffers are recycled between calls.
+    let mut worker = tokenizer.create_worker()?;
+    for sentence in ["本とカレーの街", "東京都に住む"] {
+        for token in worker.tokenize_borrowed_views(sentence)?.iter() {
+            println!("{}\t{}", token.surface(), token.feature());
+        }
+    }
+    Ok(())
+}
 ```
 
-Stress them with more generated inputs by overriding the deterministic seed
-count and maximum generated input length:
+While delarocha is 0.x, rebuild `ipadic.dic` when upgrading to a new minor
+version (see [Binary dictionary compatibility](#binary-dictionary-compatibility)).
 
-```bash
-DELAROCHA_FUZZ_SEEDS=100000 DELAROCHA_FUZZ_MAX_LEN=256 cargo test -p delarocha --test fuzz_tokenizer
-DELAROCHA_FUZZ_SEEDS=100000 DELAROCHA_FUZZ_MAX_LEN=256 cargo test -p delarocha --features zig-ffi --test zig_ffi
+Without `zig-ffi`, the pure-Rust tokenizer reads the same raw files directly:
+
+```rust,no_run
+use std::fs::File;
+
+fn main() -> delarocha::Result<()> {
+    let dictionary = delarocha::SystemDictionaryBuilder::from_readers(
+        File::open("dic/lex.csv")?,
+        File::open("dic/matrix.def")?,
+        File::open("dic/char.def")?,
+        File::open("dic/unk.def")?,
+    )?;
+    let tokenizer = delarocha::Tokenizer::new(dictionary);
+    let mut worker = tokenizer.create_worker();
+    for token in worker.tokenize("本とカレーの街")? {
+        println!("{}\t{}", token.surface(), token.feature());
+    }
+    Ok(())
+}
 ```
 
-Coverage-guided fuzzing uses `cargo-fuzz` with libFuzzer. The `tokenize`
-target fuzzes valid UTF-8 input against token span and surface invariants, and
-the `dictionary` target fuzzes the compact dictionary parser for panic-free
-error handling.
+The pure-Rust path is roughly an order of magnitude slower than the Zig core
+and parses the raw dictionary on every start; use it where the Zig core is not
+available. To compare throughput with Vibrato on your own machine and text, see
+[Benchmarks](#benchmarks).
 
-```bash
-cargo install cargo-fuzz
-cargo +nightly fuzz run tokenize -- -max_total_time=30
-cargo +nightly fuzz run dictionary -- -max_total_time=30
-```
-
-## CLI
-
-```bash
-echo '本とカレー' | cargo run -p delarocha -- \
-  --lex fixtures/lex.csv \
-  --matrix fixtures/matrix.def \
-  --char fixtures/char.def \
-  --unk fixtures/unk.def \
-  -O wakati
-```
-
-MeCab-compatible space skipping and unknown grouping options are available:
-
-```bash
-cargo run -p delarocha -- --lex lex.csv --matrix matrix.def --char char.def --unk unk.def -S -M 24
-```
-
-## WebAssembly Playground
-
-The Rust tokenizer can be compiled to WebAssembly and used from a static
-browser playground. The playground downloads MeCab ipadic source data, converts
-it to UTF-8, and serves gzip-compressed dictionary assets next to the static UI:
-
-```bash
-rustup target add wasm32-unknown-unknown
-cargo install -f wasm-bindgen-cli --version 0.2.120
-cargo build -p delarocha --lib --target wasm32-unknown-unknown --features wasm --release
-mkdir -p public/pkg
-cp -R playground/. public/
-python3 scripts/prepare_ipadic_playground.py --out-dir public/dic
-wasm-bindgen \
-  --target web \
-  --out-dir public/pkg \
-  --out-name delarocha \
-  target/wasm32-unknown-unknown/release/delarocha.wasm
-python3 -m http.server 4173 --directory public
-```
-
-Pushes to `main` build the same artifact and deploy it to GitHub Pages.
-
-## Zig Tests
-
-Requires Zig on `PATH`.
-
-```bash
-cd zig
-zig build test
-```
-
-## Zig Core Benchmark
-
-The pure Zig microbenchmark measures tokenizer core time without Rust/C ABI overhead.
-
-```bash
-cd zig
-zig build bench -Doptimize=ReleaseFast
-```
-
-## Rust Binding To Zig C ABI
+## Supported targets
 
 The `zig-ffi` feature links a prebuilt static Zig library for common Rust
 targets, so downstream crates can use the Rust crate without installing Zig.
@@ -173,13 +120,31 @@ The bundled targets are:
 The WASM artifact is built with Zig's `ReleaseSmall` optimization mode to keep
 the download size low. Native artifacts continue to use `ReleaseFast`.
 
-Set `DELAROCHA_BUILD_ZIG=1` to rebuild the static library from
-`zig/src/lib.zig`. Unsupported targets also fall back to building from Zig
-sources, so those environments still need Zig installed.
+Other targets cannot use `zig-ffi` from the crates.io package, because it does
+not contain the Zig sources. Either use the pure-Rust tokenizer, or depend on a
+[repository checkout](https://github.com/bokuweb/delarocha) (for example a git
+dependency) with Zig 0.16 on `PATH`: unsupported targets then build the static
+library from `zig/src/lib.zig`. Set `DELAROCHA_BUILD_ZIG=1` to rebuild it from
+source even for bundled targets.
 
-```bash
-cargo test -p delarocha --features zig-ffi
-```
+## Binary dictionary compatibility
+
+While delarocha is at 0.x, the binary dictionary format written by
+`ZigTokenizer::write_binary_from_raw_paths` may change between minor versions
+(0.1 to 0.2, for example); patch releases keep it. The current format is
+version 4 (magic `DLRDIC04`). A file written by another format version is
+rejected at load time with `Error::UnsupportedDictionaryVersion` (Zig:
+`error.UnsupportedDictionaryVersion`) and must be rebuilt from the raw MeCab
+dictionary files, so keep the raw files, or rebuild the binary dictionary as
+part of your build or deployment, rather than shipping only the `.dic` file.
+Rebuilding the same raw files with the same delarocha version produces
+byte-identical output.
+
+## Zig tokenizer
+
+The Zig core lives in `delarocha::ffi` (feature `zig-ffi`). `ZigTokenizer`
+loads a dictionary (binary, raw MeCab files, or the TSV fixture format) and is
+shared read-only; each thread creates its own `ZigWorker`.
 
 Binary dictionaries loaded from a path (`ZigTokenizer::from_binary_path`,
 `ZigTokenizer::count_only_from_binary_path`, and Zig's
@@ -270,7 +235,148 @@ Zig they are `Worker.retainedBytes`, `Worker.shrinkTo` / `Worker.shrink`, and
 `delarocha_worker_retained_bytes`, `delarocha_worker_shrink_to`, and
 `delarocha_worker_set_retained_limit` (`SIZE_MAX` removes the limit).
 
-## Benchmarks
+## Precompiled Vibrato dictionaries
+
+The `vibrato-system` feature loads precompiled Vibrato dictionaries
+directly from `system.dic` or zstd-compressed `system.dic.zst`:
+
+```rust
+let tokenizer = delarocha::VibratoSystemDictionary::from_path("system.dic.zst")?
+    .into_tokenizer()
+    .ignore_space(true)?
+    .max_grouping_len(24);
+let tokens = tokenizer.tokenize("これはテストです。")?;
+```
+
+## Development
+
+The sections below are for working on delarocha itself from a repository
+checkout.
+
+### Implementation overview
+
+- runtime dictionary loader
+- `Tokenizer` / reusable `Worker`
+- AoS nodes
+- dense row-major connection matrix
+- minimal unknown word handling
+- C ABI for Rust bindings
+- `cargo bench` harness for comparison with Vibrato
+
+### Dictionary fixture
+
+The Zig C ABI still accepts a deliberately small TSV fixture format:
+
+```text
+matrix	<right_size>	<left_size>
+<row 0 i16 costs...>
+entry	<surface>	<left_id>	<right_id>	<word_cost>	<feature>
+```
+
+The Rust binding now also accepts MeCab/Vibrato-style raw dictionary readers:
+
+- `lex.csv`
+- `matrix.def`
+- `char.def`
+- `unk.def`
+
+This matches the input shape of `vibrato::SystemDictionaryBuilder::from_readers` and is the current compatibility path for differential tests and the CLI.
+
+### Rust Tests
+
+```bash
+cargo test
+```
+
+The CI workflow runs the Rust, Vibrato system dictionary, and Zig unit tests on
+Linux, macOS, and Windows. It also runs `zig-ffi` tests and compiles the
+Yokohama text benchmark on Linux and macOS; Windows currently exercises the
+pure Rust, `vibrato-system`, and Zig test suites while the MSVC Zig FFI link
+path is kept out of the matrix.
+
+### Fuzzing
+
+The repository has deterministic seeded fuzz-style tests that generate mixed
+Japanese, ASCII, whitespace, punctuation, and emoji inputs on every CI run:
+
+- `bindings/rust/tests/fuzz_tokenizer.rs` verifies Rust tokenization does not
+  fail and that emitted token spans rebuild the original UTF-8 input.
+- `bindings/rust/tests/zig_ffi.rs` verifies Zig binary count-only tokenization
+  returns the same token count as full Zig tokenization for seeded random inputs.
+
+Run them locally with:
+
+```bash
+cargo test -p delarocha
+cargo test -p delarocha --features zig-ffi
+```
+
+Stress them with more generated inputs by overriding the deterministic seed
+count and maximum generated input length:
+
+```bash
+DELAROCHA_FUZZ_SEEDS=100000 DELAROCHA_FUZZ_MAX_LEN=256 cargo test -p delarocha --test fuzz_tokenizer
+DELAROCHA_FUZZ_SEEDS=100000 DELAROCHA_FUZZ_MAX_LEN=256 cargo test -p delarocha --features zig-ffi --test zig_ffi
+```
+
+Coverage-guided fuzzing uses `cargo-fuzz` with libFuzzer. The `tokenize`
+target fuzzes valid UTF-8 input against token span and surface invariants, and
+the `dictionary` target fuzzes the compact dictionary parser for panic-free
+error handling.
+
+```bash
+cargo install cargo-fuzz
+cargo +nightly fuzz run tokenize -- -max_total_time=30
+cargo +nightly fuzz run dictionary -- -max_total_time=30
+```
+
+### CLI
+
+```bash
+echo '本とカレー' | cargo run -p delarocha -- \
+  --lex fixtures/lex.csv \
+  --matrix fixtures/matrix.def \
+  --char fixtures/char.def \
+  --unk fixtures/unk.def \
+  -O wakati
+```
+
+MeCab-compatible space skipping and unknown grouping options are available:
+
+```bash
+cargo run -p delarocha -- --lex lex.csv --matrix matrix.def --char char.def --unk unk.def -S -M 24
+```
+
+### Zig Tests
+
+Requires Zig on `PATH`.
+
+```bash
+cd zig
+zig build test
+```
+
+### Zig Core Benchmark
+
+The pure Zig microbenchmark measures tokenizer core time without Rust/C ABI overhead.
+
+```bash
+cd zig
+zig build bench -Doptimize=ReleaseFast
+```
+
+### Zig FFI tests and prebuilt libraries
+
+```bash
+cargo test -p delarocha --features zig-ffi
+```
+
+To regenerate the checked-in libraries after changing the Zig sources, run
+`scripts/build_prebuilt.sh` (on macOS, so the Darwin archives can be repacked
+with 8-byte aligned members); see
+[bindings/rust/prebuilt/README.md](https://github.com/bokuweb/delarocha/blob/main/bindings/rust/prebuilt/README.md).
+
+### Benchmarks
 
 Run the baseline benchmark:
 
@@ -298,7 +404,7 @@ VIBRATO_SYSTEM_DIC="$PWD/target/vibrato-dic/ipadic-mecab-2_7_0/system.dic.zst" \
 
 The Vibrato project and dictionary release information are available at <https://github.com/daac-tools/vibrato>.
 
-### Vibrato-Style Benchmark
+#### Vibrato-Style Benchmark
 
 The `vibrato_style_benchmark` example mirrors the benchmark runner used by
 `daac-tools/vibrato`: it reads newline-separated sentences from stdin, runs
@@ -322,7 +428,7 @@ comparison with Vibrato, whose worker tokens also borrow the sentence and the
 dictionary instead of allocating strings. Add `--owned` (`--full --owned`) to
 measure the owned `Vec<Token>` API, which allocates two strings per token.
 
-### Yokohama Ordinance Text Benchmark
+#### Yokohama Ordinance Text Benchmark
 
 To reproduce the long-text comparison used for the Yokohama City tax ordinance, download the HTML, extract normalized visible text, and run the dedicated example:
 
@@ -344,7 +450,7 @@ VIBRATO_SYSTEM_DIC=/path/to/system.dic.zst \
 
 The example prints per-iteration wall-clock time and token count for `delarocha/binary-count-only`, `delarocha/raw-count-only`, and `vibrato/system-dic` on the same extracted text.
 
-## Memory Comparison
+### Memory Comparison
 
 The Rust example below reports RSS after dictionary load and after repeated tokenization for the fixture dictionary.
 
@@ -365,7 +471,30 @@ VIBRATO_SYSTEM_DIC=/path/to/system.dic.zst \
   cargo run -p delarocha --release --features 'zig-ffi vibrato-bench' --example memory -- vibrato-system
 ```
 
+### WebAssembly Playground
+
+The Rust tokenizer can be compiled to WebAssembly and used from a static
+browser playground. The playground downloads MeCab ipadic source data, converts
+it to UTF-8, and serves gzip-compressed dictionary assets next to the static UI:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install -f wasm-bindgen-cli --version 0.2.120
+cargo build -p delarocha --lib --target wasm32-unknown-unknown --features wasm --release
+mkdir -p public/pkg
+cp -R playground/. public/
+python3 scripts/prepare_ipadic_playground.py --out-dir public/dic
+wasm-bindgen \
+  --target web \
+  --out-dir public/pkg \
+  --out-name delarocha \
+  target/wasm32-unknown-unknown/release/delarocha.wasm
+python3 -m http.server 4173 --directory public
+```
+
+Pushes to `main` build the same artifact and deploy it to GitHub Pages.
+
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option.
+Licensed under either of [Apache License, Version 2.0](https://github.com/bokuweb/delarocha/blob/main/LICENSE-APACHE) or
+[MIT license](https://github.com/bokuweb/delarocha/blob/main/LICENSE-MIT) at your option.

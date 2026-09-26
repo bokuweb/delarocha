@@ -47,4 +47,5 @@ name = "tokenize"
 harness = false
 
 [package.metadata.docs.rs]
-features = ["vibrato-system"]
+features = ["vibrato-system", "zig-ffi"]
+rustdoc-args = ["--cfg", "docsrs"]
