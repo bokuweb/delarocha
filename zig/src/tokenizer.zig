@@ -127,6 +127,9 @@ pub const Worker = struct {
     count_end_heads: std.ArrayList(u32),
     tokens: std.ArrayList(Token),
     group_cache: ?GroupCache,
+    /// Optional cap on the capacity the worker keeps between calls; see
+    /// `setRetainedCapacityLimit`. `null` (the default) never trims.
+    retained_capacity_limit: ?usize = null,
 
     pub fn init(allocator: Allocator, dictionary: *const dict_mod.Dictionary, max_grouping_len: ?usize) Worker {
         return .{
@@ -157,6 +160,7 @@ pub const Worker = struct {
         }
         const best = try self.buildBestPath(input);
         try self.backtrace(input, best);
+        if (self.retained_capacity_limit) |limit| if (self.retainedBytes() > limit) self.trimAfterCall(limit, true);
         return self.tokens.items;
     }
 
@@ -166,7 +170,9 @@ pub const Worker = struct {
             return 0;
         }
         const best = try self.buildBestCountPath(input);
-        return self.count_nodes.items[best].token_count;
+        const count = self.count_nodes.items[best].token_count;
+        if (self.retained_capacity_limit) |limit| if (self.retainedBytes() > limit) self.trimAfterCall(limit, false);
+        return count;
     }
 
     pub fn tokenizeCountAssumeValid(self: *Worker, input: []const u8) usize {
@@ -180,7 +186,79 @@ pub const Worker = struct {
             return 0;
         }
         const best = self.buildBestCountPath(input) catch unreachable;
-        return self.count_nodes.items[best].token_count;
+        const count = self.count_nodes.items[best].token_count;
+        if (self.retained_capacity_limit) |limit| if (self.retainedBytes() > limit) self.trimAfterCall(limit, false);
+        return count;
+    }
+
+    /// Bytes of buffer capacity the worker currently holds: the full and
+    /// count-only lattices plus the token buffer. Tokenizing grows these to
+    /// fit the largest input seen so far (roughly 60 bytes per input byte for
+    /// `tokenize` and 32 for `tokenizeCount` on IPADIC) and keeps them for
+    /// reuse; see `shrinkTo` and `setRetainedCapacityLimit`.
+    pub fn retainedBytes(self: *const Worker) usize {
+        return self.nodes.capacity * @sizeOf(Node) +
+            self.end_heads.capacity * @sizeOf(u32) +
+            self.count_nodes.capacity * @sizeOf(CountNode) +
+            self.count_end_heads.capacity * @sizeOf(u32) +
+            self.tokens.capacity * @sizeOf(Token);
+    }
+
+    /// Releases every retained buffer. Equivalent to `shrinkTo(0)`.
+    pub fn shrink(self: *Worker) void {
+        self.shrinkTo(0);
+    }
+
+    /// Frees retained buffers, largest first, until `retainedBytes()` is at
+    /// most `max_bytes`. The token slice returned by the last `tokenize` call
+    /// is invalidated. Later calls regrow the buffers on demand and produce
+    /// the same results.
+    pub fn shrinkTo(self: *Worker, max_bytes: usize) void {
+        self.releaseLargestUntil(max_bytes, true);
+    }
+
+    /// Caps the capacity kept between calls. When set, a call that leaves
+    /// more than `limit` bytes retained releases the lattice buffers (largest
+    /// first) before returning, so one huge input does not pin its lattice for
+    /// the worker lifetime. The token buffer backing a `tokenize` result is
+    /// never freed by this; if it alone is over the limit it is shrunk to the
+    /// result's length (and trimmed further once a later call replaces it).
+    /// `null` disables the cap. Inputs below the limit never trim, so
+    /// steady-state reuse on small inputs is unaffected.
+    pub fn setRetainedCapacityLimit(self: *Worker, limit: ?usize) void {
+        self.retained_capacity_limit = limit;
+        if (limit) |max_bytes| self.trimAfterCall(max_bytes, true);
+    }
+
+    noinline fn trimAfterCall(self: *Worker, limit: usize, shrink_tokens: bool) void {
+        self.releaseLargestUntil(limit, false);
+        if (shrink_tokens and self.retainedBytes() > limit) {
+            // The token buffer holds the result being returned: shrink it to
+            // the result instead of freeing it.
+            self.tokens.shrinkAndFree(self.allocator, self.tokens.items.len);
+        }
+    }
+
+    fn releaseLargestUntil(self: *Worker, max_bytes: usize, include_tokens: bool) void {
+        while (self.retainedBytes() > max_bytes) {
+            const sizes = [_]usize{
+                self.nodes.capacity * @sizeOf(Node),
+                self.end_heads.capacity * @sizeOf(u32),
+                self.count_nodes.capacity * @sizeOf(CountNode),
+                self.count_end_heads.capacity * @sizeOf(u32),
+                if (include_tokens) self.tokens.capacity * @sizeOf(Token) else 0,
+            };
+            const largest = std.mem.indexOfMax(usize, &sizes);
+            if (sizes[largest] == 0) return;
+            switch (largest) {
+                0 => self.nodes.clearAndFree(self.allocator),
+                1 => self.end_heads.clearAndFree(self.allocator),
+                2 => self.count_nodes.clearAndFree(self.allocator),
+                3 => self.count_end_heads.clearAndFree(self.allocator),
+                else => self.tokens.clearAndFree(self.allocator),
+            }
+        }
+        self.group_cache = null;
     }
 
     fn buildBestPath(self: *Worker, input: []const u8) !u32 {

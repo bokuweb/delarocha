@@ -24,6 +24,9 @@ comptime {
     _ = ffi.delarocha_tokenizer_free;
     _ = ffi.delarocha_worker_new;
     _ = ffi.delarocha_worker_free;
+    _ = ffi.delarocha_worker_retained_bytes;
+    _ = ffi.delarocha_worker_shrink_to;
+    _ = ffi.delarocha_worker_set_retained_limit;
     _ = ffi.delarocha_tokenize;
     _ = ffi.delarocha_tokenize_bytes;
     _ = ffi.delarocha_tokenize_count_bytes;
@@ -242,6 +245,88 @@ test "binary file loaders (mmap, copy, borrowed, count-only) agree" {
             try std.testing.expectError(error.UnsupportedDictionaryVersion, Dictionary.fromBinaryFile(allocator, path));
         }
     }
+}
+
+test "raw lexicon entries share one string blob and keep verbatim features" {
+    const allocator = std.testing.allocator;
+    const lex = "本,0,0,10,noun,book,*\r\n\n  と,0,0,1\nカレー,0,0,10,,\n";
+    // The matrix must hold IPADIC's connection id 5 for the U+2015
+    // compatibility entry to be added.
+    const matrix_6x6 = "6 6\n0 0 0\n";
+    var dict = try Dictionary.fromRawBytes(allocator, lex, matrix_6x6, "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n");
+    defer dict.deinit();
+    // Three lexicon rows plus the U+2015 compatibility entry.
+    try std.testing.expectEqual(@as(usize, 4), dict.entries.len);
+    const expected = [_][2][]const u8{
+        .{ "本", "noun,book,*" },
+        .{ "と", "" },
+        .{ "カレー", "," },
+        .{ "―", "記号,一般,*,*,*,*,―,―,―" },
+    };
+    const blob_start = @intFromPtr(dict.entry_blob.ptr);
+    for (dict.entries, expected) |entry, want| {
+        try std.testing.expectEqualStrings(want[0], entry.surface);
+        try std.testing.expectEqualStrings(want[1], entry.feature);
+        for ([_][]const u8{ entry.surface, entry.feature }) |text| {
+            try std.testing.expect(@intFromPtr(text.ptr) >= blob_start);
+            try std.testing.expect(@intFromPtr(text.ptr) + text.len <= blob_start + dict.entry_blob.len);
+        }
+    }
+    try std.testing.expectError(error.InvalidDictionary, Dictionary.fromRawBytes(allocator, "本,0,0\n", "1 1\n0 0 0\n", "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n"));
+    try std.testing.expectError(error.InvalidCharacter, Dictionary.fromRawBytes(allocator, "本,0,x,1,f\n", "1 1\n0 0 0\n", "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n"));
+
+    var count_only = try Dictionary.fromRawBytes(allocator, lex, matrix_6x6, "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n");
+    defer count_only.deinit();
+    count_only.discardFullTokenDataForCount();
+}
+
+test "worker shrink and retained-capacity limit keep results identical" {
+    const allocator = std.testing.allocator;
+    var dict = try Dictionary.parseMinimal(allocator, minimal_dict);
+    defer dict.deinit();
+
+    var long_input: std.ArrayList(u8) = .empty;
+    defer long_input.deinit(allocator);
+    for (0..512) |_| try long_input.appendSlice(allocator, "本とカレーX🍛");
+    const inputs = [_][]const u8{ long_input.items, "本とカレー", "本X🍛", "", long_input.items[0..60] };
+
+    var reference = Worker.init(allocator, &dict, null);
+    defer reference.deinit();
+    var shrinking = Worker.init(allocator, &dict, null);
+    defer shrinking.deinit();
+    var capped = Worker.init(allocator, &dict, null);
+    defer capped.deinit();
+    const limit: usize = 4096;
+    capped.setRetainedCapacityLimit(limit);
+
+    for (0..2) |_| {
+        for (inputs) |input| {
+            const expected_count = try reference.tokenizeCount(input);
+            const expected = try reference.tokenize(input);
+
+            try expectSameTokens(expected, try shrinking.tokenize(input));
+            try std.testing.expectEqual(expected_count, try shrinking.tokenizeCount(input));
+            try std.testing.expect(shrinking.retainedBytes() > 0 or input.len == 0);
+            shrinking.shrinkTo(limit);
+            try std.testing.expect(shrinking.retainedBytes() <= limit);
+            try std.testing.expectEqual(expected_count, try shrinking.tokenizeCount(input));
+            try expectSameTokens(expected, try shrinking.tokenize(input));
+            shrinking.shrink();
+            try std.testing.expectEqual(@as(usize, 0), shrinking.retainedBytes());
+
+            const capped_tokens = try capped.tokenize(input);
+            try expectSameTokens(expected, capped_tokens);
+            // Only the returned token buffer may exceed the cap, and only by
+            // what the result itself needs.
+            try std.testing.expect(capped.retainedBytes() <= @max(limit, capped_tokens.len * @sizeOf(Token)));
+            try std.testing.expectEqual(expected_count, try capped.tokenizeCount(input));
+        }
+    }
+    // Small inputs stay below the cap and keep their buffers for reuse.
+    _ = try capped.tokenize("本とカレー");
+    _ = try capped.tokenizeCount("本とカレー");
+    try std.testing.expect(capped.retainedBytes() > 0);
+    try std.testing.expect(capped.retainedBytes() <= limit);
 }
 
 test {

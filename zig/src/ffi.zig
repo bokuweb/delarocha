@@ -229,6 +229,28 @@ pub export fn delarocha_worker_free(worker: ?*Worker) void {
     }
 }
 
+/// Bytes of lattice/token buffer capacity the worker holds (see
+/// `Worker.retainedBytes`). Returns 0 for a null worker.
+pub export fn delarocha_worker_retained_bytes(worker: ?*const Worker) usize {
+    return if (worker) |ptr| ptr.retainedBytes() else 0;
+}
+
+/// Frees the worker's retained buffers, largest first, until at most
+/// `max_bytes` remain, and returns the bytes still retained. Token data from
+/// the previous tokenize call is invalidated. Pass 0 to release everything.
+pub export fn delarocha_worker_shrink_to(worker: ?*Worker, max_bytes: usize) usize {
+    const ptr = worker orelse return 0;
+    ptr.shrinkTo(max_bytes);
+    return ptr.retainedBytes();
+}
+
+/// Sets the worker's retained-capacity cap (see
+/// `Worker.setRetainedCapacityLimit`); `SIZE_MAX` removes the cap.
+pub export fn delarocha_worker_set_retained_limit(worker: ?*Worker, max_bytes: usize) void {
+    const ptr = worker orelse return;
+    ptr.setRetainedCapacityLimit(if (max_bytes == std.math.maxInt(usize)) null else max_bytes);
+}
+
 pub export fn delarocha_tokenize(worker: ?*Worker, input: [*:0]const u8) i32 {
     return tokenizeSlice(worker, std.mem.span(input));
 }
