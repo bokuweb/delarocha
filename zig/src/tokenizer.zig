@@ -786,12 +786,17 @@ pub const Worker = struct {
         }
         const index = self.count_nodes.items.len;
         if (index > std.math.maxInt(u32)) unreachable;
-        self.appendCountNode(.{
-            .right_id = right_id,
-            .min_cost = best.cost,
-            .token_count = token_count,
-            .next_end = self.count_end_heads.items[end],
-        }) catch unreachable;
+        // Grow out of line, then store the fields straight into the lattice
+        // slot. Passing a node value to an append that may grow made the
+        // compiler build it on the stack with narrow stores and copy it with
+        // one 16-byte load, which cannot be store-forwarded and stalled every
+        // count-lattice append.
+        if (index >= self.count_nodes.capacity) self.count_nodes.ensureUnusedCapacity(self.allocator, 1) catch unreachable;
+        const node = self.count_nodes.addOneAssumeCapacity();
+        node.right_id = right_id;
+        node.min_cost = best.cost;
+        node.token_count = token_count;
+        node.next_end = self.count_end_heads.items[end];
         self.count_end_heads.items[end] = @intCast(index);
     }
 
