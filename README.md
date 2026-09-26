@@ -218,6 +218,30 @@ place, so a sentence loop stops allocating once the buffers warm up.
 Feature strings are checked for UTF-8 once per dictionary word id per worker
 and memoized, rather than on every emitted token.
 
+### Worker memory
+
+Workers keep their lattice and token buffers between calls so steady-state
+tokenization does not allocate. They grow to fit the largest input seen, about
+60 bytes per input byte for full tokenization and 32 for count-only on IPADIC
+(a 659 KB document leaves roughly 39 MB / 20 MB behind). To give that back:
+
+- `retained_bytes()` reports the capacity currently held.
+- `shrink_to(max_bytes)` frees buffers (largest first) until at most
+  `max_bytes` remain; `shrink_to_fit()` frees everything. Later calls regrow
+  what they need and return identical tokens.
+- `set_retained_capacity_limit(Some(max_bytes))` trims automatically after any
+  call that leaves more than `max_bytes` retained. Calls whose buffers stay
+  below the limit never trim, so small-sentence loops keep reusing their
+  buffers. The buffer holding the tokens just returned is kept (shrunk to the
+  result) until a later call replaces it.
+
+These exist on `ZigWorker` (native lattice, Rust-side token metadata, parked
+`tokenize_into` tokens, and the UTF-8 memo) and on the pure-Rust `Worker`. In
+Zig they are `Worker.retainedBytes`, `Worker.shrinkTo` / `Worker.shrink`, and
+`Worker.setRetainedCapacityLimit`; the C ABI exports
+`delarocha_worker_retained_bytes`, `delarocha_worker_shrink_to`, and
+`delarocha_worker_set_retained_limit` (`SIZE_MAX` removes the limit).
+
 ## Benchmarks
 
 Run the baseline benchmark:

@@ -275,3 +275,64 @@ fn long_input_keeps_byte_and_char_offsets_consistent() {
     assert_eq!(byte, input.len());
     assert_eq!(chars, input.chars().count());
 }
+
+#[test]
+fn worker_shrink_and_retained_limit_keep_results_identical() {
+    let fixture_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/vibrato");
+    let open = |name: &str| std::fs::File::open(fixture_dir.join(name)).expect("fixture exists");
+    let dictionary = SystemDictionaryBuilder::from_readers(
+        open("lex.csv"),
+        open("matrix.def"),
+        open("char.def"),
+        open("unk.def"),
+    )
+    .expect("fixture dictionary builds");
+    let tokenizer = Tokenizer::new(dictionary);
+
+    let unit = "京都東京都に行った。 アイウエオ本とカレー🍛 abc 123\n";
+    let long = unit.repeat(512);
+    let inputs = [
+        long.as_str(),
+        unit,
+        "",
+        "本とカレー",
+        &long[..unit.len() * 3],
+    ];
+    let limit = 16 * 1024;
+
+    let mut reference = tokenizer.create_worker();
+    let mut shrinking = tokenizer.create_worker();
+    let mut capped = tokenizer.create_worker();
+    capped.set_retained_capacity_limit(Some(limit));
+    for _ in 0..2 {
+        for input in inputs {
+            let expected = reference.tokenize(input).expect("tokenize").to_vec();
+            let expected_count = reference.tokenize_count(input).expect("count");
+
+            assert_eq!(shrinking.tokenize(input).expect("tokenize"), expected);
+            assert_eq!(
+                shrinking.tokenize_count(input).expect("count"),
+                expected_count
+            );
+            shrinking.shrink_to(limit);
+            assert!(shrinking.retained_bytes() <= limit);
+            assert_eq!(shrinking.tokenize(input).expect("tokenize"), expected);
+            shrinking.shrink_to_fit();
+            assert_eq!(shrinking.retained_bytes(), 0);
+            assert_eq!(
+                shrinking.tokenize_count(input).expect("count"),
+                expected_count
+            );
+
+            let capped_tokens = capped.tokenize(input).expect("tokenize").to_vec();
+            assert_eq!(capped_tokens, expected);
+            // Only the vector holding the returned tokens may exceed the cap.
+            let token_bytes = capped_tokens.len() * std::mem::size_of::<delarocha::Token>();
+            assert!(capped.retained_bytes() <= limit.max(token_bytes));
+            assert_eq!(capped.tokenize_count(input).expect("count"), expected_count);
+        }
+    }
+    let _ = capped.tokenize(unit).expect("tokenize");
+    assert!(capped.retained_bytes() > 0 && capped.retained_bytes() <= limit);
+}

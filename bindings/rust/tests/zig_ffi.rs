@@ -432,6 +432,77 @@ fn zig_ffi_borrowed_views_match_owned_tokens() {
 }
 
 #[test]
+fn zig_ffi_worker_shrink_and_retained_limit_keep_results_identical() {
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let tokenizer = ZigTokenizer::from_raw_paths(
+        fixture_dir.join("lex.csv"),
+        fixture_dir.join("matrix.def"),
+        fixture_dir.join("char.def"),
+        fixture_dir.join("unk.def"),
+    )
+    .expect("Zig tokenizer loads raw fixture");
+    let unit = "本とカレー 本\0カレー🍛 abc カレー本と\n";
+    let long = unit.repeat(512);
+    let inputs = [
+        long.as_str(),
+        unit,
+        "",
+        "本とカレー",
+        &long[..unit.len() * 3],
+    ];
+    let limit = 16 * 1024;
+
+    let mut reference = tokenizer.create_worker().expect("Zig worker is created");
+    let mut shrinking = tokenizer.create_worker().expect("Zig worker is created");
+    let mut capped = tokenizer.create_worker().expect("Zig worker is created");
+    capped.set_retained_capacity_limit(Some(limit));
+    let mut reused = Vec::new();
+    for _ in 0..2 {
+        for input in inputs {
+            let expected = reference.tokenize(input).expect("tokenize");
+            let expected_count = reference.tokenize_count(input).expect("count");
+
+            assert_eq!(shrinking.tokenize(input).expect("tokenize"), expected);
+            shrinking
+                .tokenize_into(input, &mut reused)
+                .expect("tokenize_into");
+            assert_eq!(reused, expected);
+            reused.clear();
+            assert_eq!(
+                shrinking.tokenize_count(input).expect("count"),
+                expected_count
+            );
+            assert!(shrinking.retained_bytes() > 0);
+            shrinking.shrink_to(limit);
+            assert!(shrinking.retained_bytes() <= limit);
+            let views: Vec<delarocha::Token> = shrinking
+                .tokenize_views(input)
+                .expect("views")
+                .into_iter()
+                .map(Into::into)
+                .collect();
+            assert_eq!(views, expected);
+            shrinking.shrink_to_fit();
+            assert_eq!(shrinking.retained_bytes(), 0);
+            assert_eq!(
+                shrinking.tokenize_count(input).expect("count"),
+                expected_count
+            );
+            assert_eq!(shrinking.tokenize(input).expect("tokenize"), expected);
+
+            assert_eq!(capped.tokenize(input).expect("tokenize"), expected);
+            assert_eq!(capped.tokenize_count(input).expect("count"), expected_count);
+            let spans = capped.tokenize_spans(input).expect("spans");
+            assert_eq!(spans.len(), expected.len());
+            // Each part stays within the cap, except that the native token
+            // buffer may keep what the last result itself needs.
+            let bound = 2 * limit + expected.len() * 64 + 4096;
+            assert!(capped.retained_bytes() <= bound);
+        }
+    }
+}
+
+#[test]
 fn zig_ffi_invalid_utf8_feature_is_empty_on_every_path() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
     let temp_dir = tempfile::tempdir().expect("create temp dir");

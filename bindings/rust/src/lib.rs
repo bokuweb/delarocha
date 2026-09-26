@@ -728,6 +728,7 @@ impl Tokenizer {
             tokens: Vec::new(),
             unknown_group_cache: None,
             matches: Vec::new(),
+            retained_capacity_limit: None,
             _dictionary_lifetime: PhantomData,
         }
     }
@@ -1037,6 +1038,7 @@ pub struct Worker<'dict> {
     tokens: Vec<Token>,
     unknown_group_cache: Option<UnknownGroupCache>,
     matches: Vec<u32>,
+    retained_capacity_limit: Option<usize>,
     _dictionary_lifetime: PhantomData<&'dict Dictionary>,
 }
 
@@ -1081,6 +1083,9 @@ impl<'dict> Worker<'dict> {
             return Ok(&self.tokens);
         };
         self.backtrace(input, best)?;
+        if let Some(limit) = self.retained_capacity_limit {
+            self.trim_scratch(limit);
+        }
         Ok(&self.tokens)
     }
 
@@ -1088,7 +1093,101 @@ impl<'dict> Worker<'dict> {
         let Some(best) = self.build_best_path(input)? else {
             return Ok(0);
         };
-        Ok(self.count_path(best))
+        let count = self.count_path(best);
+        if let Some(limit) = self.retained_capacity_limit {
+            self.trim_scratch(limit);
+        }
+        Ok(count)
+    }
+
+    /// Bytes of buffer capacity the worker keeps for reuse: the lattice,
+    /// the per-position link heads, dictionary match scratch, and the token
+    /// vector itself (not the strings owned by the current tokens). These grow
+    /// to fit the largest input seen so far.
+    pub fn retained_bytes(&self) -> usize {
+        self.scratch_sizes().iter().sum::<usize>()
+            + self.tokens.capacity() * std::mem::size_of::<Token>()
+    }
+
+    /// Releases every retained buffer, including the tokens returned by the
+    /// last [`Self::tokenize`] call. Later calls regrow the buffers on demand
+    /// and produce identical results.
+    pub fn shrink_to_fit(&mut self) {
+        self.shrink_to(0);
+    }
+
+    /// Frees retained buffers, largest first, until [`Self::retained_bytes`]
+    /// is at most `max_bytes`. May drop the tokens returned by the last
+    /// [`Self::tokenize`] call.
+    pub fn shrink_to(&mut self, max_bytes: usize) {
+        while self.retained_bytes() > max_bytes {
+            let token_bytes = self.tokens.capacity() * std::mem::size_of::<Token>();
+            let scratch = self.scratch_sizes();
+            let (largest, &size) = scratch
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, size)| *size)
+                .expect("scratch buffers");
+            if token_bytes >= size {
+                self.tokens = Vec::new();
+            } else {
+                self.release_scratch(largest);
+            }
+        }
+    }
+
+    /// Caps the buffer capacity kept between calls. When set, a call that
+    /// leaves more than `limit` bytes retained releases lattice buffers
+    /// (largest first) before returning, so one huge input does not pin its
+    /// lattice for the worker lifetime. The token vector holding the returned
+    /// tokens is kept (its excess capacity is released). `None` (the default)
+    /// disables the cap; inputs below the cap never trim.
+    pub fn set_retained_capacity_limit(&mut self, limit: Option<usize>) {
+        self.retained_capacity_limit = limit;
+        if let Some(limit) = limit {
+            self.trim_scratch(limit);
+        }
+    }
+
+    fn scratch_sizes(&self) -> [usize; 4] {
+        [
+            self.nodes.capacity() * std::mem::size_of::<Node>(),
+            self.ends.capacity() * std::mem::size_of::<u32>(),
+            self.end_links.capacity() * std::mem::size_of::<EndLink>(),
+            self.matches.capacity() * std::mem::size_of::<u32>(),
+        ]
+    }
+
+    fn release_scratch(&mut self, index: usize) {
+        match index {
+            0 => self.nodes = Vec::new(),
+            1 => self.ends = Vec::new(),
+            2 => self.end_links = Vec::new(),
+            _ => self.matches = Vec::new(),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn trim_scratch(&mut self, limit: usize) {
+        if self.retained_bytes() <= limit {
+            return;
+        }
+        loop {
+            let scratch = self.scratch_sizes();
+            let (largest, &size) = scratch
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, size)| *size)
+                .expect("scratch buffers");
+            if size == 0 || self.retained_bytes() <= limit {
+                break;
+            }
+            self.release_scratch(largest);
+        }
+        if self.retained_bytes() > limit {
+            self.tokens.shrink_to_fit();
+        }
     }
 
     fn build_best_path(&mut self, input: &str) -> Result<Option<usize>> {
@@ -1985,6 +2084,9 @@ pub mod ffi {
         fn delarocha_tokenizer_free(tokenizer: *mut RawTokenizer);
         fn delarocha_worker_new(tokenizer: *mut RawTokenizer) -> *mut RawWorker;
         fn delarocha_worker_free(worker: *mut RawWorker);
+        fn delarocha_worker_retained_bytes(worker: *const RawWorker) -> usize;
+        fn delarocha_worker_shrink_to(worker: *mut RawWorker, max_bytes: usize) -> usize;
+        fn delarocha_worker_set_retained_limit(worker: *mut RawWorker, max_bytes: usize);
         fn delarocha_tokenize_bytes(worker: *mut RawWorker, input: *const u8, len: usize) -> i32;
         fn delarocha_tokenize_count_bytes_nonnull(
             worker: *mut RawWorker,
@@ -2043,6 +2145,7 @@ pub mod ffi {
         feature_lens: Vec<usize>,
         feature_utf8: FeatureUtf8Cache,
         spare_tokens: Vec<Token>,
+        retained_capacity_limit: Option<usize>,
         _tokenizer: PhantomData<&'tokenizer ZigTokenizer>,
     }
 
@@ -2072,6 +2175,10 @@ pub mod ffi {
     const FEATURE_UTF8_CACHE_LIMIT: u32 = 1 << 24;
 
     impl FeatureUtf8Cache {
+        fn retained_bytes(&self) -> usize {
+            (self.known.capacity() + self.unknown.capacity()) * std::mem::size_of::<u64>()
+        }
+
         #[inline(always)]
         fn bits(&self, word_id: u32) -> Option<(&[u64], usize)> {
             let (bits, index) = if word_id < USER_WORD_BASE {
@@ -2471,6 +2578,7 @@ pub mod ffi {
                 feature_lens: Vec::new(),
                 feature_utf8: FeatureUtf8Cache::default(),
                 spare_tokens: Vec::new(),
+                retained_capacity_limit: None,
                 _tokenizer: PhantomData,
             })
         }
@@ -2529,9 +2637,109 @@ pub mod ffi {
             }
         }
 
+        /// Bytes of buffer capacity this worker keeps for reuse: the native
+        /// lattice and token buffers, the Rust-side token metadata buffers,
+        /// tokens parked by [`Self::tokenize_into`] (including their string
+        /// capacity), and the per-word-id UTF-8 memo. The input-proportional
+        /// parts grow to fit the largest input seen so far (roughly 60 bytes
+        /// per input byte natively plus 36 bytes per token on the Rust side
+        /// for owned/view tokenization, 32 bytes per input byte for
+        /// count-only on IPADIC).
+        pub fn retained_bytes(&self) -> usize {
+            self.rust_scratch_bytes()
+                + self.feature_utf8.retained_bytes()
+                + unsafe { delarocha_worker_retained_bytes(self.raw.as_ptr()) }
+        }
+
+        /// Releases every retained buffer, native and Rust-side, including the
+        /// UTF-8 memo. Equivalent to `shrink_to(0)`.
+        pub fn shrink_to_fit(&mut self) {
+            self.shrink_to(0);
+        }
+
+        /// Frees retained buffers until [`Self::retained_bytes`] is at most
+        /// `max_bytes`: Rust-side token metadata and parked tokens first, then
+        /// native lattice buffers (largest first), and the UTF-8 memo last.
+        /// Later calls regrow what they need and return identical tokens.
+        pub fn shrink_to(&mut self, max_bytes: usize) {
+            if self.retained_bytes() <= max_bytes {
+                return;
+            }
+            self.release_rust_scratch();
+            let memo = self.feature_utf8.retained_bytes();
+            unsafe {
+                delarocha_worker_shrink_to(self.raw.as_ptr(), max_bytes.saturating_sub(memo));
+            }
+            if self.retained_bytes() > max_bytes {
+                self.feature_utf8 = FeatureUtf8Cache::default();
+            }
+        }
+
+        /// Caps the buffer capacity kept between calls; `None` (the default)
+        /// disables the cap. With a cap, a call whose native lattice leaves
+        /// more than `limit` bytes retained releases it before returning, and
+        /// the Rust-side token metadata buffers are released once they exceed
+        /// `limit` (after owned/span tokenization, or at the start of the next
+        /// call for borrowed views). Each part therefore stays within `limit`
+        /// between calls, and inputs below the cap never trim.
+        pub fn set_retained_capacity_limit(&mut self, limit: Option<usize>) {
+            self.retained_capacity_limit = limit;
+            unsafe {
+                delarocha_worker_set_retained_limit(self.raw.as_ptr(), limit.unwrap_or(usize::MAX))
+            };
+            self.trim_rust_scratch_to_limit();
+        }
+
+        fn rust_scratch_bytes(&self) -> usize {
+            use std::mem::size_of;
+            let u32_bufs = self.span_starts.capacity()
+                + self.span_ends.capacity()
+                + self.span_start_chars.capacity()
+                + self.span_end_chars.capacity()
+                + self.span_word_ids.capacity();
+            let spare_strings: usize = self
+                .spare_tokens
+                .iter()
+                .map(|token| token.surface.capacity() + token.feature.capacity())
+                .sum();
+            u32_bufs * size_of::<u32>()
+                + self.feature_ptrs.capacity() * size_of::<*const u8>()
+                + self.feature_lens.capacity() * size_of::<usize>()
+                + self.spare_tokens.capacity() * size_of::<Token>()
+                + spare_strings
+        }
+
+        fn release_rust_scratch(&mut self) {
+            self.span_starts = Vec::new();
+            self.span_ends = Vec::new();
+            self.span_start_chars = Vec::new();
+            self.span_end_chars = Vec::new();
+            self.span_word_ids = Vec::new();
+            self.feature_ptrs = Vec::new();
+            self.feature_lens = Vec::new();
+            self.spare_tokens = Vec::new();
+        }
+
+        #[inline(always)]
+        fn trim_rust_scratch_to_limit(&mut self) {
+            if let Some(limit) = self.retained_capacity_limit {
+                self.trim_rust_scratch_cold(limit);
+            }
+        }
+
+        #[cold]
+        #[inline(never)]
+        fn trim_rust_scratch_cold(&mut self, limit: usize) {
+            if self.rust_scratch_bytes() > limit {
+                self.release_rust_scratch();
+            }
+        }
+
         /// Runs Zig tokenization and copies token metadata into the worker's
         /// reusable buffers. Returns the number of tokens copied.
         fn copy_metadata(&mut self, input: &str) -> Result<usize> {
+            // Views from a previous call may have kept oversized buffers.
+            self.trim_rust_scratch_to_limit();
             let status =
                 unsafe { delarocha_tokenize_bytes(self.raw.as_ptr(), input.as_ptr(), input.len()) };
             if status != 0 {
@@ -2711,6 +2919,7 @@ pub mod ffi {
                 token.word_id = word_id;
                 token.total_cost = 0;
             }
+            self.trim_rust_scratch_to_limit();
             Ok(())
         }
 
@@ -2793,6 +3002,7 @@ pub mod ffi {
                         word_id,
                     }),
             );
+            self.trim_rust_scratch_to_limit();
             Ok(())
         }
 

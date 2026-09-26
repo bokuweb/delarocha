@@ -23,6 +23,9 @@ comptime {
     _ = ffi.delarocha_tokenizer_free;
     _ = ffi.delarocha_worker_new;
     _ = ffi.delarocha_worker_free;
+    _ = ffi.delarocha_worker_retained_bytes;
+    _ = ffi.delarocha_worker_shrink_to;
+    _ = ffi.delarocha_worker_set_retained_limit;
     _ = ffi.delarocha_tokenize;
     _ = ffi.delarocha_tokenize_bytes;
     _ = ffi.delarocha_tokenize_count_bytes;
@@ -241,6 +244,55 @@ test "binary file loaders (mmap, copy, borrowed, count-only) agree" {
             try std.testing.expectError(error.UnsupportedDictionaryVersion, Dictionary.fromBinaryFile(allocator, path));
         }
     }
+}
+
+test "worker shrink and retained-capacity limit keep results identical" {
+    const allocator = std.testing.allocator;
+    var dict = try Dictionary.parseMinimal(allocator, minimal_dict);
+    defer dict.deinit();
+
+    var long_input: std.ArrayList(u8) = .empty;
+    defer long_input.deinit(allocator);
+    for (0..512) |_| try long_input.appendSlice(allocator, "本とカレーX🍛");
+    const inputs = [_][]const u8{ long_input.items, "本とカレー", "本X🍛", "", long_input.items[0..60] };
+
+    var reference = Worker.init(allocator, &dict, null);
+    defer reference.deinit();
+    var shrinking = Worker.init(allocator, &dict, null);
+    defer shrinking.deinit();
+    var capped = Worker.init(allocator, &dict, null);
+    defer capped.deinit();
+    const limit: usize = 4096;
+    capped.setRetainedCapacityLimit(limit);
+
+    for (0..2) |_| {
+        for (inputs) |input| {
+            const expected_count = try reference.tokenizeCount(input);
+            const expected = try reference.tokenize(input);
+
+            try expectSameTokens(expected, try shrinking.tokenize(input));
+            try std.testing.expectEqual(expected_count, try shrinking.tokenizeCount(input));
+            try std.testing.expect(shrinking.retainedBytes() > 0 or input.len == 0);
+            shrinking.shrinkTo(limit);
+            try std.testing.expect(shrinking.retainedBytes() <= limit);
+            try std.testing.expectEqual(expected_count, try shrinking.tokenizeCount(input));
+            try expectSameTokens(expected, try shrinking.tokenize(input));
+            shrinking.shrink();
+            try std.testing.expectEqual(@as(usize, 0), shrinking.retainedBytes());
+
+            const capped_tokens = try capped.tokenize(input);
+            try expectSameTokens(expected, capped_tokens);
+            // Only the returned token buffer may exceed the cap, and only by
+            // what the result itself needs.
+            try std.testing.expect(capped.retainedBytes() <= @max(limit, capped_tokens.len * @sizeOf(Token)));
+            try std.testing.expectEqual(expected_count, try capped.tokenizeCount(input));
+        }
+    }
+    // Small inputs stay below the cap and keep their buffers for reuse.
+    _ = try capped.tokenize("本とカレー");
+    _ = try capped.tokenizeCount("本とカレー");
+    try std.testing.expect(capped.retainedBytes() > 0);
+    try std.testing.expect(capped.retainedBytes() <= limit);
 }
 
 test {
