@@ -49,22 +49,26 @@ pub const TrieEdge = extern struct {
     child: u32 align(1),
 };
 
-// Each trie node stores offsets into global edge/term streams. IPADIC stays far
-// below 24-bit offsets and 16-bit per-node term counts, so the in-memory node
-// can be packed to reduce resident memory while the binary file layout remains
-// unchanged and backward-compatible.
-pub const TrieNode = packed struct {
-    edge_start: u24,
-    edge_len: u16,
-    word_start: u24,
-    word_len: u16,
-    count_word_start: u24,
-    count_word_len: u16,
+// Each trie node stores offsets into global edge/term streams. The in-memory
+// layout is byte-for-byte the 22-byte binary node record, so memory-mapped
+// dictionaries borrow the node table instead of decoding ~1M nodes on every
+// load (previously the largest load cost). Tokenization cycles with these
+// unaligned fields matched the former packed 16-byte node on aarch64; the
+// packed form only saved ~6 MiB for dictionaries that are copied or built
+// from raw files.
+pub const TrieNode = extern struct {
+    edge_start: u32 align(1),
+    edge_len: u16 align(1),
+    word_start: u32 align(1),
+    word_len: u32 align(1),
+    count_word_start: u32 align(1),
+    count_word_len: u32 align(1),
 };
 
-// Trie terms are stored in binary dictionaries as raw struct bytes, so their
-// layout must be fixed. The field order matches what Zig previously chose for
-// the auto-layout struct, keeping the in-memory layout of the hot term stream
+// Trie term streams are stored in the binary file with the exact in-memory
+// layout, so borrowed (mmap) dictionaries slice them directly instead of
+// decoding. `extern` pins the field order to what Zig previously chose for the
+// auto-layout structs, keeping the in-memory layout of the hot term stream
 // unchanged while making the DLRDIC03 file layout independent of the compiler.
 pub const TrieTerm = extern struct {
     word_id: u32,
@@ -83,10 +87,12 @@ pub const TrieCountTerm = extern struct {
 };
 
 comptime {
-    if (@sizeOf(TrieEdge) != 5 or @sizeOf(TrieTerm) != 12 or @sizeOf(TrieCountTerm) != 8) {
+    if (@sizeOf(TrieNode) != 22 or @sizeOf(TrieEdge) != 5 or @sizeOf(TrieTerm) != 12 or @sizeOf(TrieCountTerm) != 8) {
         @compileError("native trie struct layout must match the binary format");
     }
     if (@offsetOf(TrieEdge, "child") != 1 or
+        @offsetOf(TrieNode, "edge_len") != 4 or @offsetOf(TrieNode, "word_start") != 6 or @offsetOf(TrieNode, "word_len") != 10 or
+        @offsetOf(TrieNode, "count_word_start") != 14 or @offsetOf(TrieNode, "count_word_len") != 18 or
         @offsetOf(TrieTerm, "word_cost") != 4 or @offsetOf(TrieTerm, "left_id") != 8 or @offsetOf(TrieTerm, "right_id") != 10 or
         @offsetOf(TrieCountTerm, "left_id") != 4 or @offsetOf(TrieCountTerm, "right_id") != 6)
     {
@@ -409,10 +415,15 @@ pub const Dictionary = struct {
     matrix: ConnectionMatrix,
     owns_matrix_costs: bool,
     entry_index: EntryIndex,
-    trie_nodes: []TrieNode,
-    trie_edges: []TrieEdge,
-    trie_terms: []TrieTerm,
-    trie_count_terms: []TrieCountTerm,
+    trie_nodes: []const TrieNode,
+    // Edge and term streams are either allocator-owned or borrowed straight
+    // from binary dictionary bytes (see `owns_trie_streams`). Borrowed streams
+    // may start at any file offset, hence the align(1) element pointers; both
+    // x86_64 and aarch64 load these without penalty.
+    trie_edges: []const TrieEdge,
+    trie_terms: []align(1) const TrieTerm,
+    trie_count_terms: []align(1) const TrieCountTerm,
+    owns_trie_streams: bool = true,
     trie_first: [256]u32,
     trie_bmp: []align(1) const u32,
     trie_pair: []align(1) const u32,
@@ -421,6 +432,10 @@ pub const Dictionary = struct {
     trie_check: []align(1) const u32,
     trie_child: []align(1) const u32,
     owns_trie_u32_tables: bool,
+    // Read-only file mapping owned by this dictionary when it was loaded with
+    // `fromBinaryFile`. Borrowed slices above point into it, so it is unmapped
+    // last in `deinit`.
+    mapped_file: ?MappedFile = null,
 
     pub fn parseMinimal(allocator: Allocator, input: []const u8) !Dictionary {
         var entries: std.ArrayList(Entry) = .empty;
@@ -521,7 +536,31 @@ pub const Dictionary = struct {
         return parseMinimal(allocator, bytes);
     }
 
+    /// Loads a binary dictionary file. Where the platform supports it the file
+    /// is memory-mapped read-only and the dictionary borrows feature blobs,
+    /// the connection matrix, and trie tables directly from the mapping, which
+    /// the dictionary owns and unmaps in `deinit`. For IPADIC this loads
+    /// several times faster than the copy path and keeps the dictionary in
+    /// clean, file-backed pages instead of anonymous memory. As with
+    /// any mmap, the file must not be truncated or rewritten in place while
+    /// the dictionary is alive; use `fromBinaryFileCopy` when that cannot be
+    /// guaranteed.
     pub fn fromBinaryFile(allocator: Allocator, path: []const u8) !Dictionary {
+        if (comptime !MappedFile.supported) return fromBinaryFileCopy(allocator, path);
+        var mapped = MappedFile.open(allocator, path) catch |err| switch (err) {
+            // Some filesystems cannot be mapped; the copy loader still works.
+            error.MemoryMappingNotSupported => return fromBinaryFileCopy(allocator, path),
+            else => |e| return e,
+        };
+        errdefer mapped.close();
+        var dict = try fromBorrowedBinaryBytes(allocator, mapped.bytes);
+        dict.mapped_file = mapped;
+        return dict;
+    }
+
+    /// Reads the whole file into memory and copies everything the dictionary
+    /// needs into allocator-owned storage; the file may change afterwards.
+    pub fn fromBinaryFileCopy(allocator: Allocator, path: []const u8) !Dictionary {
         const bytes = try readFileAlloc(allocator, path);
         defer allocator.free(bytes);
         return fromBinaryBytes(allocator, bytes);
@@ -659,14 +698,7 @@ pub const Dictionary = struct {
         try appendU32(allocator, &bytes, @intCast(self.trie_check.len));
         try appendU32(allocator, &bytes, @intCast(self.trie_child.len));
 
-        for (self.trie_nodes) |node| {
-            try appendU32(allocator, &bytes, node.edge_start);
-            try appendU16(allocator, &bytes, node.edge_len);
-            try appendU32(allocator, &bytes, node.word_start);
-            try appendU32(allocator, &bytes, node.word_len);
-            try appendU32(allocator, &bytes, node.count_word_start);
-            try appendU32(allocator, &bytes, node.count_word_len);
-        }
+        try appendNativeStructSlice(TrieNode, allocator, &bytes, self.trie_nodes);
         try appendNativeStructSlice(TrieEdge, allocator, &bytes, self.trie_edges);
         try appendNativeStructSlice(TrieTerm, allocator, &bytes, self.trie_terms);
         try appendNativeStructSlice(TrieCountTerm, allocator, &bytes, self.trie_count_terms);
@@ -698,10 +730,14 @@ pub const Dictionary = struct {
         return size;
     }
 
+    /// Copies everything out of `bytes`; the caller may free them afterwards.
     pub fn fromBinaryBytes(allocator: Allocator, bytes: []const u8) !Dictionary {
         return fromBinaryBytesInternal(allocator, bytes, true);
     }
 
+    /// Borrows feature blobs and (on little-endian targets) the matrix, trie
+    /// edge/term streams, and lookup tables from `bytes`, which must stay
+    /// alive and unchanged until `deinit`.
     pub fn fromBorrowedBinaryBytes(allocator: Allocator, bytes: []const u8) !Dictionary {
         return fromBinaryBytesInternal(allocator, bytes, false);
     }
@@ -757,7 +793,31 @@ pub const Dictionary = struct {
         const entry_blob: []const u8 = if (copy_feature_blob) entry_blob_owned else bytes;
         errdefer if (copy_feature_blob) allocator.free(entry_blob_owned);
         var entry_blob_cursor: usize = 0;
-        for (0..entry_count) |entry_index| {
+        if (compact_entry_features) {
+            // Hot path for large dictionaries: only the feature location is
+            // needed, so skip the per-field decode and read the two lengths
+            // from the fixed 16-byte record header.
+            for (entry_features) |*ref| {
+                const record = cursor;
+                const surface_len, const feature_len = try readBinaryEntryLens(bytes, &cursor);
+                // Compact dictionaries resolve connection ids through the trie
+                // terms, but stored entry ids are still held to the matrix.
+                try id_limits.check(
+                    std.mem.readInt(u16, bytes[record + 4 ..][0..2], .little),
+                    std.mem.readInt(u16, bytes[record + 6 ..][0..2], .little),
+                );
+                cursor += surface_len;
+                const feature_offset = if (copy_feature_blob) copied: {
+                    const feature_start = entry_blob_cursor;
+                    @memcpy(entry_blob_owned[feature_start .. feature_start + feature_len], bytes[cursor .. cursor + feature_len]);
+                    entry_blob_cursor += feature_len;
+                    break :copied feature_start;
+                } else cursor;
+                cursor += feature_len;
+                if (feature_offset > std.math.maxInt(u32)) return error.InvalidDictionary;
+                ref.* = .{ .offset = @intCast(feature_offset), .len = @intCast(feature_len) };
+            }
+        } else for (0..entry_count) |entry_index| {
             const surface_len: usize = @intCast(try readU32(bytes, &cursor));
             const left_id = try readU16(bytes, &cursor);
             const right_id = try readU16(bytes, &cursor);
@@ -766,19 +826,6 @@ pub const Dictionary = struct {
             try id_limits.check(left_id, right_id);
             const surface = try readSlice(bytes, &cursor, surface_len);
             const feature = try readSlice(bytes, &cursor, feature_len);
-            if (compact_entry_features) {
-                // Offsets are derived from bounds-checked slices of `bytes`, so
-                // every feature reference stays inside `entry_blob`.
-                const feature_offset = if (copy_feature_blob) copied: {
-                    const feature_start = entry_blob_cursor;
-                    @memcpy(entry_blob_owned[feature_start .. feature_start + feature_len], feature);
-                    entry_blob_cursor += feature_len;
-                    break :copied feature_start;
-                } else @intFromPtr(feature.ptr) - @intFromPtr(entry_blob.ptr);
-                if (feature_offset > std.math.maxInt(u32) or feature_len > std.math.maxInt(u32)) return error.InvalidDictionary;
-                entry_features[entry_index] = .{ .offset = @intCast(feature_offset), .len = @intCast(feature_len) };
-                continue;
-            }
             const entry_surface, const entry_feature = if (copy_feature_blob) copied: {
                 const surface_start = entry_blob_cursor;
                 @memcpy(entry_blob_owned[surface_start .. surface_start + surface_len], surface);
@@ -877,6 +924,7 @@ pub const Dictionary = struct {
             .trie_edges = trie.edges,
             .trie_terms = trie.terms,
             .trie_count_terms = trie.count_terms,
+            .owns_trie_streams = trie.owns_streams,
             .trie_first = buildTrieFirst(trie.nodes, trie.edges),
             .trie_bmp = trie.bmp,
             .trie_pair = trie.pair,
@@ -891,7 +939,12 @@ pub const Dictionary = struct {
     pub fn deinit(self: *Dictionary) void {
         self.entry_index.deinit(self.allocator);
         self.unk_index.deinit(self.allocator);
-        freeTrie(self.allocator, self.trie_nodes, self.trie_edges, self.trie_terms, self.trie_count_terms);
+        if (self.owns_trie_streams) {
+            freeAlign1Slice(TrieNode, self.allocator, self.trie_nodes);
+            freeAlign1Slice(TrieEdge, self.allocator, self.trie_edges);
+            freeAlign1Slice(TrieTerm, self.allocator, self.trie_terms);
+            freeAlign1Slice(TrieCountTerm, self.allocator, self.trie_count_terms);
+        }
         if (self.owns_trie_u32_tables) {
             if (self.trie_bmp.len != 0) freeU32Slice(self.allocator, self.trie_bmp);
             if (self.trie_pair.len != 0) freeU32Slice(self.allocator, self.trie_pair);
@@ -916,6 +969,8 @@ pub const Dictionary = struct {
         }
         self.char_property.deinit();
         if (self.owns_matrix_costs) freeI16Slice(self.allocator, self.matrix.costs);
+        if (self.mapped_file) |mapped| mapped.close();
+        self.mapped_file = null;
     }
 
     pub fn discardFullTokenDataForCount(self: *Dictionary) void {
@@ -944,7 +999,7 @@ pub const Dictionary = struct {
         freeEntrySlice(self.allocator, self.user_entries);
         self.user_entries = emptyEntrySlice();
 
-        self.allocator.free(self.trie_terms);
+        if (self.owns_trie_streams) freeAlign1Slice(TrieTerm, self.allocator, self.trie_terms);
         self.trie_terms = emptyTrieTermSlice();
         if (self.unk_feature_blob.len != 0) {
             if (self.owns_unk_feature_blob) self.allocator.free(self.unk_feature_blob);
@@ -978,7 +1033,6 @@ fn addSizes(initial: usize, values: anytype) !usize {
 const binary_entry_record_len = 16;
 const binary_category_record_len = 10;
 const binary_range_record_len = 12;
-const binary_trie_node_len = 22;
 
 fn ensureRecords(bytes: []const u8, cursor: usize, count: usize, record_len: usize) !void {
     if (count > (bytes.len - cursor) / record_len) return error.InvalidDictionary;
@@ -1064,35 +1118,31 @@ fn readBinaryCharProperty(allocator: Allocator, bytes: []const u8, cursor: *usiz
     };
 }
 
-// Trie tables of a binary dictionary while it is being loaded. The u32 lookup
-// tables may borrow the input bytes, mirroring `owns_trie_u32_tables`.
+// Trie tables of a binary dictionary while it is being loaded. The streams and
+// u32 lookup tables may borrow the input bytes, mirroring `owns_trie_streams`
+// and `owns_trie_u32_tables`.
 const BinaryTrie = struct {
-    nodes: []TrieNode,
-    edges: []TrieEdge,
-    terms: []TrieTerm,
-    count_terms: []TrieCountTerm,
+    nodes: []const TrieNode,
+    edges: []const TrieEdge,
+    terms: []align(1) const TrieTerm,
+    count_terms: []align(1) const TrieCountTerm,
     pair: []align(1) const u32,
     bmp: []align(1) const u32,
     triple: []align(1) const u32,
     base: []align(1) const u32,
     check: []align(1) const u32,
     child: []align(1) const u32,
+    owns_streams: bool,
     owns_u32_tables: bool,
 
     fn deinit(self: BinaryTrie, allocator: Allocator) void {
-        freeTrie(allocator, self.nodes, self.edges, self.terms, self.count_terms);
+        if (self.owns_streams) freeTrie(allocator, self.nodes, self.edges, self.terms, self.count_terms);
         if (!self.owns_u32_tables) return;
         if (self.pair.len != 0) freeU32Slice(allocator, self.pair);
         if (self.bmp.len != 0) freeU32Slice(allocator, self.bmp);
         if (self.triple.len != 0) freeU32Slice(allocator, self.triple);
         freeDoubleArray(allocator, .{ .base = self.base, .check = self.check, .child = self.child });
     }
-};
-
-const TrieStreamLens = struct {
-    edges: usize,
-    terms: usize,
-    count_terms: usize,
 };
 
 fn readBinaryTrie(allocator: Allocator, bytes: []const u8, cursor: *usize, borrow: bool, word_count: usize, id_limits: ConnectionIdLimits) !BinaryTrie {
@@ -1114,14 +1164,16 @@ fn readBinaryTrie(allocator: Allocator, bytes: []const u8, cursor: *usize, borro
         return error.InvalidDictionary;
     }
 
-    const nodes = try readTrieNodes(allocator, bytes, cursor, node_count, .{ .edges = edge_count, .terms = term_count, .count_terms = count_term_count });
-    errdefer allocator.free(nodes);
-    const edges = try readTrieEdges(allocator, bytes, cursor, edge_count, node_count);
-    errdefer allocator.free(edges);
-    const terms = try readTrieTerms(allocator, bytes, cursor, term_count, word_count, id_limits);
-    errdefer allocator.free(terms);
-    const count_terms = try readTrieCountTerms(allocator, bytes, cursor, count_term_count, id_limits);
-    errdefer allocator.free(count_terms);
+    // `readStructSlice` bounds-checks each stream against `bytes` before it
+    // allocates, so oversized counts fail without large allocations.
+    const nodes = try readStructSlice(TrieNode, allocator, bytes, cursor, node_count, borrow);
+    errdefer if (!borrow) freeAlign1Slice(TrieNode, allocator, nodes);
+    const edges = try readStructSlice(TrieEdge, allocator, bytes, cursor, edge_count, borrow);
+    errdefer if (!borrow) freeAlign1Slice(TrieEdge, allocator, edges);
+    const terms = try readStructSlice(TrieTerm, allocator, bytes, cursor, term_count, borrow);
+    errdefer if (!borrow) freeAlign1Slice(TrieTerm, allocator, terms);
+    const count_terms = try readStructSlice(TrieCountTerm, allocator, bytes, cursor, count_term_count, borrow);
+    errdefer if (!borrow) freeAlign1Slice(TrieCountTerm, allocator, count_terms);
     const pair = try readU32Slice(allocator, bytes, cursor, pair_count, borrow);
     errdefer if (!borrow and pair.len != 0) freeU32Slice(allocator, pair);
     const bmp = try readU32Slice(allocator, bytes, cursor, bmp_count, borrow);
@@ -1135,6 +1187,13 @@ fn readBinaryTrie(allocator: Allocator, bytes: []const u8, cursor: *usize, borro
     const child = try readU32Slice(allocator, bytes, cursor, child_count, borrow);
     errdefer if (!borrow and child.len != 0) freeU32Slice(allocator, child);
 
+    // The streams may alias the input bytes, so every index the tokenizer
+    // reads without bounds checks is validated here, after reading, in both
+    // the copy and the borrow path.
+    try validateTrieNodes(nodes, edge_count, term_count, count_term_count);
+    try validateTrieEdges(edges, node_count);
+    try validateTrieTerms(terms, word_count, id_limits);
+    try validateTrieCountTerms(count_terms, id_limits);
     try validateTrieNodeTable(pair, node_count);
     try validateTrieNodeTable(bmp, node_count);
     try validateTrieNodeTable(triple, node_count);
@@ -1150,8 +1209,61 @@ fn readBinaryTrie(allocator: Allocator, bytes: []const u8, cursor: *usize, borro
         .base = base,
         .check = check,
         .child = child,
+        .owns_streams = !borrow,
         .owns_u32_tables = !borrow,
     };
+}
+
+// The stream validators below reduce each field to its maximum instead of
+// branching per record, which keeps the passes over the (possibly
+// memory-mapped) streams cheap: they cost little beyond faulting the pages in.
+
+// Tokenization slices the edge and term streams with node ranges without
+// bounds checks. Fields are u32/u16, so the sums cannot overflow u64.
+fn validateTrieNodes(nodes: []const TrieNode, edge_count: usize, term_count: usize, count_term_count: usize) !void {
+    var max_edge_end: u64 = 0;
+    var max_word_end: u64 = 0;
+    var max_count_word_end: u64 = 0;
+    for (nodes) |node| {
+        max_edge_end = @max(max_edge_end, @as(u64, node.edge_start) + node.edge_len);
+        max_word_end = @max(max_word_end, @as(u64, node.word_start) + node.word_len);
+        max_count_word_end = @max(max_count_word_end, @as(u64, node.count_word_start) + node.count_word_len);
+    }
+    if (max_edge_end > edge_count or max_word_end > term_count or max_count_word_end > count_term_count) return error.InvalidDictionary;
+}
+
+fn validateTrieEdges(edges: []const TrieEdge, node_count: usize) !void {
+    if (edges.len == 0) return;
+    var max_child: u32 = 0;
+    for (edges) |edge| max_child = @max(max_child, edge.child);
+    if (max_child >= node_count) return error.InvalidDictionary;
+}
+
+// Full token backtrace resolves word ids through the entry or feature tables
+// without bounds checks, and connection ids index the matrix unchecked.
+fn validateTrieTerms(terms: []align(1) const TrieTerm, word_count: usize, id_limits: ConnectionIdLimits) !void {
+    if (terms.len == 0) return;
+    var max_word_id: u32 = 0;
+    var max_left_id: u16 = 0;
+    var max_right_id: u16 = 0;
+    for (terms) |term| {
+        max_word_id = @max(max_word_id, term.word_id);
+        max_left_id = @max(max_left_id, term.left_id);
+        max_right_id = @max(max_right_id, term.right_id);
+    }
+    if (max_word_id >= word_count) return error.InvalidDictionary;
+    try id_limits.check(max_left_id, max_right_id);
+}
+
+fn validateTrieCountTerms(terms: []align(1) const TrieCountTerm, id_limits: ConnectionIdLimits) !void {
+    if (terms.len == 0) return;
+    var max_left_id: u16 = 0;
+    var max_right_id: u16 = 0;
+    for (terms) |term| {
+        max_left_id = @max(max_left_id, term.left_id);
+        max_right_id = @max(max_right_id, term.right_id);
+    }
+    try id_limits.check(max_left_id, max_right_id);
 }
 
 fn rebuildBinaryV1Trie(allocator: Allocator, entries: []const Entry, matrix: *const ConnectionMatrix) !BinaryTrie {
@@ -1175,6 +1287,7 @@ fn rebuildBinaryV1Trie(allocator: Allocator, entries: []const Entry, matrix: *co
         .base = double_array.base,
         .check = double_array.check,
         .child = double_array.child,
+        .owns_streams = true,
         .owns_u32_tables = true,
     };
 }
@@ -1206,8 +1319,23 @@ fn validateDoubleArray(base: []align(1) const u32, check: []align(1) const u32, 
 }
 
 const BuildTrieNode = struct {
-    edges: std.ArrayList(TrieEdge) = .empty,
-    word_ids: std.ArrayList(u32) = .empty,
+    /// This node's outgoing edges in the shared edge pool, linked in insertion
+    /// order through `BuildTrieEdge.next`.
+    first_edge: u32 = invalid_trie_node,
+    last_edge: u32 = invalid_trie_node,
+    edge_len: u32 = 0,
+    word_len: u32 = 0,
+    /// Index of a 256-entry child table in the dense pool once the node has
+    /// `build_trie_dense_threshold` edges; lookups then skip the list walk.
+    dense: u32 = invalid_trie_node,
+};
+
+const build_trie_dense_threshold = 8;
+
+const BuildTrieEdge = struct {
+    child: u32,
+    next: u32,
+    byte: u8,
 };
 
 const TrieBuildResult = struct {
@@ -1329,74 +1457,118 @@ fn buildEntryIndex(allocator: Allocator, entries: []const Entry) !EntryIndex {
 }
 
 fn buildTrie(allocator: Allocator, entries: []const Entry, matrix: *const ConnectionMatrix) !TrieBuildResult {
+    // Nodes and edges live in two flat pools (no per-node allocations); each
+    // node's edges form a linked list in insertion order. `word_nodes[i]` is
+    // the terminal node of entries[i], later grouped per node by a stable
+    // counting sort so each node's terms keep ascending word id order.
     var build_nodes: std.ArrayList(BuildTrieNode) = .empty;
-    defer {
-        for (build_nodes.items) |*node| {
-            node.edges.deinit(allocator);
-            node.word_ids.deinit(allocator);
-        }
-        build_nodes.deinit(allocator);
-    }
+    defer build_nodes.deinit(allocator);
+    var build_edges: std.ArrayList(BuildTrieEdge) = .empty;
+    defer build_edges.deinit(allocator);
+    var dense_children: std.ArrayList(u32) = .empty;
+    defer dense_children.deinit(allocator);
+    const word_nodes = try allocator.alloc(u32, entries.len);
+    defer allocator.free(word_nodes);
 
     try build_nodes.append(allocator, .{});
     for (entries, 0..) |entry, word_id| {
         var node_index: usize = 0;
         for (entry.surface) |byte| {
-            if (findEdgeSlice(build_nodes.items[node_index].edges.items, byte)) |child| {
-                node_index = child;
+            const node = build_nodes.items[node_index];
+            const found = if (node.dense != invalid_trie_node)
+                dense_children.items[@as(usize, node.dense) * 256 + byte]
+            else
+                findBuildEdge(build_edges.items, node.first_edge, byte);
+            if (found != invalid_trie_node) {
+                node_index = found;
             } else {
-                const child = build_nodes.items.len;
+                const child: u32 = @intCast(build_nodes.items.len);
                 try build_nodes.append(allocator, .{});
-                try build_nodes.items[node_index].edges.append(allocator, .{ .byte = byte, .child = @intCast(child) });
+                const edge_index: u32 = @intCast(build_edges.items.len);
+                try build_edges.append(allocator, .{ .byte = byte, .child = child, .next = invalid_trie_node });
+                const parent = &build_nodes.items[node_index];
+                if (parent.last_edge == invalid_trie_node) {
+                    parent.first_edge = edge_index;
+                } else {
+                    build_edges.items[parent.last_edge].next = edge_index;
+                }
+                parent.last_edge = edge_index;
+                parent.edge_len += 1;
+                if (parent.dense != invalid_trie_node) {
+                    dense_children.items[@as(usize, parent.dense) * 256 + byte] = child;
+                } else if (parent.edge_len == build_trie_dense_threshold) {
+                    parent.dense = @intCast(dense_children.items.len / 256);
+                    const table = try dense_children.addManyAsArray(allocator, 256);
+                    @memset(table, invalid_trie_node);
+                    var e = parent.first_edge;
+                    while (e != invalid_trie_node) : (e = build_edges.items[e].next) {
+                        table[build_edges.items[e].byte] = build_edges.items[e].child;
+                    }
+                }
                 node_index = child;
             }
         }
-        try build_nodes.items[node_index].word_ids.append(allocator, @intCast(word_id));
-    }
-
-    var edge_count: usize = 0;
-    var word_id_count: usize = 0;
-    for (build_nodes.items) |*node| {
-        std.mem.sort(TrieEdge, node.edges.items, {}, trieEdgeLessThan);
-        edge_count += node.edges.items.len;
-        word_id_count += node.word_ids.items.len;
+        build_nodes.items[node_index].word_len += 1;
+        word_nodes[word_id] = @intCast(node_index);
     }
 
     const nodes = try allocator.alloc(TrieNode, build_nodes.items.len);
     errdefer allocator.free(nodes);
-    const edges = try allocator.alloc(TrieEdge, edge_count);
+    const edges = try allocator.alloc(TrieEdge, build_edges.items.len);
     errdefer allocator.free(edges);
-    const terms = try allocator.alloc(TrieTerm, word_id_count);
+    const terms = try allocator.alloc(TrieTerm, entries.len);
     errdefer allocator.free(terms);
     var count_terms: std.ArrayList(TrieCountTerm) = .empty;
     errdefer count_terms.deinit(allocator);
 
-    var edge_offset: usize = 0;
-    var word_offset: usize = 0;
-    for (build_nodes.items, 0..) |node, i| {
-        @memcpy(edges[edge_offset .. edge_offset + node.edges.items.len], node.edges.items);
-        const count_start = count_terms.items.len;
-        for (node.word_ids.items, 0..) |word_id, j| {
+    // word_starts[i] = offset of node i's first term.
+    const word_starts = try allocator.alloc(u32, build_nodes.items.len);
+    defer allocator.free(word_starts);
+    {
+        var offset: usize = 0;
+        for (build_nodes.items, word_starts) |node, *word_start| {
+            word_start.* = try narrowTrieOffset(offset);
+            offset += node.word_len;
+        }
+        const cursor = try allocator.dupe(u32, word_starts);
+        defer allocator.free(cursor);
+        for (word_nodes, 0..) |node_index, word_id| {
             const entry = entries[word_id];
-            const term: TrieTerm = .{
-                .word_id = word_id,
+            terms[cursor[node_index]] = .{
+                .word_id = @intCast(word_id),
                 .left_id = entry.left_id,
                 .right_id = entry.right_id,
                 .word_cost = entry.word_cost,
             };
-            terms[word_offset + j] = term;
+            cursor[node_index] += 1;
+        }
+    }
+
+    var edge_offset: usize = 0;
+    for (build_nodes.items, 0..) |node, i| {
+        const node_edges = edges[edge_offset .. edge_offset + node.edge_len];
+        var edge_index = node.first_edge;
+        for (node_edges) |*edge| {
+            const build_edge = build_edges.items[edge_index];
+            edge.* = .{ .byte = build_edge.byte, .child = build_edge.child };
+            edge_index = build_edge.next;
+        }
+        std.mem.sort(TrieEdge, node_edges, {}, trieEdgeLessThan);
+
+        const word_offset: usize = word_starts[i];
+        const count_start = count_terms.items.len;
+        for (terms[word_offset .. word_offset + node.word_len]) |term| {
             try appendCountTerm(allocator, &count_terms, term, count_start, matrix);
         }
         nodes[i] = .{
             .edge_start = try narrowTrieOffset(edge_offset),
-            .edge_len = @intCast(node.edges.items.len),
+            .edge_len = @intCast(node.edge_len),
             .word_start = try narrowTrieOffset(word_offset),
-            .word_len = try narrowTrieTermLen(node.word_ids.items.len),
+            .word_len = try narrowTrieTermLen(node.word_len),
             .count_word_start = try narrowTrieOffset(count_start),
             .count_word_len = try narrowTrieTermLen(count_terms.items.len - count_start),
         };
-        edge_offset += node.edges.items.len;
-        word_offset += node.word_ids.items.len;
+        edge_offset += node.edge_len;
     }
 
     return .{ .nodes = nodes, .edges = edges, .terms = terms, .count_terms = try count_terms.toOwnedSlice(allocator) };
@@ -1444,11 +1616,14 @@ fn countTermDominates(matrix: *const ConnectionMatrix, lhs: TrieCountTerm, rhs: 
     return true;
 }
 
-fn findEdgeSlice(edges: []const TrieEdge, byte: u8) ?usize {
-    for (edges) |edge| {
-        if (edge.byte == byte) return @intCast(edge.child);
+fn findBuildEdge(edges: []const BuildTrieEdge, first_edge: u32, byte: u8) u32 {
+    var edge_index = first_edge;
+    while (edge_index != invalid_trie_node) {
+        const edge = edges[edge_index];
+        if (edge.byte == byte) return edge.child;
+        edge_index = edge.next;
     }
-    return null;
+    return invalid_trie_node;
 }
 
 fn buildTrieFirst(nodes: []const TrieNode, edges: []const TrieEdge) [256]u32 {
@@ -1553,14 +1728,20 @@ fn buildDoubleArray(allocator: Allocator, nodes: []const TrieNode, edges: []cons
     for (order, 0..) |*item, i| item.* = i;
     std.mem.sort(usize, order, nodes, trieNodeFanoutGreater);
 
-    var used: std.ArrayList(u8) = .empty;
-    defer used.deinit(allocator);
+    // `free` is a bitmap over double-array slots (bit set = slot unused).
+    // Slots past its end are implicitly free. Searching for a base value then
+    // tests 64 consecutive candidates per word: AND-ing the free bits at each
+    // edge's offset yields the candidates where every edge slot is free, and
+    // @ctz picks the smallest. This finds exactly the same base as a linear
+    // candidate-by-candidate scan, so the layout is unchanged.
+    var free: DoubleArrayFreeBits = .{};
+    defer free.deinit(allocator);
     var check: std.ArrayList(u32) = .empty;
     errdefer check.deinit(allocator);
     var child: std.ArrayList(u32) = .empty;
     errdefer child.deinit(allocator);
 
-    try ensureDoubleArrayCapacity(allocator, &used, &check, &child, 512);
+    try ensureDoubleArrayCapacity(allocator, &free, &check, &child, 512);
     var next_free: usize = 1;
     for (order) |node_index| {
         const node = nodes[node_index];
@@ -1573,26 +1754,20 @@ fn buildDoubleArray(allocator: Allocator, nodes: []const TrieNode, edges: []cons
         const edge_start: usize = @intCast(node.edge_start);
         const node_edges = edges[edge_start .. edge_start + edge_len];
         const first_byte: usize = node_edges[0].byte;
-        var candidate = if (next_free > first_byte) next_free - first_byte else 1;
-
-        while (true) : (candidate += 1) {
-            const first_slot = candidate + first_byte;
-            if (first_slot < used.items.len and used.items[first_slot] != 0) continue;
-            if (doubleArrayBaseFits(used.items, node_edges, candidate)) break;
-        }
+        const candidate = free.findBase(node_edges, if (next_free > first_byte) next_free - first_byte else 1);
 
         var max_slot: usize = 0;
         for (node_edges) |edge| max_slot = @max(max_slot, candidate + edge.byte);
-        try ensureDoubleArrayCapacity(allocator, &used, &check, &child, max_slot + 1);
+        try ensureDoubleArrayCapacity(allocator, &free, &check, &child, max_slot + 1);
 
         base[node_index] = @intCast(candidate);
         for (node_edges) |edge| {
             const slot = candidate + edge.byte;
-            used.items[slot] = 1;
+            free.markUsed(slot);
             check.items[slot] = @intCast(node_index);
             child.items[slot] = edge.child;
         }
-        while (next_free < used.items.len and used.items[next_free] != 0) next_free += 1;
+        next_free = @min(free.nextFree(next_free), check.items.len);
     }
 
     return .{
@@ -1606,42 +1781,111 @@ fn trieNodeFanoutGreater(nodes: []const TrieNode, lhs: usize, rhs: usize) bool {
     return nodes[lhs].edge_len > nodes[rhs].edge_len;
 }
 
-fn narrowTrieTermLen(len: usize) !u16 {
-    if (len > std.math.maxInt(u16)) return error.InvalidDictionary;
-    return @intCast(len);
+fn narrowTrieTermLen(len: usize) !u32 {
+    return std.math.cast(u32, len) orelse error.InvalidDictionary;
 }
 
-fn narrowTrieOffset(offset: usize) !u24 {
-    if (offset > std.math.maxInt(u24)) return error.InvalidDictionary;
-    return @intCast(offset);
+fn narrowTrieOffset(offset: usize) !u32 {
+    return std.math.cast(u32, offset) orelse error.InvalidDictionary;
 }
 
-fn doubleArrayBaseFits(used: []const u8, node_edges: []const TrieEdge, candidate: usize) bool {
-    for (node_edges) |edge| {
-        const slot = candidate + edge.byte;
-        if (slot < used.len and used[slot] != 0) return false;
+const DoubleArrayFreeBits = struct {
+    /// Bit set = slot free. The slice always extends `padding_words` all-ones
+    /// words past the double-array length so that windows starting at any
+    /// candidate <= length plus any edge byte stay in bounds without checks.
+    words: std.ArrayList(u64) = .empty,
+
+    // A window reads `lanes + 1` words starting at most (length + 255) / 64,
+    // i.e. up to word length / 64 + 4 + lanes.
+    const padding_words = 16;
+
+    fn deinit(self: *DoubleArrayFreeBits, allocator: Allocator) void {
+        self.words.deinit(allocator);
     }
-    return true;
-}
+
+    fn grow(self: *DoubleArrayFreeBits, allocator: Allocator, slot_len: usize) !void {
+        std.debug.assert(slot_len % 64 == 0);
+        const target = slot_len / 64 + padding_words;
+        if (self.words.items.len < target) {
+            try self.words.appendNTimes(allocator, ~@as(u64, 0), target - self.words.items.len);
+        }
+    }
+
+    const lanes = 8;
+    const Lanes = @Vector(lanes, u64);
+
+    /// Free bits for slots [bit, bit + 64 * lanes): lane k bit j = slot
+    /// bit + 64 * k + j.
+    inline fn window(words: []const u64, bit: usize) Lanes {
+        const index = bit >> 6;
+        const shift: u6 = @truncate(bit);
+        const lo: Lanes = words[index..][0..lanes].*;
+        const hi: Lanes = words[index + 1 ..][0..lanes].*;
+        // `(hi << 1) << (63 - shift)` is `hi << (64 - shift)` without the
+        // undefined shift-by-64 when shift == 0.
+        const s: @Vector(lanes, u6) = @splat(shift);
+        const t: @Vector(lanes, u6) = @splat(63 - shift);
+        const one: @Vector(lanes, u6) = @splat(1);
+        return (lo >> s) | ((hi << one) << t);
+    }
+
+    /// Smallest base >= start such that base + edge.byte is free for every
+    /// edge. `start` must not exceed the double-array length, which bounds the
+    /// search: a base equal to the length always fits. Candidates are tested
+    /// 64 * lanes at a time; the result equals a linear candidate scan.
+    fn findBase(self: *const DoubleArrayFreeBits, node_edges: []const TrieEdge, start: usize) usize {
+        const words = self.words.items;
+        var chunk = start;
+        while (true) : (chunk += 64 * lanes) {
+            var mask: Lanes = @splat(~@as(u64, 0));
+            for (node_edges) |edge| {
+                mask &= window(words, chunk + edge.byte);
+                if (@reduce(.Or, mask) == 0) break;
+            }
+            if (@reduce(.Or, mask) == 0) continue;
+            const arr: [lanes]u64 = mask;
+            for (arr, 0..) |bits, k| {
+                if (bits != 0) return chunk + 64 * k + @ctz(bits);
+            }
+            unreachable;
+        }
+    }
+
+    /// Smallest free slot >= start. Terminates in the all-ones padding.
+    fn nextFree(self: *const DoubleArrayFreeBits, start: usize) usize {
+        const words = self.words.items;
+        var index = start >> 6;
+        var bits = words[index] & (~@as(u64, 0) << @as(u6, @truncate(start)));
+        while (bits == 0) {
+            index += 1;
+            bits = words[index];
+        }
+        return index * 64 + @ctz(bits);
+    }
+
+    inline fn markUsed(self: *DoubleArrayFreeBits, slot: usize) void {
+        self.words.items[slot >> 6] &= ~(@as(u64, 1) << @as(u6, @truncate(slot)));
+    }
+};
 
 fn ensureDoubleArrayCapacity(
     allocator: Allocator,
-    used: *std.ArrayList(u8),
+    free: *DoubleArrayFreeBits,
     check: *std.ArrayList(u32),
     child: *std.ArrayList(u32),
     required: usize,
 ) !void {
-    if (used.items.len >= required) return;
-    var new_len = @max(used.items.len, @as(usize, 512));
+    if (check.items.len >= required) return;
+    var new_len = @max(check.items.len, @as(usize, 512));
     while (new_len < required) new_len *= 2;
 
-    const old_len = used.items.len;
-    try used.resize(allocator, new_len);
+    const old_len = check.items.len;
     try check.resize(allocator, new_len);
     try child.resize(allocator, new_len);
-    @memset(used.items[old_len..], 0);
     @memset(check.items[old_len..], invalid_trie_node);
     @memset(child.items[old_len..], invalid_trie_node);
+    // new_len is a multiple of 64 (512 doubled).
+    try free.grow(allocator, new_len);
 }
 
 fn freeDoubleArray(allocator: Allocator, double_array: DoubleArray) void {
@@ -1713,14 +1957,14 @@ pub inline fn findDoubleArray(base: []align(1) const u32, check: []align(1) cons
     return @intCast(child[slot]);
 }
 
-pub inline fn trieTerms(nodes: []const TrieNode, trie_terms: []const TrieTerm, node_index: usize) []const TrieTerm {
+pub inline fn trieTerms(nodes: []const TrieNode, trie_terms: []align(1) const TrieTerm, node_index: usize) []align(1) const TrieTerm {
     const node = nodes[node_index];
     const start: usize = @intCast(node.word_start);
     const len: usize = @intCast(node.word_len);
     return trie_terms[start .. start + len];
 }
 
-pub inline fn trieCountTerms(nodes: []const TrieNode, trie_terms: []const TrieCountTerm, node_index: usize) []const TrieCountTerm {
+pub inline fn trieCountTerms(nodes: []const TrieNode, trie_terms: []align(1) const TrieCountTerm, node_index: usize) []align(1) const TrieCountTerm {
     const node = nodes[node_index];
     const start: usize = @intCast(node.count_word_start);
     const len: usize = @intCast(node.count_word_len);
@@ -1731,11 +1975,18 @@ fn trieEdgeLessThan(_: void, lhs: TrieEdge, rhs: TrieEdge) bool {
     return lhs.byte < rhs.byte;
 }
 
-fn freeTrie(allocator: Allocator, nodes: []TrieNode, edges: []TrieEdge, terms_slice: []TrieTerm, count_terms_slice: []TrieCountTerm) void {
-    allocator.free(nodes);
-    allocator.free(edges);
-    allocator.free(terms_slice);
-    allocator.free(count_terms_slice);
+fn freeTrie(allocator: Allocator, nodes: []const TrieNode, edges: []const TrieEdge, terms_slice: []align(1) const TrieTerm, count_terms_slice: []align(1) const TrieCountTerm) void {
+    freeAlign1Slice(TrieNode, allocator, nodes);
+    freeAlign1Slice(TrieEdge, allocator, edges);
+    freeAlign1Slice(TrieTerm, allocator, terms_slice);
+    freeAlign1Slice(TrieCountTerm, allocator, count_terms_slice);
+}
+
+// Frees an allocator-owned slice that is stored behind an align(1) pointer so
+// it can share a field with slices borrowed from binary dictionary bytes.
+fn freeAlign1Slice(comptime T: type, allocator: Allocator, values: []align(1) const T) void {
+    const aligned: []const T = @alignCast(values);
+    allocator.free(@constCast(aligned));
 }
 
 fn freeU32Slice(allocator: Allocator, values: []align(1) const u32) void {
@@ -1748,6 +1999,35 @@ fn freeI16Slice(allocator: Allocator, values: []align(1) const i16) void {
     allocator.free(@constCast(aligned));
 }
 
+/// A read-only, private memory mapping of a whole file.
+pub const MappedFile = struct {
+    bytes: []align(std.heap.page_size_min) const u8,
+
+    /// Windows and WASM fall back to reading the file into memory.
+    pub const supported = !builtin.cpu.arch.isWasm() and builtin.os.tag != .windows;
+
+    pub fn open(allocator: Allocator, path: []const u8) !MappedFile {
+        if (comptime !supported) @compileError("memory-mapped files are not supported on this target");
+        var io_instance: std.Io.Threaded = .init(allocator, .{});
+        defer io_instance.deinit();
+        const io = io_instance.io();
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        // The mapping keeps its own reference to the file; the descriptor is
+        // not needed after mmap returns.
+        defer file.close(io);
+        const len = std.math.cast(usize, try file.length(io)) orelse return error.FileTooBig;
+        // mmap rejects zero-length mappings; an empty file is never a valid
+        // dictionary anyway.
+        if (len == 0) return error.InvalidDictionary;
+        const bytes = try std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+        return .{ .bytes = bytes };
+    }
+
+    pub fn close(self: MappedFile) void {
+        if (comptime supported) std.posix.munmap(self.bytes);
+    }
+};
+
 pub fn readFileAlloc(allocator: Allocator, path: []const u8) ![]u8 {
     var io_instance: std.Io.Threaded = .init(allocator, .{});
     defer io_instance.deinit();
@@ -1759,8 +2039,9 @@ fn appendU8(allocator: Allocator, bytes: *std.ArrayList(u8), value: u8) !void {
 }
 
 fn appendU16(allocator: Allocator, bytes: *std.ArrayList(u8), value: u16) !void {
-    try appendU8(allocator, bytes, @intCast(value & 0xff));
-    try appendU8(allocator, bytes, @intCast(value >> 8));
+    var buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &buf, value, .little);
+    try bytes.appendSlice(allocator, &buf);
 }
 
 fn appendI16(allocator: Allocator, bytes: *std.ArrayList(u8), value: i16) !void {
@@ -1768,10 +2049,9 @@ fn appendI16(allocator: Allocator, bytes: *std.ArrayList(u8), value: i16) !void 
 }
 
 fn appendU32(allocator: Allocator, bytes: *std.ArrayList(u8), value: u32) !void {
-    try appendU8(allocator, bytes, @intCast(value & 0xff));
-    try appendU8(allocator, bytes, @intCast((value >> 8) & 0xff));
-    try appendU8(allocator, bytes, @intCast((value >> 16) & 0xff));
-    try appendU8(allocator, bytes, @intCast(value >> 24));
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .little);
+    try bytes.appendSlice(allocator, &buf);
 }
 
 fn appendI32(allocator: Allocator, bytes: *std.ArrayList(u8), value: i32) !void {
@@ -1794,12 +2074,21 @@ fn appendU32Slice(allocator: Allocator, bytes: *std.ArrayList(u8), values: []ali
     for (values) |value| try appendU32(allocator, bytes, value);
 }
 
-fn appendNativeStructSlice(comptime T: type, allocator: Allocator, bytes: *std.ArrayList(u8), values: []const T) !void {
+fn appendNativeStructSlice(comptime T: type, allocator: Allocator, bytes: *std.ArrayList(u8), values: []align(1) const T) !void {
     if (builtin.cpu.arch.endian() == .little) {
         try bytes.appendSlice(allocator, std.mem.sliceAsBytes(values));
         return;
     }
-    if (T == TrieEdge) {
+    if (T == TrieNode) {
+        for (values) |node| {
+            try appendU32(allocator, bytes, node.edge_start);
+            try appendU16(allocator, bytes, node.edge_len);
+            try appendU32(allocator, bytes, node.word_start);
+            try appendU32(allocator, bytes, node.word_len);
+            try appendU32(allocator, bytes, node.count_word_start);
+            try appendU32(allocator, bytes, node.count_word_len);
+        }
+    } else if (T == TrieEdge) {
         for (values) |edge| {
             try appendU8(allocator, bytes, edge.byte);
             try appendU32(allocator, bytes, edge.child);
@@ -1869,96 +2158,66 @@ fn readI32(bytes: []const u8, cursor: *usize) !i32 {
     return @bitCast(try readU32(bytes, cursor));
 }
 
-fn readTrieNodes(allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize, stream_lens: TrieStreamLens) ![]TrieNode {
-    try ensureRecords(bytes, cursor.*, count, binary_trie_node_len);
-    const nodes = try allocator.alloc(TrieNode, count);
-    errdefer allocator.free(nodes);
-    for (nodes) |*node| {
-        node.* = .{
-            .edge_start = try narrowTrieOffset(try readU32(bytes, cursor)),
-            .edge_len = try readU16(bytes, cursor),
-            .word_start = try narrowTrieOffset(try readU32(bytes, cursor)),
-            .word_len = try narrowTrieTermLen(try readU32(bytes, cursor)),
-            .count_word_start = try narrowTrieOffset(try readU32(bytes, cursor)),
-            .count_word_len = try narrowTrieTermLen(try readU32(bytes, cursor)),
+// Reads a stream of fixed-layout records. On little-endian targets the file
+// layout equals the in-memory `extern struct` layout, so `borrow` returns a
+// view into `bytes` without touching the data; otherwise the records are
+// copied (or decoded field by field on big-endian targets).
+fn readStructSlice(comptime T: type, allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize, borrow: bool) ![]align(1) const T {
+    comptime std.debug.assert(@typeInfo(T).@"struct".layout == .@"extern");
+    const raw = try readSlice(bytes, cursor, try std.math.mul(usize, count, @sizeOf(T)));
+    if (borrow and builtin.cpu.arch.endian() == .little) return std.mem.bytesAsSlice(T, raw);
+    const values = try allocator.alloc(T, count);
+    errdefer allocator.free(values);
+    if (builtin.cpu.arch.endian() == .little) {
+        @memcpy(std.mem.sliceAsBytes(values), raw);
+        return values;
+    }
+    var raw_cursor: usize = 0;
+    for (values) |*value| {
+        value.* = switch (T) {
+            TrieNode => .{
+                .edge_start = try readU32(raw, &raw_cursor),
+                .edge_len = try readU16(raw, &raw_cursor),
+                .word_start = try readU32(raw, &raw_cursor),
+                .word_len = try readU32(raw, &raw_cursor),
+                .count_word_start = try readU32(raw, &raw_cursor),
+                .count_word_len = try readU32(raw, &raw_cursor),
+            },
+            TrieEdge => .{
+                .byte = try readU8(raw, &raw_cursor),
+                .child = try readU32(raw, &raw_cursor),
+            },
+            TrieTerm => .{
+                .word_id = try readU32(raw, &raw_cursor),
+                .word_cost = try readI32(raw, &raw_cursor),
+                .left_id = try readU16(raw, &raw_cursor),
+                .right_id = try readU16(raw, &raw_cursor),
+            },
+            TrieCountTerm => .{
+                .word_cost = try readI32(raw, &raw_cursor),
+                .left_id = try readU16(raw, &raw_cursor),
+                .right_id = try readU16(raw, &raw_cursor),
+            },
+            else => @compileError("unsupported binary record type"),
         };
-        // Tokenization slices the edge and term streams with these ranges
-        // without bounds checks.
-        if (@as(usize, node.edge_start) + node.edge_len > stream_lens.edges or
-            @as(usize, node.word_start) + node.word_len > stream_lens.terms or
-            @as(usize, node.count_word_start) + node.count_word_len > stream_lens.count_terms)
-        {
-            return error.InvalidDictionary;
-        }
     }
-    return nodes;
+    return values;
 }
 
-fn readTrieEdges(allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize, node_count: usize) ![]TrieEdge {
-    try ensureRecords(bytes, cursor.*, count, @sizeOf(TrieEdge));
-    const edges = try allocator.alloc(TrieEdge, count);
-    errdefer allocator.free(edges);
-    if (builtin.cpu.arch.endian() == .little) {
-        const raw = try readSlice(bytes, cursor, try std.math.mul(usize, count, @sizeOf(TrieEdge)));
-        @memcpy(std.mem.sliceAsBytes(edges), raw);
-    } else {
-        for (edges) |*edge| {
-            edge.* = .{
-                .byte = try readU8(bytes, cursor),
-                .child = try readU32(bytes, cursor),
-            };
-        }
-    }
-    for (edges) |edge| {
-        if (edge.child >= node_count) return error.InvalidDictionary;
-    }
-    return edges;
-}
-
-fn readTrieTerms(allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize, word_count: usize, id_limits: ConnectionIdLimits) ![]TrieTerm {
-    try ensureRecords(bytes, cursor.*, count, @sizeOf(TrieTerm));
-    const terms = try allocator.alloc(TrieTerm, count);
-    errdefer allocator.free(terms);
-    if (builtin.cpu.arch.endian() == .little) {
-        const raw = try readSlice(bytes, cursor, try std.math.mul(usize, count, @sizeOf(TrieTerm)));
-        @memcpy(std.mem.sliceAsBytes(terms), raw);
-    } else {
-        for (terms) |*term| {
-            term.* = .{
-                .word_id = try readU32(bytes, cursor),
-                .word_cost = try readI32(bytes, cursor),
-                .left_id = try readU16(bytes, cursor),
-                .right_id = try readU16(bytes, cursor),
-            };
-        }
-    }
-    // Full token backtrace resolves word ids through the entry or feature
-    // tables without bounds checks.
-    for (terms) |term| {
-        if (term.word_id >= word_count) return error.InvalidDictionary;
-        try id_limits.check(term.left_id, term.right_id);
-    }
-    return terms;
-}
-
-fn readTrieCountTerms(allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize, id_limits: ConnectionIdLimits) ![]TrieCountTerm {
-    try ensureRecords(bytes, cursor.*, count, @sizeOf(TrieCountTerm));
-    const terms = try allocator.alloc(TrieCountTerm, count);
-    errdefer allocator.free(terms);
-    if (builtin.cpu.arch.endian() == .little) {
-        const raw = try readSlice(bytes, cursor, try std.math.mul(usize, count, @sizeOf(TrieCountTerm)));
-        @memcpy(std.mem.sliceAsBytes(terms), raw);
-    } else {
-        for (terms) |*term| {
-            term.* = .{
-                .word_cost = try readI32(bytes, cursor),
-                .left_id = try readU16(bytes, cursor),
-                .right_id = try readU16(bytes, cursor),
-            };
-        }
-    }
-    for (terms) |term| try id_limits.check(term.left_id, term.right_id);
-    return terms;
+// Reads the fixed 16-byte header of a binary lexicon entry (surface_len u32,
+// left_id u16, right_id u16, word_cost i32, feature_len u32), checks that the
+// surface and feature bytes that follow are in bounds, and leaves `cursor` at
+// the start of the surface bytes.
+inline fn readBinaryEntryLens(bytes: []const u8, cursor: *usize) !struct { usize, usize } {
+    const start = cursor.*;
+    if (bytes.len - start < 16) return error.InvalidDictionary;
+    const header = bytes[start..][0..16];
+    const surface_len: usize = std.mem.readInt(u32, header[0..4], .little);
+    const feature_len: usize = std.mem.readInt(u32, header[12..16], .little);
+    const body = start + 16;
+    if (bytes.len - body < surface_len or bytes.len - body - surface_len < feature_len) return error.InvalidDictionary;
+    cursor.* = body;
+    return .{ surface_len, feature_len };
 }
 
 fn readU32Slice(allocator: Allocator, bytes: []const u8, cursor: *usize, count: usize, borrow: bool) ![]align(1) const u32 {
@@ -1999,14 +2258,10 @@ fn scanBinaryEntryFeatureBlobLen(bytes: []const u8, start_cursor: usize, entry_c
     var cursor = start_cursor;
     var total: usize = 0;
     for (0..entry_count) |_| {
-        const surface_len: usize = @intCast(try readU32(bytes, &cursor));
-        _ = try readU16(bytes, &cursor);
-        _ = try readU16(bytes, &cursor);
-        _ = try readI32(bytes, &cursor);
-        const feature_len: usize = @intCast(try readU32(bytes, &cursor));
-        total = try std.math.add(usize, total, feature_len);
-        _ = try readSlice(bytes, &cursor, surface_len);
-        _ = try readSlice(bytes, &cursor, feature_len);
+        const surface_len, const feature_len = try readBinaryEntryLens(bytes, &cursor);
+        cursor += surface_len + feature_len;
+        // Feature bytes are in bounds of `bytes`, so the sum cannot overflow.
+        total += feature_len;
     }
     return total;
 }
@@ -2259,7 +2514,7 @@ fn testSections(bytes: []const u8) !TestSections {
     const count_term_count = try readU32(bytes, &cursor);
     const pair_count = try readU32(bytes, &cursor);
     const nodes = trie_counts + 40;
-    const edges = nodes + binary_trie_node_len * @as(usize, node_count);
+    const edges = nodes + @sizeOf(TrieNode) * @as(usize, node_count);
     const terms = edges + @sizeOf(TrieEdge) * @as(usize, edge_count);
     const count_terms = terms + @sizeOf(TrieTerm) * @as(usize, term_count);
     return .{
@@ -2420,4 +2675,92 @@ test "binary dictionary rejects out-of-range word ids, offsets, and counts" {
     try expectPatchedError(bytes, binary_magic.len + 16, u32, 0xffff);
     try expectPatchedError(bytes, sections.trie_counts, u32, 0xffff_fff0);
     try expectPatchedError(bytes, sections.trie_counts + 16, u32, 1);
+}
+
+test "memory-mapped binary files get the same version and index validation" {
+    const allocator = std.testing.allocator;
+    const large_lex = try testLargeLex(allocator);
+    defer allocator.free(large_lex);
+    const bytes = try testBinary(allocator, large_lex);
+    defer allocator.free(bytes);
+    const sections = try testSections(bytes);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/dict.dic", .{tmp.sub_path});
+    const patched = try allocator.dupe(u8, bytes);
+    defer allocator.free(patched);
+
+    // A corrupted mapping must be rejected (and unmapped) by `fromBinaryFile`
+    // exactly like the in-memory loaders reject it.
+    const Patch = struct { offset: usize, value: u32, expected: anyerror };
+    const patches = [_]Patch{
+        .{ .offset = sections.edges + 1, .value = sections.node_count, .expected = error.InvalidDictionary },
+        .{ .offset = sections.nodes + 6, .value = sections.term_count + 1, .expected = error.InvalidDictionary },
+        .{ .offset = sections.terms, .value = std.mem.readInt(u32, bytes[binary_magic.len..][0..4], .little), .expected = error.InvalidDictionary },
+    };
+    for (patches) |patch| {
+        @memcpy(patched, bytes);
+        std.mem.writeInt(u32, patched[patch.offset..][0..4], patch.value, .little);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dict.dic", .data = patched });
+        try std.testing.expectError(patch.expected, Dictionary.fromBinaryFile(allocator, path));
+        try std.testing.expectError(patch.expected, Dictionary.fromBinaryFileCopy(allocator, path));
+    }
+    @memcpy(patched, bytes);
+    @memcpy(patched[0..binary_magic.len], binary_magic_v2);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dict.dic", .data = patched });
+    try std.testing.expectError(error.UnsupportedDictionaryVersion, Dictionary.fromBinaryFile(allocator, path));
+    try std.testing.expectError(error.UnsupportedDictionaryVersion, Dictionary.fromBinaryFileCopy(allocator, path));
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dict.dic", .data = bytes });
+    var dict = try Dictionary.fromBinaryFile(allocator, path);
+    defer dict.deinit();
+    try expectTokens(allocator, &dict, "本とカレーABC", &.{ "compound,book-and", "noun,curry", "alpha" });
+}
+
+test "double-array free bitmap search matches a linear scan" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+
+    var round: usize = 0;
+    while (round < 200) : (round += 1) {
+        const slot_len: usize = 64 * (1 + random.uintLessThan(usize, 64));
+        var free: DoubleArrayFreeBits = .{};
+        defer free.deinit(allocator);
+        try free.grow(allocator, slot_len);
+        const used = try allocator.alloc(bool, slot_len);
+        defer allocator.free(used);
+        const density = random.uintLessThan(u32, 100);
+        for (used, 0..) |*u, slot| {
+            u.* = random.uintLessThan(u32, 100) < density;
+            if (u.*) free.markUsed(slot);
+        }
+
+        var edge_buf: [256]TrieEdge = undefined;
+        const edge_len = 1 + random.uintLessThan(usize, 12);
+        var byte_set = std.StaticBitSet(256).initEmpty();
+        while (byte_set.count() < edge_len) byte_set.set(random.int(u8));
+        var it = byte_set.iterator(.{});
+        var n: usize = 0;
+        while (it.next()) |byte| : (n += 1) edge_buf[n] = .{ .byte = @intCast(byte), .child = 0 };
+        const node_edges = edge_buf[0..n];
+
+        const start = 1 + random.uintLessThan(usize, slot_len);
+        var expected = start;
+        while (true) : (expected += 1) {
+            var fits = true;
+            for (node_edges) |edge| {
+                const slot = expected + edge.byte;
+                if (slot < slot_len and used[slot]) fits = false;
+            }
+            if (fits) break;
+        }
+        try std.testing.expectEqual(expected, free.findBase(node_edges, start));
+
+        var expected_free = start;
+        while (expected_free < slot_len and used[expected_free]) expected_free += 1;
+        try std.testing.expectEqual(expected_free, @min(free.nextFree(start), slot_len));
+    }
 }

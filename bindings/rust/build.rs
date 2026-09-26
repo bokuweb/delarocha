@@ -6,19 +6,26 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ZIG_FFI");
     println!("cargo:rerun-if-env-changed=DELAROCHA_BUILD_ZIG");
     println!("cargo:rerun-if-changed=prebuilt");
-    println!("cargo:rerun-if-changed=../../zig/src/lib.zig");
-    println!("cargo:rerun-if-changed=../../zig/src/dictionary.zig");
-    println!("cargo:rerun-if-changed=../../zig/src/tokenizer.zig");
-    println!("cargo:rerun-if-changed=../../zig/src/ffi.zig");
-    println!("cargo:rerun-if-changed=../../zig/src/bench.zig");
-    println!("cargo:rerun-if-changed=../../zig/build.zig");
+
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"));
+    // The Zig sources live outside this crate and only exist in a repository
+    // checkout, not in the crates.io package. Watching missing paths would make
+    // Cargo rerun this script on every build, so only watch them when present.
+    let zig_dir = manifest_dir.join("../../zig");
+    if zig_dir.exists() {
+        println!("cargo:rerun-if-changed=../../zig/src/lib.zig");
+        println!("cargo:rerun-if-changed=../../zig/src/dictionary.zig");
+        println!("cargo:rerun-if-changed=../../zig/src/tokenizer.zig");
+        println!("cargo:rerun-if-changed=../../zig/src/ffi.zig");
+        println!("cargo:rerun-if-changed=../../zig/src/bench.zig");
+        println!("cargo:rerun-if-changed=../../zig/build.zig");
+    }
 
     if env::var_os("CARGO_FEATURE_ZIG_FFI").is_none() {
         return;
     }
 
-    let manifest_dir =
-        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"));
     let target = env::var("TARGET").expect("TARGET is set");
     let zig_target = zig_target(&target);
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -40,7 +47,14 @@ fn main() {
         return;
     }
 
-    let zig_lib = manifest_dir.join("../../zig/src/lib.zig");
+    let zig_lib = zig_dir.join("src/lib.zig");
+    assert!(
+        zig_lib.exists(),
+        "delarocha: no prebuilt Zig library for target `{target}` and Zig sources were not found at {}. \
+         The `zig-ffi` feature can only build from source in a delarocha repository checkout; \
+         use a supported prebuilt target or build without `--features zig-ffi`.",
+        zig_lib.display()
+    );
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"));
     let out_lib = if target_env == "msvc" {
         out_dir.join("delarocha_zig.lib")

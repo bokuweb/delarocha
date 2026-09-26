@@ -55,6 +55,38 @@
 |---|---|
 | `(begin, left_id)` predecessor cache | 8-way曖昧候補の512文字入力では約36.5 µsから25–30 µsへ改善したが、Worker肥大化とhot-path分岐により短文が約40 ns/文から58 ns/文以上へ悪化。総合回帰のため不採用。曖昧入力ベンチのみ残した。 |
 
+## 追加評価（2026-09-26）: 辞書load
+
+### 採用
+
+| 候補 | 結果 |
+|---|---|
+| 3-2 mmap + borrowをZig標準経路へ | `Dictionary.fromBinaryFile` / `Tokenizer.initBinaryFile` / `delarocha_tokenizer_new_binary(_count_only)`はファイルをread-only mmapし、Dictionaryがmappingを所有して`deinit`でunmapする。WindowsとWasm、mmap不可のfilesystemは従来のcopy経路へfallback。copyが必要な呼び出し側向けに`fromBinaryFileCopy` / `initBinaryFileCopy`を追加。 |
+| N5 Rust count-only | `count_only_from_binary_path`をRust側mmap + 新export `delarocha_tokenizer_new_binary_borrowed_bytes_count_only`へ変更。mmapは`ZigTokenizer`が所有し、native tokenizer解放後にdropされる。 |
+| trie tableのzero-copy borrow | `TrieNode`をDLRDIC02の22-byte recordと同一の`extern struct`（align(1)）にし、node・edge・term・count termをmmapから直接sliceする。従来はborrow load時間の約60%がnode decodeだった。`TrieTerm` / `TrieCountTerm`は`extern`化し、#32以降の書き出し（Zig auto layout）と同じfield順を固定。record layoutは不変（新旧builderの出力はmagic以外byte一致）。ただしDLRDIC02は#32前後で2種類のterm layoutが混在し区別できないため、magicをDLRDIC03に上げてDLRDIC02は`UnsupportedDictionaryVersion`で拒否する。borrowしたstreamもload時にnode range・edge child・word id・connection idを線形検証する（IPADIC mmap loadは約3.3ms→約7ms、tokenizeは誤差範囲）。 |
+| 非trie部の高速化 | 大辞書のentry loopは16-byte header内の2つの長さだけを読む。 |
+| error経路修正 | truncated binaryで`CharProperty`の二重free、未初期化category/range sliceのfree、matrix costのalignment不一致free、分岐内errdeferによるtrie tableのleakが起きていたのを修正し、truncated入力のtestを追加。 |
+
+IPADIC（89 MB）、M4、交互9回の中央値。load時間は同一process内の繰り返しload、RSSは`/usr/bin/time -l`のpeak（1文tokenize込み）。
+
+| 経路 | 変更前 | 変更後 |
+|---|---|---|
+| Zig `fromBinaryFile`（`initBinaryFile` / FFI path） | 22.4 ms / 159 MiB | 4.1 ms / 47 MiB |
+| Zig count（`fromBinaryFile` + discard） | 22.0 ms / 160 MiB | 4.1 ms / 47 MiB |
+| Zig `fromBorrowedBinaryBytes`（呼び出し側mmap） | 10.0 ms / 108 MiB | 4.1 ms / 47 MiB |
+| Zig `fromBinaryFileCopy`（従来copy） | 22.4 ms / 159 MiB | 19.9 ms / 165 MiB |
+| Rust `from_binary_path` | 10.4 ms / 110 MiB | 4.1 ms / 48 MiB |
+| Rust `count_only_from_binary_path` | 23.1 ms / 163 MiB | 4.1 ms / 47 MiB |
+
+tokenize出力digestは全load経路で一致。tokenize 1回あたりのcycle数（load差分を除去）はZig full/count・doc/linesとも変更前と±2%以内。copy経路は22-byte nodeのため+6 MiB。
+
+### 評価して不採用
+
+| 候補 | 理由 |
+|---|---|
+| `MADV_WILLNEED` | load時間はやや短縮するが、ファイル全体がresidentになりpeak RSSが約89 MiBへ増加。 |
+| binary v3（feature offset table分離） | 残りのload時間約4 msの大半はentry recordを走査する際のpage faultで、v3なら不要になりcount-onlyのRSSも約30 MiB減る見込み。ただしformat変更が必要なため今回は見送り。 |
+
 ## 検証
 
 - `cargo test -p delarocha --features zig-ffi`

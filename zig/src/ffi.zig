@@ -145,6 +145,16 @@ pub export fn delarocha_tokenizer_new_binary_borrowed_bytes(bytes_ptr: [*]const 
     return tokenizer;
 }
 
+/// Count-only variant of `delarocha_tokenizer_new_binary_borrowed_bytes`. The
+/// bytes (typically a caller-owned mmap) must outlive the tokenizer. Count-only
+/// tokenization never reads the borrowed feature blob, so those pages are not
+/// faulted in after loading.
+pub export fn delarocha_tokenizer_new_binary_borrowed_bytes_count_only(bytes_ptr: [*]const u8, bytes_len: usize) ?*Tokenizer {
+    const tokenizer = delarocha_tokenizer_new_binary_borrowed_bytes(bytes_ptr, bytes_len) orelse return null;
+    tokenizer.dictionary.discardFullTokenDataForCount();
+    return tokenizer;
+}
+
 pub export fn delarocha_tokenizer_new_binary_count_only(path: [*:0]const u8) ?*Tokenizer {
     const tokenizer = delarocha_tokenizer_new_binary(path) orelse return null;
     tokenizer.dictionary.discardFullTokenDataForCount();
