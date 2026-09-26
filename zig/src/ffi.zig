@@ -168,6 +168,27 @@ pub export fn delarocha_dictionary_write_binary(
     unk_path: [*:0]const u8,
     output_path: [*:0]const u8,
 ) i32 {
+    return delarocha_dictionary_write_binary_with_id_order(lex_path, matrix_path, char_path, unk_path, output_path, id_order_dictionary_prior, null);
+}
+
+/// Connection-id orders for `delarocha_dictionary_write_binary_with_id_order`
+/// (see `Dictionary.renumberConnectionIds`). Renumbering never changes
+/// tokenization output; it only makes frequently used connection costs
+/// cache-local.
+const id_order_original: u32 = 0; // keep the raw ids
+const id_order_dictionary_prior: u32 = 1; // estimate usage from the lexicon (default)
+const id_order_weights_file: u32 = 2; // `order_path`: "id left_weight right_weight" lines
+const id_order_sample_text: u32 = 3; // `order_path`: sample text, tokenized line by line
+
+pub export fn delarocha_dictionary_write_binary_with_id_order(
+    lex_path: [*:0]const u8,
+    matrix_path: [*:0]const u8,
+    char_path: [*:0]const u8,
+    unk_path: [*:0]const u8,
+    output_path: [*:0]const u8,
+    id_order: u32,
+    order_path: ?[*:0]const u8,
+) i32 {
     if (comptime is_wasm) {
         setLastError("dictionary binary writing is not available on wasm", .{});
         return -1;
@@ -183,6 +204,10 @@ pub export fn delarocha_dictionary_write_binary(
         return -1;
     };
     defer dict.deinit();
+    renumberForBinary(&dict, id_order, order_path) catch |err| {
+        setLastError("failed to renumber connection ids: {s}", .{@errorName(err)});
+        return -1;
+    };
 
     const bytes = dict.toBinaryAlloc(c_allocator) catch |err| {
         setLastError("failed to encode binary dictionary: {s}", .{@errorName(err)});
@@ -200,6 +225,25 @@ pub export fn delarocha_dictionary_write_binary(
         return -1;
     };
     return 0;
+}
+
+fn renumberForBinary(dict: *Dictionary, id_order: u32, order_path: ?[*:0]const u8) !void {
+    if (id_order == id_order_original) return;
+    const weights = switch (id_order) {
+        id_order_dictionary_prior => try dict.connectionIdPriorWeights(c_allocator),
+        id_order_weights_file, id_order_sample_text => blk: {
+            const path = order_path orelse return error.MissingIdOrderPath;
+            const bytes = try dict_mod.readFileAlloc(c_allocator, std.mem.span(path));
+            defer c_allocator.free(bytes);
+            break :blk if (id_order == id_order_weights_file)
+                try dict_mod.ConnectionIdWeights.parse(c_allocator, dict.matrix.left_size, dict.matrix.right_size, bytes)
+            else
+                try tokenizer_mod.sampleConnectionIdWeights(c_allocator, dict, bytes);
+        },
+        else => return error.InvalidIdOrder,
+    };
+    defer weights.deinit(c_allocator);
+    try dict.renumberConnectionIds(weights);
 }
 
 pub export fn delarocha_tokenizer_free(tokenizer: ?*Tokenizer) void {

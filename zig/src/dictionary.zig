@@ -1218,7 +1218,184 @@ pub const Dictionary = struct {
         const end = @min(@max(@as(usize, offsets[index + 1]), start), self.entry_blob.len);
         return self.entry_blob[start..end];
     }
+
+    /// Renumbers the connection (context) ids of a dictionary built from raw
+    /// files so that ids with larger weights get smaller numbers: left ids
+    /// select connection-matrix rows and right ids select columns, so the
+    /// frequently used costs end up in a few adjacent cache lines. Id 0
+    /// (BOS/EOS) keeps its number. The permutation is applied consistently to
+    /// the matrix and every entry, unknown-word and trie term, so costs and
+    /// tokenization results are unchanged; only the ids stored in the
+    /// dictionary change (no public API exposes them).
+    pub fn renumberConnectionIds(self: *Dictionary, weights: ConnectionIdWeights) !void {
+        if (!self.owns_matrix_costs or !self.owns_trie_streams) return error.BorrowedDictionary;
+        const left_size = self.matrix.left_size;
+        const right_size = self.matrix.right_size;
+        if (weights.left.len != left_size or weights.right.len != right_size) return error.InvalidDictionary;
+        const left_map = try connectionIdMap(self.allocator, weights.left);
+        defer self.allocator.free(left_map);
+        const right_map = try connectionIdMap(self.allocator, weights.right);
+        defer self.allocator.free(right_map);
+
+        const old_costs = self.matrix.costs;
+        const costs = try self.allocator.alloc(i16, old_costs.len);
+        for (0..left_size) |left| {
+            const row = costs[@as(usize, left_map[left]) * right_size ..][0..right_size];
+            const old_row = old_costs[left * right_size ..][0..right_size];
+            for (old_row, right_map) |cost, new_right| row[new_right] = cost;
+        }
+        freeI16Slice(self.allocator, old_costs);
+        self.matrix.costs = costs;
+
+        const maps: ConnectionIdMaps = .{ .left = left_map, .right = right_map };
+        for (self.entries) |*entry| maps.apply(entry);
+        for (self.user_entries) |*entry| maps.apply(entry);
+        for (self.unk_entries) |*entry| maps.apply(entry);
+        for (@constCast(self.trie_terms)) |*term| maps.apply(term);
+        for (@constCast(self.trie_count_terms)) |*term| maps.apply(term);
+        for (self.unk_index.buckets) |bucket| for (bucket) |*term| maps.apply(term);
+        for (self.unk_index.count_buckets) |bucket| for (bucket) |*term| maps.apply(term);
+        for (self.unk_index.fallback_terms) |*term| maps.apply(term);
+    }
+
+    /// Connection-id weights estimated from the dictionary alone, for
+    /// `renumberConnectionIds`. The tokenizer evaluates matrix costs for every
+    /// lattice node, i.e. for every dictionary surface that occurs in the
+    /// input, so an id's weight is the probability that one of its surfaces
+    /// occurs at a random input position under a character unigram model
+    /// fitted to the lexicon surfaces (characters of cheaper, i.e. more
+    /// common, words count more). Unknown-word ids fire on almost every
+    /// kanji or katakana run and are ranked first.
+    pub fn connectionIdPriorWeights(self: *const Dictionary, allocator: Allocator) !ConnectionIdWeights {
+        const weights = try ConnectionIdWeights.init(allocator, self.matrix.left_size, self.matrix.right_size);
+        errdefer weights.deinit(allocator);
+
+        var char_weights: std.AutoHashMapUnmanaged(u21, f64) = .empty;
+        defer char_weights.deinit(allocator);
+        var total: f64 = 0;
+        for (self.entries) |entry| {
+            const entry_weight = @exp(-@as(f64, @floatFromInt(entry.word_cost)) / prior_cost_scale);
+            var it = surfaceChars(entry.surface);
+            while (it.next()) |ch| {
+                const slot = try char_weights.getOrPutValue(allocator, ch, 0);
+                slot.value_ptr.* += entry_weight;
+                total += entry_weight;
+            }
+        }
+        var max_weight: f64 = 0;
+        for (self.entries) |entry| {
+            var probability: f64 = 1;
+            var it = surfaceChars(entry.surface);
+            while (it.next()) |ch| probability *= char_weights.get(ch).? / total;
+            if (entry.left_id < weights.left.len) weights.left[entry.left_id] += probability;
+            if (entry.right_id < weights.right.len) weights.right[entry.right_id] += probability;
+        }
+        for (weights.left) |w| max_weight = @max(max_weight, w);
+        for (weights.right) |w| max_weight = @max(max_weight, w);
+        for (self.unk_entries) |entry| {
+            if (entry.left_id < weights.left.len) weights.left[entry.left_id] += max_weight;
+            if (entry.right_id < weights.right.len) weights.right[entry.right_id] += max_weight;
+        }
+        return weights;
+    }
 };
+
+/// Per-id weights for `Dictionary.renumberConnectionIds` (`left` has
+/// `matrix.left_size` items, `right` has `matrix.right_size`).
+pub const ConnectionIdWeights = struct {
+    left: []f64,
+    right: []f64,
+
+    pub fn init(allocator: Allocator, left_size: usize, right_size: usize) !ConnectionIdWeights {
+        const left = try allocator.alloc(f64, left_size);
+        errdefer allocator.free(left);
+        const right = try allocator.alloc(f64, right_size);
+        @memset(left, 0);
+        @memset(right, 0);
+        return .{ .left = left, .right = right };
+    }
+
+    pub fn deinit(self: ConnectionIdWeights, allocator: Allocator) void {
+        allocator.free(self.left);
+        allocator.free(self.right);
+    }
+
+    /// Parses "id left_weight right_weight" lines (blank lines and `#`
+    /// comments are skipped; ids not listed get weight 0).
+    pub fn parse(allocator: Allocator, left_size: usize, right_size: usize, input: []const u8) !ConnectionIdWeights {
+        const weights = try init(allocator, left_size, right_size);
+        errdefer weights.deinit(allocator);
+        var lines = std.mem.splitScalar(u8, input, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            var fields = std.mem.tokenizeAny(u8, line, " \t,");
+            const id = try std.fmt.parseInt(usize, fields.next() orelse return error.InvalidDictionary, 10);
+            const left = try std.fmt.parseFloat(f64, fields.next() orelse return error.InvalidDictionary);
+            const right = try std.fmt.parseFloat(f64, fields.next() orelse return error.InvalidDictionary);
+            if (!(left >= 0) or !(right >= 0)) return error.InvalidDictionary;
+            if (id < left_size) weights.left[id] = left;
+            if (id < right_size) weights.right[id] = right;
+        }
+        return weights;
+    }
+};
+
+// ipadic word costs are roughly -log(p) scaled by several hundred; this only
+// sharpens the character model towards common words.
+const prior_cost_scale: f64 = 500;
+
+const ConnectionIdMaps = struct {
+    left: []const u16,
+    right: []const u16,
+
+    inline fn apply(self: ConnectionIdMaps, item: anytype) void {
+        if (item.left_id < self.left.len) item.left_id = self.left[item.left_id];
+        if (item.right_id < self.right.len) item.right_id = self.right[item.right_id];
+    }
+};
+
+// Maps old id -> new id: id 0 stays first, the rest by descending weight
+// (ties keep the original order).
+fn connectionIdMap(allocator: Allocator, weights: []const f64) ![]u16 {
+    if (weights.len > std.math.maxInt(u16) + 1) return error.InvalidDictionary;
+    const order = try allocator.alloc(u16, weights.len);
+    defer allocator.free(order);
+    for (order, 0..) |*id, i| id.* = @intCast(i);
+    if (order.len > 1) {
+        const Context = struct {
+            weights: []const f64,
+            fn lessThan(ctx: @This(), lhs: u16, rhs: u16) bool {
+                const lw = ctx.weights[lhs];
+                const rw = ctx.weights[rhs];
+                if (lw != rw) return lw > rw;
+                return lhs < rhs;
+            }
+        };
+        std.sort.pdq(u16, order[1..], Context{ .weights = weights }, Context.lessThan);
+    }
+    const map = try allocator.alloc(u16, weights.len);
+    for (order, 0..) |old, new| map[old] = @intCast(new);
+    return map;
+}
+
+const SurfaceChars = struct {
+    bytes: []const u8,
+    index: usize = 0,
+
+    fn next(self: *SurfaceChars) ?u21 {
+        if (self.index >= self.bytes.len) return null;
+        const len = std.unicode.utf8ByteSequenceLength(self.bytes[self.index]) catch 1;
+        const end = @min(self.index + len, self.bytes.len);
+        const ch = std.unicode.utf8Decode(self.bytes[self.index..end]) catch self.bytes[self.index];
+        self.index = if (end > self.index) end else self.index + 1;
+        return ch;
+    }
+};
+
+fn surfaceChars(surface: []const u8) SurfaceChars {
+    return .{ .bytes = surface };
+}
 
 /// Build-time `feature_codec` output for `toBinaryAllocWithOptions`.
 const CompactFeatures = struct {

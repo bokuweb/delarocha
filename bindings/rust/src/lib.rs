@@ -2100,12 +2100,14 @@ pub mod ffi {
             bytes_ptr: *const u8,
             bytes_len: usize,
         ) -> *mut RawTokenizer;
-        fn delarocha_dictionary_write_binary(
+        fn delarocha_dictionary_write_binary_with_id_order(
             lex_path: *const std::ffi::c_char,
             matrix_path: *const std::ffi::c_char,
             char_path: *const std::ffi::c_char,
             unk_path: *const std::ffi::c_char,
             output_path: *const std::ffi::c_char,
+            id_order: u32,
+            order_path: *const std::ffi::c_char,
         ) -> i32;
         fn delarocha_tokenizer_free(tokenizer: *mut RawTokenizer);
         fn delarocha_worker_new(tokenizer: *mut RawTokenizer) -> *mut RawWorker;
@@ -2154,6 +2156,30 @@ pub mod ffi {
     // Mirrors the error kinds exported by `zig/src/ffi.zig`.
     const ERROR_KIND_INVALID_DICTIONARY: u32 = 1;
     const ERROR_KIND_UNSUPPORTED_DICTIONARY_VERSION: u32 = 2;
+
+    /// How [`ZigTokenizer::write_binary_from_raw_paths_with_id_order`] numbers
+    /// the connection (left/right context) ids in the binary dictionary.
+    ///
+    /// Renumbering never changes tokenization output (token spans, word ids,
+    /// features and costs are identical, and no API exposes connection ids);
+    /// it only places the frequently used rows and columns of the connection
+    /// matrix next to each other so they share cache lines.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub enum ConnectionIdOrder {
+        /// Keep the ids of the raw dictionary files.
+        Original,
+        /// Rank ids by how often their surfaces are expected to occur in text,
+        /// estimated from the lexicon alone (the default).
+        #[default]
+        DictionaryPrior,
+        /// Rank ids by weights read from a file of `id left_weight
+        /// right_weight` lines (ids not listed get weight 0).
+        WeightsFile(std::path::PathBuf),
+        /// Rank ids by how often the tokenizer looks them up while tokenizing
+        /// this sample text line by line. Use text representative of (but not
+        /// identical to) the text you will tokenize.
+        SampleText(std::path::PathBuf),
+    }
 
     pub struct ZigTokenizer {
         raw: NonNull<RawTokenizer>,
@@ -2557,6 +2583,8 @@ pub mod ffi {
             })
         }
 
+        /// Builds a binary dictionary from raw MeCab files, renumbering
+        /// connection ids with [`ConnectionIdOrder::DictionaryPrior`].
         pub fn write_binary_from_raw_paths(
             lex_path: impl AsRef<Path>,
             matrix_path: impl AsRef<Path>,
@@ -2564,33 +2592,51 @@ pub mod ffi {
             unk_path: impl AsRef<Path>,
             output_path: impl AsRef<Path>,
         ) -> Result<()> {
-            let lex_path =
-                CString::new(lex_path.as_ref().as_os_str().to_string_lossy().as_bytes())?;
-            let matrix_path = CString::new(
-                matrix_path
-                    .as_ref()
-                    .as_os_str()
-                    .to_string_lossy()
-                    .as_bytes(),
-            )?;
-            let char_path =
-                CString::new(char_path.as_ref().as_os_str().to_string_lossy().as_bytes())?;
-            let unk_path =
-                CString::new(unk_path.as_ref().as_os_str().to_string_lossy().as_bytes())?;
-            let output_path = CString::new(
-                output_path
-                    .as_ref()
-                    .as_os_str()
-                    .to_string_lossy()
-                    .as_bytes(),
-            )?;
+            Self::write_binary_from_raw_paths_with_id_order(
+                lex_path,
+                matrix_path,
+                char_path,
+                unk_path,
+                output_path,
+                &ConnectionIdOrder::default(),
+            )
+        }
+
+        /// Builds a binary dictionary from raw MeCab files with an explicit
+        /// connection-id order (see [`ConnectionIdOrder`]).
+        pub fn write_binary_from_raw_paths_with_id_order(
+            lex_path: impl AsRef<Path>,
+            matrix_path: impl AsRef<Path>,
+            char_path: impl AsRef<Path>,
+            unk_path: impl AsRef<Path>,
+            output_path: impl AsRef<Path>,
+            id_order: &ConnectionIdOrder,
+        ) -> Result<()> {
+            fn c_path(path: &Path) -> Result<CString> {
+                Ok(CString::new(path.as_os_str().to_string_lossy().as_bytes())?)
+            }
+            let lex_path = c_path(lex_path.as_ref())?;
+            let matrix_path = c_path(matrix_path.as_ref())?;
+            let char_path = c_path(char_path.as_ref())?;
+            let unk_path = c_path(unk_path.as_ref())?;
+            let output_path = c_path(output_path.as_ref())?;
+            let (order, order_path) = match id_order {
+                ConnectionIdOrder::Original => (0, None),
+                ConnectionIdOrder::DictionaryPrior => (1, None),
+                ConnectionIdOrder::WeightsFile(path) => (2, Some(c_path(path)?)),
+                ConnectionIdOrder::SampleText(path) => (3, Some(c_path(path)?)),
+            };
             let status = unsafe {
-                delarocha_dictionary_write_binary(
+                delarocha_dictionary_write_binary_with_id_order(
                     lex_path.as_ptr(),
                     matrix_path.as_ptr(),
                     char_path.as_ptr(),
                     unk_path.as_ptr(),
                     output_path.as_ptr(),
+                    order,
+                    order_path
+                        .as_ref()
+                        .map_or(std::ptr::null(), |path| path.as_ptr()),
                 )
             };
             if status != 0 {

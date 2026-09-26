@@ -203,6 +203,18 @@ files with `ZigTokenizer::write_binary_from_raw_paths` (or Zig's
 `Dictionary.toBinaryAlloc`). Rebuilding the same raw files produces
 byte-identical output.
 
+When writing a binary dictionary, the connection (left/right context) ids are
+renumbered so that frequently used connection-matrix rows and columns sit next
+to each other in memory. By default the order is estimated from the lexicon
+alone (`ConnectionIdOrder::DictionaryPrior`);
+`ZigTokenizer::write_binary_from_raw_paths_with_id_order` can instead keep the
+raw ids (`Original`), rank them by a precomputed `id left_weight right_weight`
+file (`WeightsFile`), or measure them by tokenizing a sample text
+(`SampleText`; use text representative of, but not identical to, the text you
+will tokenize). Renumbering is invisible to callers: token spans, word ids,
+features and costs are unchanged, and no API exposes connection ids. On the
+Yokohama benchmark it speeds up tokenization by roughly 2-4%.
+
 Large dictionaries store entry features compactly: the leading CSV columns
 (for IPADIC the six part-of-speech/conjugation columns) come from a small
 shared table, and the remaining columns are encoded as back-references to the
