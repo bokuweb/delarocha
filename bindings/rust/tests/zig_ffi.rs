@@ -320,3 +320,95 @@ impl XorShift64 {
         x
     }
 }
+
+fn write_fixture_binary(dir: &std::path::Path) -> Vec<u8> {
+    let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let binary_path = dir.join("fixture.dic");
+    ZigTokenizer::write_binary_from_raw_paths(
+        fixture_dir.join("lex.csv"),
+        fixture_dir.join("matrix.def"),
+        fixture_dir.join("char.def"),
+        fixture_dir.join("unk.def"),
+        &binary_path,
+    )
+    .expect("Zig writes binary dictionary");
+    std::fs::read(&binary_path).expect("read binary fixture")
+}
+
+// Loads through both the copying byte loader and the mmap-borrowing path
+// loader, which alias the file for the matrix and trie tables.
+fn load_binary_both_ways(dir: &std::path::Path, bytes: &[u8]) -> Vec<delarocha::Error> {
+    let path = dir.join("corrupt.dic");
+    std::fs::write(&path, bytes).expect("write corrupt dictionary");
+    vec![
+        ZigTokenizer::from_binary_bytes(bytes)
+            .err()
+            .expect("byte load must fail"),
+        ZigTokenizer::from_binary_path(&path)
+            .err()
+            .expect("mmap load must fail"),
+        ZigTokenizer::count_only_from_binary_path(&path)
+            .err()
+            .expect("count-only load must fail"),
+    ]
+}
+
+#[test]
+fn zig_ffi_rejects_stale_binary_dictionary_version() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let mut bytes = write_fixture_binary(temp_dir.path());
+    assert_eq!(&bytes[..8], b"DLRDIC03");
+    bytes[..8].copy_from_slice(b"DLRDIC02");
+    for err in load_binary_both_ways(temp_dir.path(), &bytes) {
+        assert!(
+            matches!(&err, delarocha::Error::UnsupportedDictionaryVersion(message) if message.contains("rebuild")),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn zig_ffi_rejects_truncated_binary_dictionary() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let bytes = write_fixture_binary(temp_dir.path());
+    for len in [0, 7, 8, 20, bytes.len() / 2, bytes.len() - 1] {
+        for err in load_binary_both_ways(temp_dir.path(), &bytes[..len]) {
+            assert!(
+                matches!(&err, delarocha::Error::InvalidDictionary(message) if message.contains("InvalidDictionary")),
+                "unexpected error at len {len}: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn zig_ffi_rejects_out_of_range_connection_id() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let mut bytes = write_fixture_binary(temp_dir.path());
+    // Header: magic, then six u32 counts. The first entry record starts with
+    // its surface length followed by the u16 left id.
+    let left_id_offset = 8 + 6 * 4 + 4;
+    bytes[left_id_offset..left_id_offset + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+    for err in load_binary_both_ways(temp_dir.path(), &bytes) {
+        assert!(
+            matches!(err, delarocha::Error::InvalidDictionary(_)),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn zig_ffi_rejects_stale_binary_dictionary_file() {
+    // Optional: point this at a DLRDIC02 dictionary built by an older release.
+    let Some(path) = std::env::var_os("DELAROCHA_STALE_BINARY_DIC") else {
+        return;
+    };
+    let err = ZigTokenizer::from_binary_path(&path)
+        .err()
+        .expect("stale dictionary must be rejected");
+    assert!(
+        matches!(err, delarocha::Error::UnsupportedDictionaryVersion(_)),
+        "unexpected error: {err}"
+    );
+    println!("{err}");
+}
