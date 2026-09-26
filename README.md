@@ -74,6 +74,9 @@ fn main() -> delarocha::Result<()> {
 }
 ```
 
+While delarocha is 0.x, rebuild `ipadic.dic` when upgrading to a new minor
+version (see [Binary dictionary compatibility](#binary-dictionary-compatibility)).
+
 Without `zig-ffi`, the pure-Rust tokenizer reads the same raw files directly:
 
 ```rust,no_run
@@ -123,6 +126,19 @@ not contain the Zig sources. Either use the pure-Rust tokenizer, or depend on a
 dependency) with Zig 0.16 on `PATH`: unsupported targets then build the static
 library from `zig/src/lib.zig`. Set `DELAROCHA_BUILD_ZIG=1` to rebuild it from
 source even for bundled targets.
+
+## Binary dictionary compatibility
+
+While delarocha is at 0.x, the binary dictionary format written by
+`ZigTokenizer::write_binary_from_raw_paths` may change between minor versions
+(0.1 to 0.2, for example); patch releases keep it. The current format is
+version 4 (magic `DLRDIC04`). A file written by another format version is
+rejected at load time with `Error::UnsupportedDictionaryVersion` (Zig:
+`error.UnsupportedDictionaryVersion`) and must be rebuilt from the raw MeCab
+dictionary files, so keep the raw files, or rebuild the binary dictionary as
+part of your build or deployment, rather than shipping only the `.dic` file.
+Rebuilding the same raw files with the same delarocha version produces
+byte-identical output.
 
 ## Zig tokenizer
 

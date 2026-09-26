@@ -2,7 +2,7 @@
 //! dictionaries (such as IPADIC) and produces MeCab/Vibrato-compatible
 //! segmentation.
 //!
-//! - [`ffi`] (feature `zig-ffi`): the fast path, a tokenizer core written in
+//! - `ffi` (feature `zig-ffi`): the fast path, a tokenizer core written in
 //!   Zig and linked from prebuilt static libraries. Dictionaries are compiled
 //!   once into a binary file that is memory-mapped at load time.
 //! - [`Tokenizer`]: a pure-Rust tokenizer that reads the raw dictionary files
@@ -70,6 +70,18 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Binary dictionary compatibility
+//!
+//! While delarocha is at 0.x, the binary dictionary format written by
+//! `ffi::ZigTokenizer::write_binary_from_raw_paths` may change between minor
+//! versions (0.1 to 0.2, for example); patch releases keep it. The current
+//! format is version 4 (magic `DLRDIC04`). A file written by another format
+//! version is rejected at load time with
+//! [`Error::UnsupportedDictionaryVersion`] and must be rebuilt from the raw
+//! MeCab dictionary files, so keep the raw files (or rebuild as part of your
+//! build or deployment) rather than shipping only the `.dic` file.
+
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::cmp::Ordering;
