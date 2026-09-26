@@ -228,6 +228,18 @@ test "binary file loaders (mmap, copy, borrowed, count-only) agree" {
             try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dict.dic", .data = binary[0..len] });
             try std.testing.expectError(error.InvalidDictionary, Dictionary.fromBinaryFile(allocator, path));
         }
+
+        // Files written by earlier format versions are rejected up front
+        // instead of being misread with the current layout.
+        const legacy = try allocator.dupe(u8, binary);
+        defer allocator.free(legacy);
+        for ([_][]const u8{ "DLRDIC01", "DLRDIC02" }) |magic| {
+            @memcpy(legacy[0..magic.len], magic);
+            try std.testing.expectError(error.UnsupportedDictionaryVersion, Dictionary.fromBinaryBytes(allocator, legacy));
+            try std.testing.expectError(error.UnsupportedDictionaryVersion, Dictionary.fromBorrowedBinaryBytes(allocator, legacy));
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dict.dic", .data = legacy });
+            try std.testing.expectError(error.UnsupportedDictionaryVersion, Dictionary.fromBinaryFile(allocator, path));
+        }
     }
 }
 
