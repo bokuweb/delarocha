@@ -38,7 +38,11 @@ fn readme_quick_start_zig() -> delarocha::Result<()> {
     }
     assert_eq!(
         output,
-        ["本と\tcompound,book-and", "カレー\tnoun,curry", "本と\tcompound,book-and"]
+        [
+            "本と\tcompound,book-and",
+            "カレー\tnoun,curry",
+            "本と\tcompound,book-and"
+        ]
     );
     Ok(())
 }
