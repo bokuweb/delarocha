@@ -11,6 +11,7 @@ pub const Token = tokenizer.Token;
 
 comptime {
     _ = ffi.delarocha_last_error;
+    _ = ffi.delarocha_last_error_kind;
     _ = ffi.delarocha_tokenizer_new;
     _ = ffi.delarocha_tokenizer_new_raw;
     _ = ffi.delarocha_tokenizer_new_raw_count_only;

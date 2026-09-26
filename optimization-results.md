@@ -63,7 +63,7 @@
 |---|---|
 | 3-2 mmap + borrowをZig標準経路へ | `Dictionary.fromBinaryFile` / `Tokenizer.initBinaryFile` / `delarocha_tokenizer_new_binary(_count_only)`はファイルをread-only mmapし、Dictionaryがmappingを所有して`deinit`でunmapする。WindowsとWasm、mmap不可のfilesystemは従来のcopy経路へfallback。copyが必要な呼び出し側向けに`fromBinaryFileCopy` / `initBinaryFileCopy`を追加。 |
 | N5 Rust count-only | `count_only_from_binary_path`をRust側mmap + 新export `delarocha_tokenizer_new_binary_borrowed_bytes_count_only`へ変更。mmapは`ZigTokenizer`が所有し、native tokenizer解放後にdropされる。 |
-| trie tableのzero-copy borrow | `TrieNode`をDLRDIC02の22-byte recordと同一の`extern struct`（align(1)）にし、node・edge・term・count termをmmapから直接sliceする。従来はborrow load時間の約60%がnode decodeだった。`TrieTerm` / `TrieCountTerm`は`extern`化し、#32以降の書き出し（Zig auto layout）と同じfield順を固定。binary formatは不変（新旧builderの出力はbyte一致）。 |
+| trie tableのzero-copy borrow | `TrieNode`をDLRDIC02の22-byte recordと同一の`extern struct`（align(1)）にし、node・edge・term・count termをmmapから直接sliceする。従来はborrow load時間の約60%がnode decodeだった。`TrieTerm` / `TrieCountTerm`は`extern`化し、#32以降の書き出し（Zig auto layout）と同じfield順を固定。binary formatは不変（新旧builderの出力はbyte一致）。format v3（#39）以降、load時はborrowしたtableも含めてfeature offset table・node range/edge・word id・connection id・double-array slotを線形検証し、DLRDIC01/02と未知の`DLRDIC??`は`UnsupportedDictionaryVersion`で拒否する。 |
 | 非trie部の高速化 | 大辞書のentry loopは16-byte header内の2つの長さだけを読む。 |
 | error経路修正 | truncated binaryで`CharProperty`の二重free、未初期化category/range sliceのfree、matrix costのalignment不一致free、分岐内errdeferによるtrie tableのleakが起きていたのを修正し、truncated入力のtestを追加。 |
 
