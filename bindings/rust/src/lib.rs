@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 use std::cmp::Ordering;
 use std::ffi::NulError;
 #[cfg(feature = "vibrato-system")]
@@ -262,21 +264,25 @@ impl Dictionary {
 }
 
 #[cfg(feature = "vibrato-system")]
+#[cfg_attr(docsrs, doc(cfg(feature = "vibrato-system")))]
 pub struct VibratoSystemDictionary {
     inner: vibrato::Dictionary,
 }
 
 #[cfg(feature = "vibrato-system")]
+#[cfg_attr(docsrs, doc(cfg(feature = "vibrato-system")))]
 pub struct VibratoSystemTokenizer {
     inner: vibrato::Tokenizer,
 }
 
 #[cfg(feature = "vibrato-system")]
+#[cfg_attr(docsrs, doc(cfg(feature = "vibrato-system")))]
 pub struct VibratoSystemWorker<'a> {
     inner: vibrato::tokenizer::worker::Worker<'a>,
 }
 
 #[cfg(feature = "vibrato-system")]
+#[cfg_attr(docsrs, doc(cfg(feature = "vibrato-system")))]
 pub struct VibratoSystemToken<'w, 't> {
     inner: vibrato::token::Token<'w, 't>,
 }
@@ -2056,6 +2062,7 @@ fn parse_i32(field: &str, line_no: usize, name: &str) -> Result<i32> {
 }
 
 #[cfg(feature = "zig-ffi")]
+#[cfg_attr(docsrs, doc(cfg(feature = "zig-ffi")))]
 pub mod ffi {
     use super::*;
     use std::ffi::{CStr, CString};

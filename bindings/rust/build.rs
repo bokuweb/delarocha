@@ -5,6 +5,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ZIG_FFI");
     println!("cargo:rerun-if-env-changed=DELAROCHA_BUILD_ZIG");
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-changed=prebuilt");
 
     let manifest_dir =
@@ -45,6 +46,12 @@ fn main() {
         // DELAROCHA_BUILD_ZIG=1 when developing delarocha itself and you need
         // to rebuild the native library from the current Zig sources.
         link_static_library(&prebuilt_dir);
+        return;
+    }
+
+    if env::var_os("DOCS_RS").is_some() {
+        // docs.rs builds documentation offline without Zig. Rustdoc does not
+        // link, so skip the native library for targets without a prebuilt one.
         return;
     }
 
