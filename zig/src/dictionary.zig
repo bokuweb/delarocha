@@ -1,12 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
+pub const feature_codec = @import("feature_codec.zig");
 
 const Allocator = std.mem.Allocator;
-// Binary dictionary format version 3. Every table starts at a 16-byte
+// Binary dictionary format version 4. Every table starts at a 16-byte
 // aligned file offset so memory-mapped dictionaries can borrow them directly,
 // and entry features are located through a separate offset table so loading
-// never walks the per-entry data.
-const binary_magic = "DLRDIC03";
+// never walks the per-entry data. Version 4 may store large dictionaries'
+// entry features as `feature_codec` records plus a prefix table.
+const binary_magic = "DLRDIC04";
 // Earlier layouts are only recognized to report a clear error: they must be
 // rebuilt from the raw dictionary with the current version. DLRDIC02 in
 // particular was written with two incompatible trie term layouts (explicit
@@ -14,12 +16,26 @@ const binary_magic = "DLRDIC03";
 // Any other `DLRDIC??` magic is a version this loader does not know and is
 // reported the same way.
 const binary_magic_prefix = "DLRDIC";
-const legacy_binary_magics = [_][]const u8{ "DLRDIC01", "DLRDIC02" };
+const legacy_binary_magics = [_][]const u8{ "DLRDIC01", "DLRDIC02", "DLRDIC03" };
 
 // Known word ids share the u32 id space with user (`1 << 30`) and unknown
 // (`1 << 31`) word ids in the tokenizer, so binary dictionaries must stay below
 // the user word base for every word id to resolve to its own feature table.
 const max_binary_word_count: usize = 1 << 30;
+const binary_header_fields = 21;
+const binary_aligned_sections = 17;
+// Values of the `feature_encoding` header field.
+const feature_encoding_raw: u32 = 0;
+const feature_encoding_compact: u32 = 1;
+
+/// Options for `Dictionary.toBinaryAllocWithOptions`.
+pub const BinaryOptions = struct {
+    /// Store large dictionaries' entry features as `feature_codec` records
+    /// (part-of-speech prefix table, back-references to the surface and to
+    /// earlier columns). The builder keeps the raw layout when that is not
+    /// smaller. Tokens carry byte-identical features either way.
+    compact_features: bool = true,
+};
 const binary_section_align = 16;
 // Dictionaries with at most this many entries tokenize through the linear
 // first-byte entry index (and keep `entries`); larger ones use the trie only.
@@ -419,6 +435,13 @@ pub const Dictionary = struct {
     owns_entry_blob: bool,
     user_entries: []Entry,
     unk_entries: []UnkEntry,
+    // Set when `entry_blob` holds `feature_codec` records instead of raw
+    // feature bytes. `feature_table` is then the prefix table, borrowed from
+    // memory-mapped files like the offset table, or owned per the flags below.
+    features_compact: bool = false,
+    feature_table: feature_codec.Table = .{},
+    owns_feature_table_offsets: bool = false,
+    owns_feature_table_blob: bool = false,
     // Mirrors `entry_blob` for unknown-word features loaded from binary files.
     unk_feature_blob: []const u8,
     owns_unk_feature_blob: bool,
@@ -658,11 +681,10 @@ pub const Dictionary = struct {
     }
 
     pub fn toBinaryAlloc(self: *const Dictionary, allocator: Allocator) ![]u8 {
-        var bytes: std.ArrayList(u8) = .empty;
-        errdefer bytes.deinit(allocator);
-        try bytes.ensureTotalCapacity(allocator, try self.binarySize());
-        try bytes.appendSlice(allocator, binary_magic);
+        return self.toBinaryAllocWithOptions(allocator, .{});
+    }
 
+    pub fn toBinaryAllocWithOptions(self: *const Dictionary, allocator: Allocator, options: BinaryOptions) ![]u8 {
         // Large dictionaries tokenize through the trie and only need entry
         // features; surfaces and connection ids per entry are stored for small
         // dictionaries, which rebuild `entries` for the linear entry index.
@@ -674,13 +696,32 @@ pub const Dictionary = struct {
             feature_blob_len = try std.math.add(usize, feature_blob_len, entry.feature.len);
         }
 
+        // Compact features are only used for large dictionaries, whose
+        // entries are never rebuilt from the blob.
+        var compact: CompactFeatures = .{};
+        defer compact.deinit(allocator);
+        if (options.compact_features and !store_lexicon) {
+            try compact.build(allocator, self.entries);
+            // Keep the raw layout unless the records and the prefix table
+            // together are smaller.
+            const compact_len = compact.records.items.len + compact.table_blob.items.len + 4 * compact.table_offsets.items.len;
+            if (compact_len >= feature_blob_len) compact.deinit(allocator);
+        }
+        const features_compact = compact.table_offsets.items.len != 0;
+        const stored_feature_blob_len = if (features_compact) compact.records.items.len else feature_blob_len;
+
+        var bytes: std.ArrayList(u8) = .empty;
+        errdefer bytes.deinit(allocator);
+        try bytes.ensureTotalCapacity(allocator, try self.binarySize(stored_feature_blob_len, compact.table_blob.items.len + 4 * compact.table_offsets.items.len));
+        try bytes.appendSlice(allocator, binary_magic);
+
         try appendU32(allocator, &bytes, try narrowBinaryLen(self.entries.len));
         try appendU32(allocator, &bytes, try narrowBinaryLen(self.unk_entries.len));
         try appendU32(allocator, &bytes, try narrowBinaryLen(self.char_property.categories.len));
         try appendU32(allocator, &bytes, try narrowBinaryLen(self.char_property.ranges.len));
         try appendU32(allocator, &bytes, try narrowBinaryLen(self.matrix.right_size));
         try appendU32(allocator, &bytes, try narrowBinaryLen(self.matrix.left_size));
-        try appendU32(allocator, &bytes, try narrowBinaryLen(feature_blob_len));
+        try appendU32(allocator, &bytes, try narrowBinaryLen(stored_feature_blob_len));
         try appendU32(allocator, &bytes, try narrowBinaryLen(surface_blob_len));
         try appendU32(allocator, &bytes, try narrowBinaryLen(self.trie_nodes.len));
         try appendU32(allocator, &bytes, try narrowBinaryLen(self.trie_edges.len));
@@ -691,18 +732,37 @@ pub const Dictionary = struct {
         try appendU32(allocator, &bytes, try narrowBinaryLen(self.trie_triple.len));
         try appendU32(allocator, &bytes, try narrowBinaryLen(self.trie_check.len));
         try appendU32(allocator, &bytes, try narrowBinaryLen(self.trie_child.len));
+        try appendU32(allocator, &bytes, if (features_compact) feature_encoding_compact else feature_encoding_raw);
+        try appendU32(allocator, &bytes, compact.prefix_fields);
+        try appendU32(allocator, &bytes, try narrowBinaryLen(compact.table_offsets.items.len));
+        try appendU32(allocator, &bytes, try narrowBinaryLen(compact.table_blob.items.len));
 
         // Feature offsets (entry count + 1, so entry i spans offsets i..i+1)
-        // and the feature blob. Loaders borrow both as-is.
+        // and the feature blob (raw features or `feature_codec` records).
+        // Loaders borrow both as-is.
         try appendBinaryPadding(allocator, &bytes);
         var offset: usize = 0;
-        for (self.entries) |entry| {
+        if (features_compact) {
+            try appendU32Slice(allocator, &bytes, compact.record_offsets.items);
+        } else {
+            for (self.entries) |entry| {
+                try appendU32(allocator, &bytes, @intCast(offset));
+                offset += entry.feature.len;
+            }
             try appendU32(allocator, &bytes, @intCast(offset));
-            offset += entry.feature.len;
         }
-        try appendU32(allocator, &bytes, @intCast(offset));
         try appendBinaryPadding(allocator, &bytes);
-        for (self.entries) |entry| try bytes.appendSlice(allocator, entry.feature);
+        if (features_compact) {
+            try bytes.appendSlice(allocator, compact.records.items);
+        } else {
+            for (self.entries) |entry| try bytes.appendSlice(allocator, entry.feature);
+        }
+        // Prefix table (offsets, then strings) of compact features; both
+        // sections are empty for raw features.
+        try appendBinaryPadding(allocator, &bytes);
+        try appendU32Slice(allocator, &bytes, compact.table_offsets.items);
+        try appendBinaryPadding(allocator, &bytes);
+        try bytes.appendSlice(allocator, compact.table_blob.items);
 
         if (store_lexicon) {
             try appendBinaryPadding(allocator, &bytes);
@@ -767,11 +827,12 @@ pub const Dictionary = struct {
         return bytes.toOwnedSlice(allocator);
     }
 
-    fn binarySize(self: *const Dictionary) !usize {
+    fn binarySize(self: *const Dictionary, feature_blob_len: usize, feature_table_len: usize) !usize {
         // Upper bound: the header plus at most `binary_section_align - 1`
-        // padding bytes before each of the 15 aligned sections.
-        var size: usize = binary_magic.len + 17 * 4 + 15 * (binary_section_align - 1);
-        for (self.entries) |entry| size = try addSizes(size, .{ 16, entry.surface.len, entry.feature.len });
+        // padding bytes before each aligned section.
+        var size: usize = binary_magic.len + binary_header_fields * 4 + binary_aligned_sections * (binary_section_align - 1);
+        size = try addSizes(size, .{ feature_blob_len, feature_table_len });
+        for (self.entries) |entry| size = try addSizes(size, .{ 16, entry.surface.len });
         size = try addSizes(size, .{8});
         for (self.unk_entries) |entry| size = try addSizes(size, .{ 16, entry.feature.len });
         for (self.char_property.categories) |category| size = try addSizes(size, .{ 10, category.name.len });
@@ -835,6 +896,19 @@ pub const Dictionary = struct {
         if (entry_len >= max_binary_word_count or unk_count >= max_binary_word_count) return error.InvalidDictionary;
         if (unk_count == 0 or category_count == 0 or right_size == 0 or left_size == 0) return error.InvalidDictionary;
         const id_limits: ConnectionIdLimits = .{ .left_size = left_size, .right_size = right_size };
+        const feature_encoding = try readU32(bytes, &cursor);
+        const prefix_fields = try readU32(bytes, &cursor);
+        const prefix_offset_count: usize = try readU32(bytes, &cursor);
+        const prefix_blob_len: usize = try readU32(bytes, &cursor);
+        const features_compact = switch (feature_encoding) {
+            feature_encoding_raw => false,
+            feature_encoding_compact => true,
+            else => return error.InvalidDictionary,
+        };
+        // Compact features need a non-empty prefix table; raw ones none.
+        if (features_compact != (prefix_offset_count >= 2)) return error.InvalidDictionary;
+        if (features_compact and (prefix_fields == 0 or prefix_fields > feature_codec.max_prefix_fields)) return error.InvalidDictionary;
+        if (!features_compact and (prefix_offset_count != 0 or prefix_blob_len != 0 or prefix_fields != 0)) return error.InvalidDictionary;
         const borrow_binary_tables = !copy_feature_blob and builtin.cpu.arch.endian() == .little;
 
         const offsets_len = entry_len + 1;
@@ -845,14 +919,29 @@ pub const Dictionary = struct {
         try skipBinaryPadding(bytes, &cursor);
         const feature_blob = try readSlice(bytes, &cursor, feature_blob_len);
         // `entryFeature` also clamps lookups, but a table that does not
-        // partition the blob is corrupt and rejected outright.
+        // partition the blob is corrupt and rejected outright. For compact
+        // features the blob holds `feature_codec` records, which the decoder
+        // bounds-checks per record.
         try validateOffsetTable(feature_offsets, feature_blob.len);
+        try skipBinaryPadding(bytes, &cursor);
+        const prefix_offsets = try readU32Slice(allocator, bytes, &cursor, prefix_offset_count, borrow_binary_tables);
+        const owns_prefix_offsets = !borrow_binary_tables and prefix_offsets.len != 0;
+        errdefer if (owns_prefix_offsets) freeU32Slice(allocator, prefix_offsets);
+        try skipBinaryPadding(bytes, &cursor);
+        const prefix_blob_bytes = try readSlice(bytes, &cursor, prefix_blob_len);
+        // The prefix table must partition its strings like the feature table.
+        if (prefix_offsets.len != 0) try validateOffsetTable(prefix_offsets, prefix_blob_bytes.len);
+        const prefix_blob: []const u8 = if (copy_feature_blob and prefix_blob_bytes.len != 0) try allocator.dupe(u8, prefix_blob_bytes) else prefix_blob_bytes;
+        const owns_prefix_blob = copy_feature_blob and prefix_blob.len != 0;
+        errdefer if (owns_prefix_blob) allocator.free(prefix_blob);
 
         // Large dictionaries only need the feature offset table and blob, which
         // are borrowed (or copied) wholesale without touching any per-entry
         // data. Small dictionaries use the linear entry index and rebuild
         // `Entry` values from the lexicon tables that only they store.
         const compact_entry_features = entry_len > small_dictionary_entry_limit;
+        // Small dictionaries rebuild `Entry` values, which need raw features.
+        if (features_compact and !compact_entry_features) return error.InvalidDictionary;
         var surface_offsets: []const u8 = &.{};
         var surface_blob: []const u8 = &.{};
         var entry_ids: []const u8 = &.{};
@@ -989,6 +1078,10 @@ pub const Dictionary = struct {
             .owns_entry_blob = entry_blob_owned.len != 0,
             .user_entries = &.{},
             .unk_entries = unk_entries,
+            .features_compact = features_compact,
+            .feature_table = .{ .prefix_fields = prefix_fields, .offsets = prefix_offsets, .blob = prefix_blob },
+            .owns_feature_table_offsets = owns_prefix_offsets,
+            .owns_feature_table_blob = owns_prefix_blob,
             .unk_feature_blob = unk_feature_blob,
             .owns_unk_feature_blob = copy_feature_blob,
             .unk_index = unk_index,
@@ -1038,6 +1131,7 @@ pub const Dictionary = struct {
         } else {
             freeEntrySlice(self.allocator, self.entries);
         }
+        self.freeFeatureTable();
         freeEntrySlice(self.allocator, self.user_entries);
         if (self.unk_feature_blob.len != 0) {
             if (self.owns_unk_feature_blob) self.allocator.free(self.unk_feature_blob);
@@ -1074,6 +1168,7 @@ pub const Dictionary = struct {
             freeEntrySlice(self.allocator, self.entries);
         }
         self.entries = emptyEntrySlice();
+        self.freeFeatureTable();
 
         freeEntrySlice(self.allocator, self.user_entries);
         self.user_entries = emptyEntrySlice();
@@ -1091,8 +1186,28 @@ pub const Dictionary = struct {
         self.unk_entries = emptyUnkEntrySlice();
     }
 
+    fn freeFeatureTable(self: *Dictionary) void {
+        if (self.owns_feature_table_offsets) freeU32Slice(self.allocator, self.feature_table.offsets);
+        if (self.owns_feature_table_blob) self.allocator.free(self.feature_table.blob);
+        self.feature_table = .{};
+        self.owns_feature_table_offsets = false;
+        self.owns_feature_table_blob = false;
+        self.features_compact = false;
+    }
+
+    /// Feature of known word `word_id` in a large binary dictionary whose
+    /// `entry_feature_offsets` is set. Raw features are returned as a slice of
+    /// the dictionary. Compact features are decoded with `surface` (the
+    /// matched input bytes of the token) and appended to `out`.
+    pub inline fn decodeEntryFeature(self: *const Dictionary, allocator: Allocator, word_id: u32, surface: []const u8, out: *std.ArrayList(u8)) Allocator.Error!feature_codec.Decoded {
+        const record = self.entryFeature(word_id);
+        if (!self.features_compact) return .{ .borrowed = record };
+        return feature_codec.decode(allocator, self.feature_table, record, surface, out);
+    }
+
     // Rebuild the feature slice only for the final best-path tokens. The hot
-    // lattice expansion path does not need known-word feature text.
+    // lattice expansion path does not need known-word feature text. For
+    // compact features this is the encoded record (see `decodeEntryFeature`).
     pub inline fn entryFeature(self: *const Dictionary, word_id: u32) []const u8 {
         // The offset table comes straight from the dictionary file; clamping
         // keeps a corrupt table from reading outside the feature blob.
@@ -1281,6 +1396,44 @@ const SurfaceChars = struct {
 fn surfaceChars(surface: []const u8) SurfaceChars {
     return .{ .bytes = surface };
 }
+
+/// Build-time `feature_codec` output for `toBinaryAllocWithOptions`.
+const CompactFeatures = struct {
+    prefix_fields: u32 = 0,
+    record_offsets: std.ArrayList(u32) = .empty,
+    records: std.ArrayList(u8) = .empty,
+    table_offsets: std.ArrayList(u32) = .empty,
+    table_blob: std.ArrayList(u8) = .empty,
+
+    fn build(self: *CompactFeatures, allocator: Allocator, entries: []const Entry) !void {
+        var encoder = try feature_codec.Encoder.init(allocator, entries);
+        defer encoder.deinit();
+        if (encoder.prefixes.len == 0) return;
+        self.prefix_fields = encoder.prefix_fields;
+        try self.table_offsets.ensureTotalCapacity(allocator, encoder.prefixes.len + 1);
+        try self.table_blob.ensureTotalCapacity(allocator, encoder.tableBlobLen());
+        for (encoder.prefixes) |prefix| {
+            self.table_offsets.appendAssumeCapacity(try narrowBinaryLen(self.table_blob.items.len));
+            self.table_blob.appendSliceAssumeCapacity(prefix);
+        }
+        self.table_offsets.appendAssumeCapacity(try narrowBinaryLen(self.table_blob.items.len));
+
+        try self.record_offsets.ensureTotalCapacity(allocator, entries.len + 1);
+        for (entries) |entry| {
+            self.record_offsets.appendAssumeCapacity(try narrowBinaryLen(self.records.items.len));
+            try encoder.encode(&self.records, entry.surface, entry.feature);
+        }
+        self.record_offsets.appendAssumeCapacity(try narrowBinaryLen(self.records.items.len));
+    }
+
+    fn deinit(self: *CompactFeatures, allocator: Allocator) void {
+        self.record_offsets.deinit(allocator);
+        self.records.deinit(allocator);
+        self.table_offsets.deinit(allocator);
+        self.table_blob.deinit(allocator);
+        self.* = .{};
+    }
+};
 
 fn addSizes(initial: usize, values: anytype) !usize {
     var total = initial;
@@ -2935,6 +3088,118 @@ fn testBinary(allocator: Allocator, lex: []const u8) ![]u8 {
     return dict.toBinaryAlloc(allocator);
 }
 
+// MeCab-style features that select the compact (`feature_codec`) encoding.
+fn testCompactLex(allocator: Allocator) ![]u8 {
+    var lex: std.ArrayList(u8) = .empty;
+    errdefer lex.deinit(allocator);
+    try lex.appendSlice(allocator, test_lex);
+    for (0..40) |i| {
+        try lex.print(allocator, "語{d},1,1,{d},名詞,一般,*,*,*,*,語{d},ゴ{d},ゴ{d}\n", .{ i, 10 + i, i, i, i });
+        try lex.print(allocator, "ご{d},2,2,{d},動詞,自立,*,*,五段,基本形,ご{d}る,ゴ{d},ゴー{d}\n", .{ i, 10 + i, i, i, i });
+    }
+    return lex.toOwnedSlice(allocator);
+}
+
+test "compact feature sections are validated and corrupt records never read out of bounds" {
+    const allocator = std.testing.allocator;
+    const lex = try testCompactLex(allocator);
+    defer allocator.free(lex);
+    const bytes = try testBinary(allocator, lex);
+    defer allocator.free(bytes);
+    const s = try testSections(bytes);
+    try std.testing.expectEqual(feature_encoding_compact, std.mem.readInt(u32, bytes[TestSections.header(17)..][0..4], .little));
+    try std.testing.expect(s.prefix_offset_count >= 2);
+    const prefix_blob_len = std.mem.readInt(u32, bytes[TestSections.header(20)..][0..4], .little);
+    const last_prefix = s.prefix_offsets + 4 * @as(usize, s.prefix_offset_count - 1);
+
+    // Header fields: unknown encoding, raw encoding with a table, no table.
+    try expectPatchedError(bytes, TestSections.header(17), u32, 2);
+    try expectPatchedError(bytes, TestSections.header(17), u32, feature_encoding_raw);
+    try expectPatchedError(bytes, TestSections.header(19), u32, 0);
+    // The prefix offset table must partition the prefix strings.
+    try expectPatchedError(bytes, s.prefix_offsets, u32, 1);
+    try expectPatchedError(bytes, s.prefix_offsets + 4, u32, prefix_blob_len + 1);
+    try expectPatchedError(bytes, last_prefix, u32, prefix_blob_len - 1);
+    try expectPatchedError(bytes, last_prefix, u32, prefix_blob_len + 1);
+    // The record offset table is validated like raw feature offsets.
+    try expectPatchedError(bytes, s.feature_offsets + 4 * @as(usize, s.entry_count), u32, s.feature_blob_len + 1);
+
+    // Arbitrary record bytes load fine and decode to some feature (possibly
+    // empty) without reading outside the dictionary or the input.
+    const Worker = @import("tokenizer.zig").Worker;
+    const patched = try allocator.dupe(u8, bytes);
+    defer allocator.free(patched);
+    var prng = std.Random.DefaultPrng.init(0xfea7);
+    const random = prng.random();
+    for (0..200) |_| {
+        @memcpy(patched, bytes);
+        for (0..8) |_| patched[s.feature_blob + random.uintLessThan(usize, s.feature_blob_len)] = random.int(u8);
+        for ([_]bool{ true, false }) |copy| {
+            var dict = try Dictionary.fromBinaryBytesInternal(allocator, patched, copy);
+            defer dict.deinit();
+            var worker = Worker.init(allocator, &dict, null);
+            defer worker.deinit();
+            for (try worker.tokenize("語1語22ご7ご39本とカレー")) |token| {
+                try std.testing.expect(token.feature.len <= feature_codec.max_decoded_len);
+            }
+        }
+    }
+
+    try expectPatchedError(bytes, TestSections.header(18), u32, 0);
+
+    // Unmodified, every word decodes to its raw feature.
+    var dict = try Dictionary.fromBinaryBytesInternal(allocator, bytes, false);
+    defer dict.deinit();
+    try expectTokens(allocator, &dict, "語3ご3", &.{ "名詞,一般,*,*,*,*,語3,ゴ3,ゴ3", "動詞,自立,*,*,五段,基本形,ご3る,ゴ3,ゴー3" });
+}
+
+test "worker capacity trimming covers compact feature state" {
+    const allocator = std.testing.allocator;
+    const Worker = @import("tokenizer.zig").Worker;
+    const lex = try testCompactLex(allocator);
+    defer allocator.free(lex);
+    const bytes = try testBinary(allocator, lex);
+    defer allocator.free(bytes);
+    var dict = try Dictionary.fromBinaryBytesInternal(allocator, bytes, false);
+    defer dict.deinit();
+    try std.testing.expect(dict.features_compact);
+
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    for (0..40) |i| try input.print(allocator, "語{d}ご{d}本とカレー", .{ i, i });
+    var reference = Worker.init(allocator, &dict, null);
+    defer reference.deinit();
+    const expected = try reference.tokenize(input.items);
+
+    var worker = Worker.init(allocator, &dict, null);
+    defer worker.deinit();
+    for ([_]usize{ 0, 256, 4096 }) |limit| {
+        // Deferred features survive trimming (the input copy is kept) and
+        // resolve to the same bytes.
+        worker.setRetainedCapacityLimit(limit);
+        const deferred = try worker.tokenizeDeferred(input.items);
+        try worker.resolveFeatures();
+        try std.testing.expectEqual(expected.len, deferred.len);
+        for (expected, deferred) |lhs, rhs| try std.testing.expectEqualStrings(lhs.feature, rhs.feature);
+        // Eager results keep the decode cache they borrow.
+        const eager = try worker.tokenize(input.items);
+        for (expected, eager) |lhs, rhs| try std.testing.expectEqualStrings(lhs.feature, rhs.feature);
+        worker.setRetainedCapacityLimit(null);
+
+        // Explicit shrinking releases the feature state too.
+        _ = try worker.tokenize(input.items);
+        try std.testing.expect(worker.retainedBytes() > limit);
+        worker.shrinkTo(limit);
+        try std.testing.expect(worker.retainedBytes() <= limit);
+        _ = try worker.tokenizeDeferred(input.items);
+        worker.shrink();
+        try std.testing.expectEqual(@as(usize, 0), worker.retainedBytes());
+        try worker.resolveFeatures();
+        const again = try worker.tokenize(input.items);
+        for (expected, again) |lhs, rhs| try std.testing.expectEqualStrings(lhs.feature, rhs.feature);
+    }
+}
+
 // More than `small_dictionary_entry_limit` entries makes the writer emit the
 // compact feature table and the dense root pair and BMP tables.
 fn testLargeLex(allocator: Allocator) ![]u8 {
@@ -2947,13 +3212,16 @@ fn testLargeLex(allocator: Allocator) ![]u8 {
     return lex.toOwnedSlice(allocator);
 }
 
-// File offsets of the format v3 sections, recomputed from the header the same
+// File offsets of the format v4 sections, recomputed from the header the same
 // way the loader walks them.
 const TestSections = struct {
     entry_count: u32,
     feature_offsets: usize,
     feature_blob: usize,
     feature_blob_len: u32,
+    prefix_offsets: usize,
+    prefix_offset_count: u32,
+    prefix_blob: usize,
     surface_offsets: ?usize,
     entry_ids: ?usize,
     unk_entries: usize,
@@ -2991,7 +3259,7 @@ const TestSections = struct {
 };
 
 fn testSections(bytes: []const u8) !TestSections {
-    var header: [17]u32 = undefined;
+    var header: [binary_header_fields]u32 = undefined;
     var cursor: usize = binary_magic.len;
     for (&header) |*value| value.* = try readU32(bytes, &cursor);
     const entry_count = header[0];
@@ -3006,7 +3274,9 @@ fn testSections(bytes: []const u8) !TestSections {
 
     const feature_offsets = align16(cursor);
     const feature_blob = align16(feature_offsets + 4 * (@as(usize, entry_count) + 1));
-    cursor = feature_blob + header[6];
+    const prefix_offsets = align16(feature_blob + header[6]);
+    const prefix_blob = align16(prefix_offsets + 4 * @as(usize, header[19]));
+    cursor = prefix_blob + header[20];
     var surface_offsets: ?usize = null;
     var entry_ids: ?usize = null;
     if (entry_count <= small_dictionary_entry_limit) {
@@ -3042,6 +3312,9 @@ fn testSections(bytes: []const u8) !TestSections {
         .feature_offsets = feature_offsets,
         .feature_blob = feature_blob,
         .feature_blob_len = header[6],
+        .prefix_offsets = prefix_offsets,
+        .prefix_offset_count = header[19],
+        .prefix_blob = prefix_blob,
         .surface_offsets = surface_offsets,
         .entry_ids = entry_ids,
         .unk_entries = unk_entries,
@@ -3191,10 +3464,14 @@ test "binary dictionary rejects corrupt offset tables, padding, and header count
             // Compact dictionaries carry no surface blob.
             try expectPatchedError(bytes, TestSections.header(7), u32, 1);
         }
-        // Padding before the feature offset table (after the 76-byte header)
+        // Padding before the feature offset table (after the 92-byte header)
         // must be zero.
-        try std.testing.expect(sections.feature_offsets > TestSections.header(17));
-        try expectPatchedError(bytes, TestSections.header(17), u8, 1);
+        try std.testing.expect(sections.feature_offsets > TestSections.header(binary_header_fields));
+        try expectPatchedError(bytes, TestSections.header(binary_header_fields), u8, 1);
+        // The feature encoding must be known and its prefix column count in
+        // range (raw features have none).
+        try expectPatchedError(bytes, TestSections.header(17), u32, 2);
+        try expectPatchedError(bytes, TestSections.header(18), u32, feature_codec.max_prefix_fields + 1);
         // Section counts that overflow or exceed the remaining bytes.
         try expectPatchedError(bytes, TestSections.header(0), u32, 0xffff_fff0);
         try expectPatchedError(bytes, TestSections.header(1), u32, 0xffff);
