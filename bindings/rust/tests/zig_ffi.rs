@@ -195,6 +195,26 @@ fn zig_ffi_mmap_count_only_compact_dictionary_and_truncated_files() {
         assert!(ZigTokenizer::count_only_from_binary_path(&truncated).is_err());
         assert!(ZigTokenizer::from_binary_bytes(&bytes[..len]).is_err());
     }
+
+    // Dictionaries written by an older binary format version are rejected
+    // with an explicit error instead of being misread.
+    for magic in [b"DLRDIC01", b"DLRDIC02"] {
+        let mut legacy = bytes.clone();
+        legacy[..magic.len()].copy_from_slice(magic);
+        let legacy_path = temp_dir.path().join("legacy.dic");
+        std::fs::write(&legacy_path, &legacy).expect("write legacy binary");
+        for result in [
+            ZigTokenizer::from_binary_path(&legacy_path),
+            ZigTokenizer::count_only_from_binary_path(&legacy_path),
+            ZigTokenizer::from_binary_bytes(&legacy),
+        ] {
+            let message = result.err().expect("legacy format is rejected").to_string();
+            assert!(
+                message.contains("UnsupportedDictionaryVersion"),
+                "unexpected error: {message}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -601,6 +621,27 @@ fn write_fixture_binary(dir: &std::path::Path) -> Vec<u8> {
     std::fs::read(&binary_path).expect("read binary fixture")
 }
 
+// Walks the binary format v3 layout (magic, 17 u32 header fields, then
+// 16-byte aligned sections) up to the unknown-word records.
+fn first_unknown_record_offset(bytes: &[u8]) -> usize {
+    let header = |index: usize| {
+        let at = 8 + 4 * index;
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
+    };
+    let align16 = |offset: usize| offset.next_multiple_of(16);
+    let entry_count = header(0);
+    let feature_offsets = align16(8 + 17 * 4);
+    let feature_blob = align16(feature_offsets + 4 * (entry_count + 1));
+    let mut cursor = feature_blob + header(6);
+    // Dictionaries with at most 32 entries also store surfaces and entry ids.
+    if entry_count <= 32 {
+        let surface_offsets = align16(cursor);
+        let surface_blob = align16(surface_offsets + 4 * (entry_count + 1));
+        cursor = align16(surface_blob + header(7)) + 8 * entry_count;
+    }
+    align16(cursor)
+}
+
 // Loads through both the copying byte loader and the mmap-borrowing path
 // loader, which alias the file for the matrix and trie tables.
 fn load_binary_both_ways(dir: &std::path::Path, bytes: &[u8]) -> Vec<delarocha::Error> {
@@ -651,9 +692,16 @@ fn zig_ffi_rejects_truncated_binary_dictionary() {
 fn zig_ffi_rejects_out_of_range_connection_id() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let mut bytes = write_fixture_binary(temp_dir.path());
-    // Header: magic, then six u32 counts. The first entry record starts with
-    // its surface length followed by the u16 left id.
-    let left_id_offset = 8 + 6 * 4 + 4;
+    // The first unknown-word record starts with its u32 category id followed
+    // by the u16 left id.
+    let unk_offset = first_unknown_record_offset(&bytes);
+    let category_id = u32::from_le_bytes(bytes[unk_offset..unk_offset + 4].try_into().unwrap());
+    let category_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    assert!(
+        category_id < category_count,
+        "offset does not point at an unknown-word record"
+    );
+    let left_id_offset = unk_offset + 4;
     bytes[left_id_offset..left_id_offset + 2].copy_from_slice(&u16::MAX.to_le_bytes());
     for err in load_binary_both_ways(temp_dir.path(), &bytes) {
         assert!(

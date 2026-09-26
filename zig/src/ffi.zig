@@ -24,7 +24,7 @@ fn setLastError(comptime fmt: []const u8, args: anytype) void {
 
 fn setLoadError(comptime context: []const u8, err: anyerror) void {
     if (err == error.UnsupportedDictionaryVersion) {
-        setLastError(context ++ ": {s}: rebuild the binary dictionary from raw dictionary sources with this delarocha version", .{@errorName(err)});
+        setLastError(context ++ ": {s} (the file was written by an older or unknown delarocha binary format; rebuild it from the raw dictionary with this version)", .{@errorName(err)});
         last_error_kind = error_kind_unsupported_dictionary_version;
         return;
     }

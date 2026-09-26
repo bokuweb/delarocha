@@ -25,8 +25,9 @@ const Node = struct {
     word_id: u32,
     // Full-token lattice nodes are transient and can become numerous on long
     // documents. Keep byte offsets and linked-list indexes at 32 bits while
-    // widening back to usize only when producing public Token values.
-    start: u32,
+    // widening back to usize only when producing public Token values. A node's
+    // start offset is not stored: it always equals `end` of its best
+    // predecessor (`prev_node`), which backtrace reads anyway.
     end: u32,
     right_id: u16,
     min_cost: i32,
@@ -36,7 +37,6 @@ const Node = struct {
     fn bos() Node {
         return .{
             .word_id = unknown_word_id,
-            .start = 0,
             .end = 0,
             .right_id = 0,
             .min_cost = 0,
@@ -326,16 +326,14 @@ pub const Worker = struct {
     }
 
     inline fn findTrieEdge(self: *Worker, node_index: usize, byte: u8) ?usize {
-        if (self.dictionary.trie_base.len != 0 and self.dictionary.trie_nodes[node_index].edge_len >= 3) {
-            return dict_mod.findDoubleArray(
-                self.dictionary.trie_base,
-                self.dictionary.trie_check,
-                self.dictionary.trie_child,
-                node_index,
-                byte,
-            );
-        }
-        return dict_mod.findEdge(self.dictionary.trie_nodes, self.dictionary.trie_edges, node_index, byte);
+        return dict_mod.findTrieChild(
+            self.dictionary.trie_nodes,
+            self.dictionary.trie_edges,
+            self.dictionary.trie_check,
+            self.dictionary.trie_child,
+            node_index,
+            byte,
+        );
     }
 
     fn appendIndexedEntries(self: *Worker, input: []const u8, begin: usize, emitted: *bool) !void {
@@ -412,9 +410,8 @@ pub const Worker = struct {
         // Count-only trie nodes store a compact term stream. Iterating it here
         // avoids rebuilding slice values at every trie depth and keeps the
         // candidate append path shared across root, pair, triple, and edge hits.
-        const node = self.dictionary.trie_nodes[node_index];
-        var index: usize = @intCast(node.count_word_start);
-        const stop = index + @as(usize, @intCast(node.count_word_len));
+        var index: usize = self.dictionary.trie_nodes[node_index].count_word_start;
+        const stop: usize = self.dictionary.trie_nodes[node_index + 1].count_word_start;
         while (index < stop) : (index += 1) {
             const term = self.dictionary.trie_count_terms[index];
             self.appendBestCountNode(begin, end, term.left_id, term.right_id, term.word_cost);
@@ -669,17 +666,24 @@ pub const Worker = struct {
     }
 
     fn appendBestNodeWithBest(self: *Worker, begin: usize, end: usize, candidate: Candidate, best: BestPath) !void {
+        _ = begin;
         const index = self.nodes.items.len;
         if (index >= invalid_node) return error.InputTooLarge;
-        try self.nodes.append(self.allocator, .{
+        const node: Node = .{
             .word_id = candidate.word_id,
-            .start = try narrowInputOffset(begin),
             .end = try narrowInputOffset(end),
             .right_id = candidate.right_id,
             .min_cost = best.cost,
             .prev_node = best.index,
             .next_end = self.end_heads.items[end],
-        });
+        };
+        // Reused workers have usually grown the lattice already; keep the
+        // steady-state append inline and leave growth to the out-of-line path.
+        if (index < self.nodes.capacity) {
+            self.nodes.appendAssumeCapacity(node);
+        } else {
+            try self.nodes.append(self.allocator, node);
+        }
         self.end_heads.items[end] = @intCast(index);
     }
 
@@ -726,19 +730,23 @@ pub const Worker = struct {
     }
 
     fn findBestPrev(self: *Worker, begin: usize, candidate: Candidate) !BestPath {
-        var best_index: u32 = invalid_node;
-        var best_cost: i32 = std.math.maxInt(i32);
-        var prev_index = self.end_heads.items[begin];
-        while (prev_index != invalid_node) : (prev_index = self.nodes.items[prev_index].next_end) {
-            const prev = self.nodes.items[prev_index];
-            const cost = prev.min_cost + self.dictionary.matrix.trustedCost(prev.right_id, candidate.left_id) + candidate.word_cost;
-            if (best_index == invalid_node or cost < best_cost) {
+        const first_index = self.end_heads.items[begin];
+        if (first_index == invalid_node) return error.NoPath;
+        const row_start = @as(usize, candidate.left_id) * self.dictionary.matrix.right_size;
+        const matrix_row = self.dictionary.matrix.costs[row_start .. row_start + self.dictionary.matrix.right_size];
+        const nodes = self.nodes.items;
+        var best_index = first_index;
+        var best_cost: i32 = nodes[first_index].min_cost + @as(i32, matrix_row[nodes[first_index].right_id]);
+        var prev_index = nodes[first_index].next_end;
+        while (prev_index != invalid_node) : (prev_index = nodes[prev_index].next_end) {
+            const prev = nodes[prev_index];
+            const cost = prev.min_cost + @as(i32, matrix_row[prev.right_id]);
+            if (cost < best_cost) {
                 best_index = prev_index;
                 best_cost = cost;
             }
         }
-        if (best_index == invalid_node) return error.NoPath;
-        return .{ .index = best_index, .cost = best_cost };
+        return .{ .index = best_index, .cost = best_cost + candidate.word_cost };
     }
 
     inline fn findBestCountPrev(self: *Worker, begin: usize, left_id: u16, word_cost: i32) BestPath {
@@ -746,29 +754,22 @@ pub const Worker = struct {
         if (first_index == invalid_count_node) unreachable;
         const row_start = @as(usize, left_id) * self.dictionary.matrix.right_size;
         const matrix_row = self.dictionary.matrix.costs[row_start .. row_start + self.dictionary.matrix.right_size];
-        const first = self.count_nodes.items[first_index];
-        if (first.next_end == invalid_count_node) {
-            // Most positions in short Japanese input have a single best
-            // predecessor after count-term deduplication. Returning here avoids
-            // a linked-list walk on the hottest count-only transition path.
-            return .{
-                .index = first_index,
-                .cost = first.min_cost + @as(i32, matrix_row[first.right_id]) + word_cost,
-            };
-        }
-
-        var best_index: u32 = invalid_count_node;
-        var best_cost: i32 = std.math.maxInt(i32);
-        var prev_index = first_index;
-        while (prev_index != invalid_count_node) : (prev_index = self.count_nodes.items[prev_index].next_end) {
-            const prev = self.count_nodes.items[prev_index];
-            const cost = prev.min_cost + @as(i32, matrix_row[prev.right_id]) + word_cost;
-            if (best_index == invalid_count_node or cost <= best_cost) {
+        const nodes = self.count_nodes.items;
+        // The first predecessor seeds the scan; for the common single-
+        // predecessor position the loop below does not run at all.
+        var best_index = first_index;
+        var best_cost: i32 = nodes[first_index].min_cost + @as(i32, matrix_row[nodes[first_index].right_id]);
+        var prev_index = nodes[first_index].next_end;
+        while (prev_index != invalid_count_node) : (prev_index = nodes[prev_index].next_end) {
+            const prev = nodes[prev_index];
+            const cost = prev.min_cost + @as(i32, matrix_row[prev.right_id]);
+            // Ties keep the later list entry.
+            if (cost <= best_cost) {
                 best_index = prev_index;
                 best_cost = cost;
             }
         }
-        return .{ .index = best_index, .cost = best_cost };
+        return .{ .index = best_index, .cost = best_cost + word_cost };
     }
 
     fn bestEndNode(self: *Worker, end: usize) !u32 {
@@ -808,42 +809,43 @@ pub const Worker = struct {
         return best_index;
     }
 
-    fn countPath(self: *const Worker, start_index: u32) usize {
+    fn backtrace(self: *Worker, input: []const u8, start_index: u32) !void {
+        // The per-position list heads are dead once the best end node is
+        // known, and a path has at most one node per input byte, so the heads
+        // buffer doubles as scratch for the path's node indexes. Collecting
+        // them in one (serially dependent) walk lets the fill loop below read
+        // the nodes in ascending order with independent loads instead of
+        // walking the `prev_node` chain a second time.
+        _ = input;
+        const path = self.end_heads.items;
         var count: usize = 0;
         var index = start_index;
         while (self.nodes.items[index].prev_node != invalid_node) {
+            path[count] = index;
             count += 1;
             index = self.nodes.items[index].prev_node;
         }
-        return count;
-    }
-
-    fn backtrace(self: *Worker, input: []const u8, start_index: u32) !void {
-        const count = self.countPath(start_index);
 
         try self.tokens.resize(self.allocator, count);
-        var index = start_index;
-        var out = count;
-        while (self.nodes.items[index].prev_node != invalid_node) {
-            out -= 1;
-            const node = self.nodes.items[index];
-            const feature = self.featureFor(node.word_id);
-            self.tokens.items[out] = .{
-                .start = @intCast(node.start),
-                .end = @intCast(node.end),
+        var start: usize = 0;
+        for (self.tokens.items, 0..) |*token, i| {
+            const node = self.nodes.items[path[count - 1 - i]];
+            const end: usize = @intCast(node.end);
+            token.* = .{
+                .start = start,
+                .end = end,
                 .word_id = node.word_id,
-                .feature = feature,
+                .feature = self.featureFor(node.word_id),
                 .total_cost = node.min_cost,
             };
-            _ = input;
-            index = node.prev_node;
+            start = end;
         }
     }
 
     fn featureFor(self: *const Worker, word_id: u32) []const u8 {
         if (word_id >= unknown_word_base) return self.dictionary.unk_entries[word_id - unknown_word_base].feature;
         if (word_id >= (1 << 30)) return self.dictionary.user_entries[word_id - (1 << 30)].feature;
-        if (self.dictionary.entry_features.len != 0) return self.dictionary.entryFeature(word_id);
+        if (self.dictionary.entry_feature_offsets.len != 0) return self.dictionary.entryFeature(word_id);
         return self.dictionary.entries[word_id].feature;
     }
 };
