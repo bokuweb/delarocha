@@ -21,6 +21,7 @@ comptime {
     _ = ffi.delarocha_tokenizer_new_binary_borrowed_bytes_count_only;
     _ = ffi.delarocha_tokenizer_new_binary_count_only;
     _ = ffi.delarocha_dictionary_write_binary;
+    _ = ffi.delarocha_dictionary_write_binary_with_id_order;
     _ = ffi.delarocha_tokenizer_free;
     _ = ffi.delarocha_worker_new;
     _ = ffi.delarocha_worker_free;
@@ -327,6 +328,70 @@ test "worker shrink and retained-capacity limit keep results identical" {
     _ = try capped.tokenizeCount("本とカレー");
     try std.testing.expect(capped.retainedBytes() > 0);
     try std.testing.expect(capped.retainedBytes() <= limit);
+}
+
+test "connection-id renumbering preserves tokenization" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xc0ffee);
+    const random = prng.random();
+    const id_count = 7;
+    const surfaces = [_][]const u8{ "a", "b", "ab", "ba", "本", "と", "本と", "カレー", "レー", "aab", "bb" };
+    var lex: std.ArrayList(u8) = .empty;
+    defer lex.deinit(allocator);
+    for (0..60) |index| {
+        try lex.print(allocator, "{s},{d},{d},{d},f{d}\n", .{
+            surfaces[index % surfaces.len],
+            random.uintLessThan(u16, id_count),
+            random.uintLessThan(u16, id_count),
+            random.intRangeAtMost(i32, -200, 800),
+            index,
+        });
+    }
+    var matrix: std.ArrayList(u8) = .empty;
+    defer matrix.deinit(allocator);
+    try matrix.print(allocator, "{d} {d}\n", .{ id_count, id_count });
+    for (0..id_count) |right| for (0..id_count) |left| {
+        try matrix.print(allocator, "{d} {d} {d}\n", .{ right, left, random.intRangeAtMost(i16, -300, 300) });
+    };
+    const char_def = "DEFAULT 0 1 0\nALPHA 1 1 3\nKANJI 0 0 2\n0x0061..0x007A ALPHA\n0x4E00..0x9FFF KANJI\n";
+    const unk = "DEFAULT,3,4,900,default\nALPHA,5,6,300,alpha\nALPHA,6,5,320,alpha2\nKANJI,2,3,500,kanji\n";
+    const inputs = [_][]const u8{ "abba本とカレーxyz", "本本とと", "baab", "カレーレー漢字", "zzz🍛ab", "", "a" };
+
+    var original = try Dictionary.fromRawBytes(allocator, lex.items, matrix.items, char_def, unk);
+    defer original.deinit();
+    var original_worker = Worker.init(allocator, &original, null);
+    defer original_worker.deinit();
+
+    for (0..3) |variant| {
+        var renumbered = try Dictionary.fromRawBytes(allocator, lex.items, matrix.items, char_def, unk);
+        defer renumbered.deinit();
+        const weights = switch (variant) {
+            0 => try renumbered.connectionIdPriorWeights(allocator),
+            1 => try tokenizer.sampleConnectionIdWeights(allocator, &renumbered, "abba本と\nカレー漢字ab\n"),
+            else => try dictionary.ConnectionIdWeights.parse(allocator, id_count, id_count, "1 1 7\n2 5 0\n# comment\n6 9 2\n"),
+        };
+        defer weights.deinit(allocator);
+        try renumbered.renumberConnectionIds(weights);
+
+        const binary = try renumbered.toBinaryAlloc(allocator);
+        defer allocator.free(binary);
+        var loaded = try Dictionary.fromBinaryBytes(allocator, binary);
+        defer loaded.deinit();
+
+        var renumbered_worker = Worker.init(allocator, &renumbered, null);
+        defer renumbered_worker.deinit();
+        var loaded_worker = Worker.init(allocator, &loaded, null);
+        defer loaded_worker.deinit();
+        for (inputs) |input| {
+            const expected = try original_worker.tokenize(input);
+            for ([_]*Worker{ &renumbered_worker, &loaded_worker }) |worker| {
+                const actual = try worker.tokenize(input);
+                try expectSameTokens(expected, actual);
+                for (expected, actual) |lhs, rhs| try std.testing.expectEqual(lhs.total_cost, rhs.total_cost);
+                try std.testing.expectEqual(try original_worker.tokenizeCount(input), try worker.tokenizeCount(input));
+            }
+        }
+    }
 }
 
 test {

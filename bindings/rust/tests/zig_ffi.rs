@@ -99,6 +99,73 @@ fn zig_ffi_writes_and_reads_binary_dictionary() {
 }
 
 #[test]
+fn zig_ffi_connection_id_orders_keep_tokenization() {
+    use delarocha::ffi::ConnectionIdOrder;
+
+    let fixture_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/vibrato");
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let sample_path = temp_dir.path().join("sample.txt");
+    let weights_path = temp_dir.path().join("weights.txt");
+    std::fs::write(&sample_path, "外国人参政権\n東京都に住む\n").expect("write sample");
+    std::fs::write(&weights_path, "# id left right\n7 5 9\n3 1 0.5\n").expect("write weights");
+    let inputs = [
+        "外国人参政権",
+        "東京都に住んでいた",
+        "本日は晴天なり ABC 123",
+        "",
+    ];
+
+    let mut expected: Option<Vec<Vec<delarocha::Token>>> = None;
+    for (index, order) in [
+        ConnectionIdOrder::Original,
+        ConnectionIdOrder::DictionaryPrior,
+        ConnectionIdOrder::WeightsFile(weights_path.clone()),
+        ConnectionIdOrder::SampleText(sample_path.clone()),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let binary_path = temp_dir.path().join(format!("order-{index}.dic"));
+        ZigTokenizer::write_binary_from_raw_paths_with_id_order(
+            fixture_dir.join("lex.csv"),
+            fixture_dir.join("matrix.def"),
+            fixture_dir.join("char.def"),
+            fixture_dir.join("unk.def"),
+            &binary_path,
+            order,
+        )
+        .expect("Zig writes binary dictionary");
+        let tokenizer = ZigTokenizer::from_binary_path(&binary_path).expect("binary loads");
+        let mut worker = tokenizer.create_worker().expect("Zig worker is created");
+        let tokens = inputs
+            .iter()
+            .map(|input| worker.tokenize(input).expect("tokenize succeeds"))
+            .collect::<Vec<_>>();
+        for (input, tokens) in inputs.iter().zip(&tokens) {
+            assert_eq!(worker.tokenize_count(input).unwrap(), tokens.len());
+        }
+        match &expected {
+            Some(expected) => assert_eq!(&tokens, expected, "{order:?}"),
+            None => expected = Some(tokens),
+        }
+    }
+
+    let missing = temp_dir.path().join("missing.txt");
+    assert!(
+        ZigTokenizer::write_binary_from_raw_paths_with_id_order(
+            fixture_dir.join("lex.csv"),
+            fixture_dir.join("matrix.def"),
+            fixture_dir.join("char.def"),
+            fixture_dir.join("unk.def"),
+            temp_dir.path().join("never.dic"),
+            &ConnectionIdOrder::SampleText(missing),
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn zig_ffi_reads_binary_dictionary_from_bytes() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
     let temp_dir = tempfile::tempdir().expect("create temp dir");

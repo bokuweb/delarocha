@@ -928,6 +928,57 @@ pub const Worker = struct {
     }
 };
 
+/// Connection-id weights measured on sample text, for
+/// `Dictionary.renumberConnectionIds`: every line of `sample` is tokenized
+/// and each connection-matrix lookup of the Viterbi search is counted
+/// (candidate left id = row, predecessor right id = column). The dictionary
+/// must keep its entries (e.g. one built from raw files).
+pub fn sampleConnectionIdWeights(allocator: Allocator, dictionary: *const dict_mod.Dictionary, sample: []const u8) !dict_mod.ConnectionIdWeights {
+    const weights = try dict_mod.ConnectionIdWeights.init(allocator, dictionary.matrix.left_size, dictionary.matrix.right_size);
+    errdefer weights.deinit(allocator);
+    var worker = Worker.init(allocator, dictionary, null);
+    defer worker.deinit();
+    var heads: std.ArrayList(u32) = .empty;
+    defer heads.deinit(allocator);
+    var next: std.ArrayList(u32) = .empty;
+    defer next.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, sample, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len == 0) continue;
+        _ = worker.tokenize(line) catch |err| switch (err) {
+            error.NoPath => continue,
+            else => return err,
+        };
+        // `backtrace` reuses the end-position heads, so rebuild the lists.
+        const nodes = worker.nodes.items;
+        try heads.resize(allocator, line.len + 1);
+        @memset(heads.items, invalid_node);
+        try next.resize(allocator, nodes.len);
+        for (nodes, 0..) |node, i| {
+            next.items[i] = heads.items[node.end];
+            heads.items[node.end] = @intCast(i);
+        }
+        for (nodes[1..]) |node| {
+            const left_id = if (node.word_id >= unknown_word_base)
+                dictionary.unk_entries[node.word_id - unknown_word_base].left_id
+            else if (node.word_id >= (1 << 30))
+                dictionary.user_entries[node.word_id - (1 << 30)].left_id
+            else if (node.word_id < dictionary.entries.len)
+                dictionary.entries[node.word_id].left_id
+            else
+                return error.InvalidDictionary;
+            var prev = heads.items[nodes[node.prev_node].end];
+            while (prev != invalid_node) : (prev = next.items[prev]) {
+                if (left_id < weights.left.len) weights.left[left_id] += 1;
+                const right_id = nodes[prev].right_id;
+                if (right_id < weights.right.len) weights.right[right_id] += 1;
+            }
+        }
+    }
+    return weights;
+}
+
 fn narrowInputOffset(offset: usize) !u32 {
     if (offset > std.math.maxInt(u32)) return error.InputTooLarge;
     return @intCast(offset);
