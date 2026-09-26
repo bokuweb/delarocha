@@ -195,8 +195,10 @@ Binary dictionaries use format version 3 (magic `DLRDIC03`). Every table
 starts at a 16-byte aligned offset and entry features are located through a
 separate offset table, so loading a memory-mapped dictionary does not read any
 per-entry data: pages are only faulted in when tokenization touches them.
-Files written by earlier versions (`DLRDIC01`, `DLRDIC02`) are rejected with
-`UnsupportedDictionaryVersion`; rebuild them from the raw MeCab dictionary
+Files written by earlier versions (`DLRDIC01`, `DLRDIC02`) or by an unknown
+format version are rejected with `UnsupportedDictionaryVersion` (Rust:
+`Error::UnsupportedDictionaryVersion`), and corrupt tables or out-of-range
+indices with `InvalidDictionary`; rebuild them from the raw MeCab dictionary
 files with `ZigTokenizer::write_binary_from_raw_paths` (or Zig's
 `Dictionary.toBinaryAlloc`). Rebuilding the same raw files produces
 byte-identical output.

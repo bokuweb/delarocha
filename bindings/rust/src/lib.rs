@@ -19,6 +19,10 @@ const INVALID_LATTICE_INDEX: u32 = u32::MAX;
 pub enum Error {
     #[error("invalid dictionary: {0}")]
     InvalidDictionary(String),
+    /// The binary dictionary was written by an incompatible delarocha version
+    /// and must be rebuilt from the raw dictionary sources.
+    #[error("unsupported dictionary version: {0}")]
+    UnsupportedDictionaryVersion(String),
     #[error("tokenization failed: {0}")]
     Tokenization(String),
     #[error("io error: {0}")]
@@ -2144,7 +2148,12 @@ pub mod ffi {
         ) -> *const std::ffi::c_char;
         fn delarocha_token_feature_len(worker: *const RawWorker, index: usize) -> usize;
         fn delarocha_last_error() -> *const std::ffi::c_char;
+        fn delarocha_last_error_kind() -> u32;
     }
+
+    // Mirrors the error kinds exported by `zig/src/ffi.zig`.
+    const ERROR_KIND_INVALID_DICTIONARY: u32 = 1;
+    const ERROR_KIND_UNSUPPORTED_DICTIONARY_VERSION: u32 = 2;
 
     pub struct ZigTokenizer {
         raw: NonNull<RawTokenizer>,
@@ -2511,7 +2520,7 @@ pub mod ffi {
             // The native loader copies dictionary data into Zig-owned storage,
             // so the caller may drop the byte slice after construction.
             let raw = unsafe { delarocha_tokenizer_new_binary_bytes(bytes.as_ptr(), bytes.len()) };
-            let raw = NonNull::new(raw).ok_or_else(last_error)?;
+            let raw = NonNull::new(raw).ok_or_else(last_load_error)?;
             Ok(Self { raw, _mmap: None })
         }
 
@@ -2537,7 +2546,7 @@ pub mod ffi {
             // public constructors' docs.
             let mmap = unsafe { memmap2::Mmap::map(&file)? };
             let raw = unsafe { load(mmap.as_ptr(), mmap.len()) };
-            let raw = NonNull::new(raw).ok_or_else(last_error)?;
+            let raw = NonNull::new(raw).ok_or_else(last_load_error)?;
             Ok(Self {
                 raw,
                 _mmap: Some(mmap),
@@ -3065,15 +3074,28 @@ pub mod ffi {
     }
 
     fn last_error() -> Error {
+        Error::Tokenization(last_error_message())
+    }
+
+    fn last_load_error() -> Error {
+        let message = last_error_message();
+        match unsafe { delarocha_last_error_kind() } {
+            ERROR_KIND_UNSUPPORTED_DICTIONARY_VERSION => {
+                Error::UnsupportedDictionaryVersion(message)
+            }
+            ERROR_KIND_INVALID_DICTIONARY => Error::InvalidDictionary(message),
+            _ => Error::Tokenization(message),
+        }
+    }
+
+    fn last_error_message() -> String {
         let ptr = unsafe { delarocha_last_error() };
         if ptr.is_null() {
-            return Error::Tokenization("unknown Zig FFI error".into());
+            return "unknown Zig FFI error".into();
         }
-        Error::Tokenization(
-            unsafe { CStr::from_ptr(ptr) }
-                .to_string_lossy()
-                .into_owned(),
-        )
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
     }
 }
 

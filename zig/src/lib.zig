@@ -11,6 +11,7 @@ pub const Token = tokenizer.Token;
 
 comptime {
     _ = ffi.delarocha_last_error;
+    _ = ffi.delarocha_last_error_kind;
     _ = ffi.delarocha_tokenizer_new;
     _ = ffi.delarocha_tokenizer_new_raw;
     _ = ffi.delarocha_tokenizer_new_raw_count_only;
@@ -249,7 +250,10 @@ test "binary file loaders (mmap, copy, borrowed, count-only) agree" {
 test "raw lexicon entries share one string blob and keep verbatim features" {
     const allocator = std.testing.allocator;
     const lex = "本,0,0,10,noun,book,*\r\n\n  と,0,0,1\nカレー,0,0,10,,\n";
-    var dict = try Dictionary.fromRawBytes(allocator, lex, "1 1\n0 0 0\n", "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n");
+    // The matrix must hold IPADIC's connection id 5 for the U+2015
+    // compatibility entry to be added.
+    const matrix_6x6 = "6 6\n0 0 0\n";
+    var dict = try Dictionary.fromRawBytes(allocator, lex, matrix_6x6, "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n");
     defer dict.deinit();
     // Three lexicon rows plus the U+2015 compatibility entry.
     try std.testing.expectEqual(@as(usize, 4), dict.entries.len);
@@ -271,7 +275,7 @@ test "raw lexicon entries share one string blob and keep verbatim features" {
     try std.testing.expectError(error.InvalidDictionary, Dictionary.fromRawBytes(allocator, "本,0,0\n", "1 1\n0 0 0\n", "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n"));
     try std.testing.expectError(error.InvalidCharacter, Dictionary.fromRawBytes(allocator, "本,0,x,1,f\n", "1 1\n0 0 0\n", "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n"));
 
-    var count_only = try Dictionary.fromRawBytes(allocator, lex, "1 1\n0 0 0\n", "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n");
+    var count_only = try Dictionary.fromRawBytes(allocator, lex, matrix_6x6, "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n");
     defer count_only.deinit();
     count_only.discardFullTokenDataForCount();
 }
