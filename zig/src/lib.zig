@@ -246,6 +246,36 @@ test "binary file loaders (mmap, copy, borrowed, count-only) agree" {
     }
 }
 
+test "raw lexicon entries share one string blob and keep verbatim features" {
+    const allocator = std.testing.allocator;
+    const lex = "本,0,0,10,noun,book,*\r\n\n  と,0,0,1\nカレー,0,0,10,,\n";
+    var dict = try Dictionary.fromRawBytes(allocator, lex, "1 1\n0 0 0\n", "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n");
+    defer dict.deinit();
+    // Three lexicon rows plus the U+2015 compatibility entry.
+    try std.testing.expectEqual(@as(usize, 4), dict.entries.len);
+    const expected = [_][2][]const u8{
+        .{ "本", "noun,book,*" },
+        .{ "と", "" },
+        .{ "カレー", "," },
+        .{ "―", "記号,一般,*,*,*,*,―,―,―" },
+    };
+    const blob_start = @intFromPtr(dict.entry_blob.ptr);
+    for (dict.entries, expected) |entry, want| {
+        try std.testing.expectEqualStrings(want[0], entry.surface);
+        try std.testing.expectEqualStrings(want[1], entry.feature);
+        for ([_][]const u8{ entry.surface, entry.feature }) |text| {
+            try std.testing.expect(@intFromPtr(text.ptr) >= blob_start);
+            try std.testing.expect(@intFromPtr(text.ptr) + text.len <= blob_start + dict.entry_blob.len);
+        }
+    }
+    try std.testing.expectError(error.InvalidDictionary, Dictionary.fromRawBytes(allocator, "本,0,0\n", "1 1\n0 0 0\n", "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n"));
+    try std.testing.expectError(error.InvalidCharacter, Dictionary.fromRawBytes(allocator, "本,0,x,1,f\n", "1 1\n0 0 0\n", "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n"));
+
+    var count_only = try Dictionary.fromRawBytes(allocator, lex, "1 1\n0 0 0\n", "DEFAULT 0 1 0\n", "DEFAULT,0,0,10000,*\n");
+    defer count_only.deinit();
+    count_only.discardFullTokenDataForCount();
+}
+
 test "worker shrink and retained-capacity limit keep results identical" {
     const allocator = std.testing.allocator;
     var dict = try Dictionary.parseMinimal(allocator, minimal_dict);

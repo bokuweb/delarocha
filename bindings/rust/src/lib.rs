@@ -1752,9 +1752,15 @@ fn parse_mecab_entries(bytes: &[u8], name: &str) -> Result<Vec<Entry>> {
         .has_headers(false)
         .flexible(true)
         .from_reader(bytes);
-    let mut entries = Vec::new();
-    for record in reader.records() {
-        let record = record.map_err(|err| Error::InvalidDictionary(format!("{name}: {err}")))?;
+    // One entry per line; sizing up front avoids regrowing a vector of
+    // hundreds of thousands of entries for IPADIC-sized lexicons.
+    let mut entries = Vec::with_capacity(bytes.iter().filter(|&&byte| byte == b'\n').count() + 1);
+    // Reuse one record buffer for every row instead of allocating per row.
+    let mut record = csv::StringRecord::new();
+    while reader
+        .read_record(&mut record)
+        .map_err(|err| Error::InvalidDictionary(format!("{name}: {err}")))?
+    {
         if record.len() < 5 {
             return Err(Error::InvalidDictionary(format!(
                 "{name}: rows must have at least five fields"
@@ -1775,10 +1781,26 @@ fn parse_mecab_entries(bytes: &[u8], name: &str) -> Result<Vec<Entry>> {
             word_cost: record[3]
                 .parse()
                 .map_err(|_| Error::InvalidDictionary(format!("{name}: invalid word cost")))?,
-            feature: record.iter().skip(4).collect::<Vec<_>>().join(","),
+            feature: join_feature_fields(&record),
         });
     }
+    entries.shrink_to_fit();
     Ok(entries)
+}
+
+/// Joins fields 4.. with commas into one exactly sized string (the feature
+/// column of a MeCab CSV row) without an intermediate `Vec<&str>`.
+fn join_feature_fields(record: &csv::StringRecord) -> String {
+    let fields = record.iter().skip(4);
+    let len = fields.clone().map(|field| field.len() + 1).sum::<usize>();
+    let mut feature = String::with_capacity(len.saturating_sub(1));
+    for (index, field) in fields.enumerate() {
+        if index != 0 {
+            feature.push(',');
+        }
+        feature.push_str(field);
+    }
+    feature
 }
 
 /// Common-prefix search index over entry surfaces.

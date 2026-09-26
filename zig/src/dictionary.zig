@@ -553,27 +553,54 @@ pub const Dictionary = struct {
         return fromBinaryBytes(allocator, bytes);
     }
 
+    /// Builds a dictionary from MeCab-style raw files. Each file is read,
+    /// parsed, and freed before the next one is read, and all of them are
+    /// released before the trie is built, so the raw text never overlaps the
+    /// build's peak memory.
     pub fn fromRawFiles(allocator: Allocator, lex_path: []const u8, matrix_path: []const u8, char_path: []const u8, unk_path: []const u8) !Dictionary {
-        const lex = try readFileAlloc(allocator, lex_path);
-        defer allocator.free(lex);
-        const matrix = try readFileAlloc(allocator, matrix_path);
-        defer allocator.free(matrix);
-        const char_def = try readFileAlloc(allocator, char_path);
-        defer allocator.free(char_def);
-        const unk = try readFileAlloc(allocator, unk_path);
-        defer allocator.free(unk);
-        return fromRawBytes(allocator, lex, matrix, char_def, unk);
+        var char_property = blk: {
+            const bytes = try readFileAlloc(allocator, char_path);
+            defer allocator.free(bytes);
+            break :blk try CharProperty.parse(allocator, bytes);
+        };
+        errdefer char_property.deinit();
+        const lexicon = blk: {
+            const bytes = try readFileAlloc(allocator, lex_path);
+            defer allocator.free(bytes);
+            break :blk try parseEntries(allocator, bytes);
+        };
+        errdefer lexicon.deinit(allocator);
+        const unk_entries = blk: {
+            const bytes = try readFileAlloc(allocator, unk_path);
+            defer allocator.free(bytes);
+            break :blk try parseUnkEntries(allocator, bytes, &char_property);
+        };
+        errdefer freeUnkSlice(allocator, unk_entries);
+        const matrix = blk: {
+            const bytes = try readFileAlloc(allocator, matrix_path);
+            defer allocator.free(bytes);
+            break :blk try ConnectionMatrix.parseMecab(allocator, bytes);
+        };
+        errdefer freeI16Slice(allocator, matrix.costs);
+        return fromParsedRaw(allocator, char_property, lexicon, unk_entries, matrix);
     }
 
     pub fn fromRawBytes(allocator: Allocator, lex: []const u8, matrix_def: []const u8, char_def: []const u8, unk_def: []const u8) !Dictionary {
         var char_property = try CharProperty.parse(allocator, char_def);
         errdefer char_property.deinit();
-        const entries = try parseEntries(allocator, lex);
-        errdefer freeEntrySlice(allocator, entries);
+        const lexicon = try parseEntries(allocator, lex);
+        errdefer lexicon.deinit(allocator);
         const unk_entries = try parseUnkEntries(allocator, unk_def, &char_property);
         errdefer freeUnkSlice(allocator, unk_entries);
         const matrix = try ConnectionMatrix.parseMecab(allocator, matrix_def);
         errdefer freeI16Slice(allocator, matrix.costs);
+        return fromParsedRaw(allocator, char_property, lexicon, unk_entries, matrix);
+    }
+
+    /// Builds the lookup structures over parsed raw parts. Ownership of the
+    /// parts moves to the result only on success; callers free them on error.
+    fn fromParsedRaw(allocator: Allocator, char_property: CharProperty, lexicon: ParsedLexicon, unk_entries: []UnkEntry, matrix: ConnectionMatrix) !Dictionary {
+        const entries = lexicon.entries;
         // Large dictionaries use the trie path exclusively; building the
         // first-byte entry index there only consumes memory and load time.
         const entry_index = if (entries.len <= small_dictionary_entry_limit) try buildEntryIndex(allocator, entries) else EntryIndex.empty();
@@ -586,8 +613,10 @@ pub const Dictionary = struct {
             .allocator = allocator,
             .entries = entries,
             .entry_feature_offsets = emptyU32Slice(),
-            .entry_blob = emptyU8Slice(),
-            .owns_entry_blob = false,
+            // Surfaces and features of raw entries live in one allocation;
+            // `deinit` frees it together with the entry array.
+            .entry_blob = lexicon.blob,
+            .owns_entry_blob = true,
             .user_entries = &.{},
             .unk_entries = unk_entries,
             .unk_feature_blob = emptyU8Slice(),
@@ -1963,9 +1992,31 @@ pub const MappedFile = struct {
 };
 
 pub fn readFileAlloc(allocator: Allocator, path: []const u8) ![]u8 {
+    const limit = 256 * 1024 * 1024;
     var io_instance: std.Io.Threaded = .init(allocator, .{});
     defer io_instance.deinit();
-    return std.Io.Dir.cwd().readFileAlloc(io_instance.io(), path, allocator, .limited(256 * 1024 * 1024));
+    const io = io_instance.io();
+    // Regular files are read into one buffer sized from their length. The
+    // generic reader grows its buffer geometrically, which for a 40 MB
+    // lexicon allocates about 1.5x the file and copies it along the way.
+    if (readWholeFileExact(allocator, io, path, limit)) |bytes| return bytes;
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(limit));
+}
+
+/// Returns null (having freed everything) when the length is unknown, too
+/// large, or changed while reading; the caller then uses the generic reader,
+/// which also reports the error for unreadable files.
+fn readWholeFileExact(allocator: Allocator, io: std.Io, path: []const u8, limit: usize) ?[]u8 {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    const len = std.math.cast(usize, file.length(io) catch return null) orelse return null;
+    if (len == 0 or len >= limit) return null;
+    const bytes = allocator.alloc(u8, len) catch return null;
+    const read = file.readPositionalAll(io, bytes, 0) catch 0;
+    var probe: [1]u8 = undefined;
+    if (read == len and (file.readPositionalAll(io, &probe, len) catch 1) == 0) return bytes;
+    allocator.free(bytes);
+    return null;
 }
 
 fn appendU8(allocator: Allocator, bytes: *std.ArrayList(u8), value: u8) !void {
@@ -2185,35 +2236,96 @@ fn scanBinaryUnkFeatureBlobLen(bytes: []const u8, start_cursor: usize, entry_cou
     return total;
 }
 
-fn parseEntries(allocator: Allocator, input: []const u8) ![]Entry {
+/// Raw lexicon entries whose surfaces and features all point into `blob`,
+/// one allocation instead of two per entry.
+const ParsedLexicon = struct {
+    entries: []Entry,
+    blob: []u8,
+
+    fn deinit(self: ParsedLexicon, allocator: Allocator) void {
+        allocator.free(self.entries);
+        allocator.free(self.blob);
+    }
+};
+
+// Vibrato's distributed IPADIC system dictionary returns U+2015 as a known
+// punctuation token even though the raw CSV lexicon does not contain it. Add
+// the same one-character entry when building native dictionaries so
+// fraim-lint-rs preserves the public token shape while still avoiding the
+// Vibrato runtime.
+const compatibility_surface = "―";
+const compatibility_feature = "記号,一般,*,*,*,*,―,―,―";
+
+fn parseEntries(allocator: Allocator, input: []const u8) !ParsedLexicon {
+    // Every surface and feature is a substring of its line, so the input size
+    // bounds the blob; it is trimmed to the used length afterwards.
+    const blob_cap = try addSizes(input.len, .{ compatibility_surface.len, compatibility_feature.len, 1 });
+    const blob = try allocator.alloc(u8, blob_cap);
+    var blob_freed = false;
+    errdefer if (!blob_freed) allocator.free(blob);
+    var used: usize = 0;
+
     var entries: std.ArrayList(Entry) = .empty;
-    errdefer freeEntries(allocator, entries.items);
     errdefer entries.deinit(allocator);
+    // One entry per line (plus the compatibility entry); counting newlines is
+    // far cheaper than regrowing and copying the entry array.
+    try entries.ensureTotalCapacityPrecise(allocator, std.mem.count(u8, input, "\n") + 2);
+
     var lines = std.mem.splitScalar(u8, input, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
         var fields = std.mem.splitScalar(u8, line, ',');
-        try entries.append(allocator, try parseEntryFields(allocator, &fields));
+        const surface = fields.next() orelse return error.InvalidDictionary;
+        const left_id = try std.fmt.parseInt(u16, fields.next() orelse return error.InvalidDictionary, 10);
+        const right_id = try std.fmt.parseInt(u16, fields.next() orelse return error.InvalidDictionary, 10);
+        const word_cost = try std.fmt.parseInt(i32, fields.next() orelse return error.InvalidDictionary, 10);
+        // The remaining comma-separated fields, verbatim.
+        const feature = fields.rest();
+        try entries.append(allocator, .{
+            .surface = appendBlob(blob, &used, surface),
+            .left_id = left_id,
+            .right_id = right_id,
+            .word_cost = word_cost,
+            .feature = appendBlob(blob, &used, feature),
+        });
     }
-    try appendCompatibilityEntries(allocator, &entries);
-    return entries.toOwnedSlice(allocator);
+    if (!hasSurface(entries.items, compatibility_surface)) {
+        try entries.append(allocator, .{
+            .surface = appendBlob(blob, &used, compatibility_surface),
+            .left_id = 5,
+            .right_id = 5,
+            .word_cost = 4769,
+            .feature = appendBlob(blob, &used, compatibility_feature),
+        });
+    }
+
+    // Move the strings into an exactly sized allocation: in-place shrinking
+    // (`resize`) may keep the whole upper-bound block alive. At least one
+    // byte is kept so an owned blob is never mistaken for an empty one.
+    const exact = try allocator.alloc(u8, @max(used, 1));
+    @memcpy(exact[0..used], blob[0..used]);
+    for (entries.items) |*entry| {
+        entry.surface = rebaseSlice(entry.surface, blob, exact);
+        entry.feature = rebaseSlice(entry.feature, blob, exact);
+    }
+    allocator.free(blob);
+    blob_freed = true;
+    errdefer allocator.free(exact);
+    const owned_entries = try entries.toOwnedSlice(allocator);
+    return .{ .entries = owned_entries, .blob = exact };
 }
 
-fn appendCompatibilityEntries(allocator: Allocator, entries: *std.ArrayList(Entry)) !void {
-    // Vibrato's distributed IPADIC system dictionary returns U+2015 as a known
-    // punctuation token even though the raw CSV lexicon does not contain it.
-    // Add the same one-character entry when building native dictionaries so
-    // fraim-lint-rs preserves the public token shape while still avoiding the
-    // Vibrato runtime.
-    if (hasSurface(entries.items, "―")) return;
-    try entries.append(allocator, .{
-        .surface = try allocator.dupe(u8, "―"),
-        .left_id = 5,
-        .right_id = 5,
-        .word_cost = 4769,
-        .feature = try allocator.dupe(u8, "記号,一般,*,*,*,*,―,―,―"),
-    });
+inline fn appendBlob(blob: []u8, used: *usize, bytes: []const u8) []const u8 {
+    const start = used.*;
+    @memcpy(blob[start..][0..bytes.len], bytes);
+    used.* = start + bytes.len;
+    return blob[start..used.*];
+}
+
+fn rebaseSlice(slice: []const u8, old: []const u8, new: []const u8) []const u8 {
+    const offset = @intFromPtr(slice.ptr) - @intFromPtr(old.ptr);
+    return new[offset..][0..slice.len];
 }
 
 fn hasSurface(entries: []const Entry, surface: []const u8) bool {
