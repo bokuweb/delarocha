@@ -1,3 +1,75 @@
+//! Japanese morphological analyzer that reads MeCab-format system
+//! dictionaries (such as IPADIC) and produces MeCab/Vibrato-compatible
+//! segmentation.
+//!
+//! - [`ffi`] (feature `zig-ffi`): the fast path, a tokenizer core written in
+//!   Zig and linked from prebuilt static libraries. Dictionaries are compiled
+//!   once into a binary file that is memory-mapped at load time.
+//! - [`Tokenizer`]: a pure-Rust tokenizer that reads the raw dictionary files
+//!   directly. Always available, roughly an order of magnitude slower.
+//! - `VibratoSystemDictionary` (feature `vibrato-system`): load precompiled
+//!   Vibrato `system.dic` / `system.dic.zst` files.
+//!
+//! See the [README](https://github.com/bokuweb/delarocha#readme) for the
+//! supported `zig-ffi` targets and how to prepare IPADIC.
+//!
+//! # Quick start
+//!
+//! Compile the raw MeCab files (UTF-8 `lex.csv`, `matrix.def`, `char.def`,
+//! `unk.def`) into a binary dictionary once, then memory-map it and tokenize
+//! with a reusable worker, reading surfaces and features as borrowed views:
+//!
+//! ```no_run
+//! # #[cfg(feature = "zig-ffi")]
+//! use delarocha::ffi::ZigTokenizer;
+//!
+//! # #[cfg(feature = "zig-ffi")]
+//! fn main() -> delarocha::Result<()> {
+//!     // Once (e.g. at build or deploy time): compile the raw MeCab files.
+//!     ZigTokenizer::write_binary_from_raw_paths(
+//!         "dic/lex.csv",
+//!         "dic/matrix.def",
+//!         "dic/char.def",
+//!         "dic/unk.def",
+//!         "ipadic.dic",
+//!     )?;
+//!
+//!     // At startup: memory-map the binary dictionary (nothing is copied).
+//!     let tokenizer = ZigTokenizer::from_binary_path("ipadic.dic")?;
+//!
+//!     // Reuse one worker per thread; its buffers are recycled between calls.
+//!     let mut worker = tokenizer.create_worker()?;
+//!     for sentence in ["本とカレーの街", "東京都に住む"] {
+//!         for token in worker.tokenize_borrowed_views(sentence)?.iter() {
+//!             println!("{}\t{}", token.surface(), token.feature());
+//!         }
+//!     }
+//!     Ok(())
+//! }
+//! # #[cfg(not(feature = "zig-ffi"))]
+//! # fn main() {}
+//! ```
+//!
+//! Without `zig-ffi`, the pure-Rust tokenizer reads the same raw files:
+//!
+//! ```no_run
+//! use std::fs::File;
+//!
+//! fn main() -> delarocha::Result<()> {
+//!     let dictionary = delarocha::SystemDictionaryBuilder::from_readers(
+//!         File::open("dic/lex.csv")?,
+//!         File::open("dic/matrix.def")?,
+//!         File::open("dic/char.def")?,
+//!         File::open("dic/unk.def")?,
+//!     )?;
+//!     let tokenizer = delarocha::Tokenizer::new(dictionary);
+//!     let mut worker = tokenizer.create_worker();
+//!     for token in worker.tokenize("本とカレーの街")? {
+//!         println!("{}\t{}", token.surface(), token.feature());
+//!     }
+//!     Ok(())
+//! }
+//! ```
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::cmp::Ordering;
