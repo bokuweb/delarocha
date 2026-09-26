@@ -75,15 +75,16 @@ pub const Decoded = union(enum) {
 };
 
 inline fn readVarint(bytes: []const u8, cursor: *usize) ?usize {
-    var value: usize = 0;
-    var shift: u6 = 0;
+    // At most four bytes (28 bits): every length fits a u32 blob offset.
+    var value: u32 = 0;
+    var shift: u5 = 0;
     while (cursor.* < bytes.len) {
         const byte = bytes[cursor.*];
         cursor.* += 1;
-        value |= @as(usize, byte & 0x7f) << shift;
+        value |= @as(u32, byte & 0x7f) << shift;
         if (byte & 0x80 == 0) return value;
+        if (shift == 21) return null;
         shift += 7;
-        if (shift > 35) return null;
     }
     return null;
 }
