@@ -1119,8 +1119,11 @@ pub const Worker = struct {
         var best_index: u32 = invalid_node;
         var best_cost: i32 = std.math.maxInt(i32);
         var index = self.end_heads.items[end];
+        // The path ends at EOS (left id 0): include its connection cost, as MeCab does, so the
+        // last word is chosen like any other (row 0 of the matrix).
+        const eos_row = self.dictionary.matrix.costs[0..self.dictionary.matrix.right_size];
         while (index != invalid_node) : (index = self.nodes.items[index].next_end) {
-            const cost = self.nodes.items[index].min_cost;
+            const cost = self.nodes.items[index].min_cost + @as(i32, eos_row[self.nodes.items[index].right_id]);
             if (best_index == invalid_node or cost < best_cost) {
                 best_index = index;
                 best_cost = cost;
@@ -1142,8 +1145,9 @@ pub const Worker = struct {
         var best_index: u32 = invalid_count_node;
         var best_cost: i32 = std.math.maxInt(i32);
         var index = first_index;
+        const eos_row = self.dictionary.matrix.costs[0..self.dictionary.matrix.right_size];
         while (index != invalid_count_node) : (index = self.count_nodes.items[index].next_end) {
-            const cost = self.count_nodes.items[index].min_cost;
+            const cost = self.count_nodes.items[index].min_cost + @as(i32, eos_row[self.count_nodes.items[index].right_id]);
             if (best_index == invalid_count_node or cost < best_cost) {
                 best_index = index;
                 best_cost = cost;
