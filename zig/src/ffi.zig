@@ -437,8 +437,8 @@ pub export fn delarocha_tokens_copy_metadata(
         starts[index] = @intCast(token.start);
         ends[index] = @intCast(token.end);
         word_ids[index] = token.word_id;
-        out_ptrs[index] = token.feature.ptr;
-        out_lens[index] = token.feature.len;
+        out_ptrs[index] = token.feature_ptr;
+        out_lens[index] = token.feature_len;
     }
     return tokens.len;
 }
@@ -465,11 +465,56 @@ pub export fn delarocha_token_feature(worker: ?*const Worker, index: usize) [*]c
     // On allocation failure unresolved features stay empty; pointer and
     // length still describe the same token feature.
     resolvedWorker(ptr) catch {};
-    return ptr.tokens.items[index].feature.ptr;
+    return ptr.tokens.items[index].feature_ptr;
 }
 
 pub export fn delarocha_token_feature_len(worker: ?*const Worker, index: usize) usize {
     const ptr = worker orelse return 3;
     resolvedWorker(ptr) catch {};
-    return ptr.tokens.items[index].feature.len;
+    return ptr.tokens.items[index].feature_len;
+}
+
+/// Size of `Token`, the element type of the array returned by
+/// `delarocha_tokenize_tokens`. Bindings compare it with their mirror of
+/// the (C-compatible) layout before reading the array in place.
+pub export fn delarocha_token_size() usize {
+    return @sizeOf(tokenizer_mod.Token);
+}
+
+/// `delarocha_tokenize_bytes` (features deferred) that also stores the
+/// address of the worker's token array in `out_tokens`, so bindings can read
+/// the tokens in place instead of copying them out. Returns the token count,
+/// or `SIZE_MAX` on error (see `delarocha_last_error`). Spans are contiguous
+/// and, for UTF-8 input, on character boundaries (see
+/// `Worker.tokenizeDeferred`).
+///
+/// The array stays valid and unchanged until the next call that mutates the
+/// worker, except that `delarocha_worker_resolve_features` fills in the
+/// features and may move it (it returns the new address).
+pub export fn delarocha_tokenize_tokens(
+    worker: ?*Worker,
+    input: [*]const u8,
+    len: usize,
+    out_tokens: *[*]const tokenizer_mod.Token,
+) usize {
+    const worker_ptr = worker orelse {
+        setLastError("worker is null", .{});
+        return std.math.maxInt(usize);
+    };
+    const tokens = worker_ptr.tokenizeDeferred(input[0..len]) catch |err| {
+        setLastError("tokenize failed: {s}", .{@errorName(err)});
+        return std.math.maxInt(usize);
+    };
+    out_tokens.* = tokens.ptr;
+    return tokens.len;
+}
+
+/// Resolves the deferred features of the current tokens (a no-op when they
+/// are already resolved) and returns the address of the token array, which
+/// resolving may have moved when a retained-capacity limit is set. On
+/// allocation failure unresolved features stay empty, as with
+/// `delarocha_token_feature`.
+pub export fn delarocha_worker_resolve_features(worker: *Worker) [*]const tokenizer_mod.Token {
+    worker.resolveFeatures() catch {};
+    return worker.tokens.items.ptr;
 }

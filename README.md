@@ -195,9 +195,14 @@ tokenization does not decode anything, and features borrowed from a worker are
 valid until the worker is used again.
 
 For output-sensitive callers, `ZigWorker::tokenize_borrowed_views` returns a
-`ZigTokenViews` collection backed by the worker's reusable metadata buffers.
-Iterating it avoids both owned surface/feature strings and the per-call
-`Vec<ZigTokenView>` allocation. The collection and its token views remain valid
+lazy `ZigTokenViews` collection that reads the worker's native token array in
+place: the call itself does no per-token work beyond tokenization (so
+`views.len()` costs the same as `tokenize_raw`), and features and character
+offsets are only computed for the tokens you read. Iterating it avoids both
+owned surface/feature strings and the per-call `Vec<ZigTokenView>` allocation;
+`iter()` is O(1) amortized per token, and `get(i)` counts characters from the
+previously read token, so sequential access is cheap while arbitrary random
+access is O(input length) per call in the worst case. The collection and its token views remain valid
 until the worker is mutably used again. Each `ZigTokenView` carries the borrowed
 surface and feature plus byte and character ranges (`range_byte`,
 `range_char`), and `to_token()` reproduces the owned `ZigWorker::tokenize`

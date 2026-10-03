@@ -3140,7 +3140,7 @@ test "compact feature sections are validated and corrupt records never read out 
             var worker = Worker.init(allocator, &dict, null);
             defer worker.deinit();
             for (try worker.tokenize("語1語22ご7ご39本とカレー")) |token| {
-                try std.testing.expect(token.feature.len <= feature_codec.max_decoded_len);
+                try std.testing.expect(token.feature().len <= feature_codec.max_decoded_len);
             }
         }
     }
@@ -3180,10 +3180,10 @@ test "worker capacity trimming covers compact feature state" {
         const deferred = try worker.tokenizeDeferred(input.items);
         try worker.resolveFeatures();
         try std.testing.expectEqual(expected.len, deferred.len);
-        for (expected, deferred) |lhs, rhs| try std.testing.expectEqualStrings(lhs.feature, rhs.feature);
+        for (expected, deferred) |lhs, rhs| try std.testing.expectEqualStrings(lhs.feature(), rhs.feature());
         // Eager results keep the decode cache they borrow.
         const eager = try worker.tokenize(input.items);
-        for (expected, eager) |lhs, rhs| try std.testing.expectEqualStrings(lhs.feature, rhs.feature);
+        for (expected, eager) |lhs, rhs| try std.testing.expectEqualStrings(lhs.feature(), rhs.feature());
         worker.setRetainedCapacityLimit(null);
 
         // Explicit shrinking releases the feature state too.
@@ -3196,7 +3196,7 @@ test "worker capacity trimming covers compact feature state" {
         try std.testing.expectEqual(@as(usize, 0), worker.retainedBytes());
         try worker.resolveFeatures();
         const again = try worker.tokenize(input.items);
-        for (expected, again) |lhs, rhs| try std.testing.expectEqualStrings(lhs.feature, rhs.feature);
+        for (expected, again) |lhs, rhs| try std.testing.expectEqualStrings(lhs.feature(), rhs.feature());
     }
 }
 
@@ -3358,7 +3358,7 @@ fn expectTokens(allocator: Allocator, dict: *const Dictionary, input: []const u8
     defer worker.deinit();
     const tokens = try worker.tokenize(input);
     try std.testing.expectEqual(features.len, tokens.len);
-    for (tokens, features) |token, feature| try std.testing.expectEqualStrings(feature, token.feature);
+    for (tokens, features) |token, feature| try std.testing.expectEqualStrings(feature, token.feature());
     try std.testing.expectEqual(features.len, try worker.tokenizeCount(input));
 }
 
