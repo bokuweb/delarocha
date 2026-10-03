@@ -20,6 +20,10 @@
 //! - `views-sf`: borrowed views, reading `surface()` and `feature()` of every
 //!   token.
 //! - `views-char`: borrowed views, reading `range_char()` of every token.
+//! - `spans-feature`: `tokenize_raw`, then `copy_token_spans` into reusable
+//!   buffers and `token_feature(i)` for every token, with a per-word-id cache
+//!   of data derived from the feature (the call pattern of span-based
+//!   integrations that do not use views).
 //! - `vibrato-num`: Vibrato `tokenize()` + `num_tokens()` (needs the
 //!   `vibrato-bench` feature).
 //! - `vibrato-sf`: Vibrato, reading `surface()` and `feature()` of every token.
@@ -43,7 +47,9 @@ fn main() {
         .collect();
 
     let (elapsed, words, checksum) = match mode.as_str() {
-        "raw" | "views-len" | "views-sf" | "views-char" => run_delarocha(dic, mode, &lines),
+        "raw" | "views-len" | "views-sf" | "views-char" | "spans-feature" => {
+            run_delarocha(dic, mode, &lines)
+        }
         "vibrato-num" | "vibrato-sf" => run_vibrato(dic, mode, &lines),
         _ => {
             eprintln!("unknown mode {mode}");
@@ -94,6 +100,29 @@ fn run_delarocha(dic: &str, mode: &str, lines: &[String]) -> (std::time::Duratio
                 for view in views.iter() {
                     let range = black_box(view.range_char());
                     checksum += range.end - range.start;
+                }
+            }
+        }
+        "spans-feature" => {
+            let (mut starts, mut ends, mut word_ids) = (Vec::new(), Vec::new(), Vec::new());
+            let mut first_fields = std::collections::HashMap::<u32, String>::new();
+            for line in lines {
+                let count = worker.tokenize_raw(line).expect("tokenize");
+                starts.resize(count, 0);
+                ends.resize(count, 0);
+                word_ids.resize(count, 0);
+                let copied = worker
+                    .copy_token_spans(&mut starts, &mut ends, &mut word_ids)
+                    .expect("copy spans");
+                words += copied;
+                for index in 0..copied {
+                    let feature = worker.token_feature(index);
+                    let first = first_fields
+                        .entry(word_ids[index])
+                        .or_insert_with(|| feature.split(',').next().unwrap_or("").to_owned());
+                    checksum += black_box(&line[starts[index]..ends[index]]).len()
+                        + feature.len()
+                        + first.len();
                 }
             }
         }
