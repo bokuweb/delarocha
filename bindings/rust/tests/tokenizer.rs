@@ -117,6 +117,38 @@ fn builds_from_mecab_style_readers() {
 }
 
 #[test]
+fn final_word_choice_includes_the_connection_cost_to_eos() {
+    // "ab" alone is cheaper by word cost (10 < 20), but its right id connects
+    // to EOS at +50 while "b"'s right id connects at 0. MeCab picks "a" + "b"
+    // (total 20 < 60); ignoring EOS would pick "ab".
+    let lexicon_csv = "a,1,1,10,a\nb,1,2,10,b\nab,1,1,10,ab\n";
+    // "right left cost": right 1 -> EOS (left 0) costs 50; everything else is free.
+    let matrix_def = "3 3\n0 0 0\n0 1 0\n0 2 0\n1 0 50\n1 1 0\n1 2 0\n2 0 0\n2 1 0\n2 2 0\n";
+    let char_def = "DEFAULT 0 1 0";
+    let unk_def = "DEFAULT,0,0,10000,*";
+
+    let dictionary = SystemDictionaryBuilder::from_readers(
+        lexicon_csv.as_bytes(),
+        matrix_def.as_bytes(),
+        char_def.as_bytes(),
+        unk_def.as_bytes(),
+    )
+    .expect("dictionary builds");
+    let tokenizer = Tokenizer::new(dictionary);
+
+    let tokens = tokenizer.tokenize("ab").expect("tokenize succeeds");
+    assert_eq!(
+        tokens
+            .iter()
+            .map(|token| token.feature.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    // The count-only path must agree (it would be 1 if EOS were ignored).
+    assert_eq!(tokenizer.tokenize_count("ab").expect("count succeeds"), 2);
+}
+
+#[test]
 fn groups_unknown_words_by_char_category() {
     let lexicon_csv = "本,0,0,1,noun";
     let matrix_def = "1 1\n0 0 0";

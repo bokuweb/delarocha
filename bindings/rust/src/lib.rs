@@ -1360,12 +1360,20 @@ impl<'dict> Worker<'dict> {
             self.append_unknown_nodes(&dictionary, input, begin, emitted)?;
         }
 
+        // The path ends at EOS (left id 0): include its connection cost, as
+        // MeCab does, so the last word is chosen like any other.
+        let eos_row = dictionary
+            .matrix
+            .row(0)
+            .ok_or_else(|| Error::Tokenization("connection matrix has no EOS row".into()))?;
         let best = EndLinkIter {
             links: &self.end_links,
             next: self.ends[input.len()],
         }
         .map(|link| link.node as usize)
-        .min_by(|left, right| compare_node_cost(&self.nodes[*left], &self.nodes[*right]))
+        .min_by(|left, right| {
+            compare_end_node_cost(&self.nodes[*left], &self.nodes[*right], eos_row)
+        })
         .ok_or_else(|| Error::Tokenization("no path reached the end of input".into()))?;
         Ok(Some(best))
     }
@@ -1758,9 +1766,10 @@ struct Candidate {
     word_cost: i32,
 }
 
-fn compare_node_cost(left: &Node, right: &Node) -> Ordering {
-    left.min_cost
-        .cmp(&right.min_cost)
+fn compare_end_node_cost(left: &Node, right: &Node, eos_row: &[i16]) -> Ordering {
+    let cost = |node: &Node| node.min_cost + i32::from(eos_row[usize::from(node.right_id)]);
+    cost(left)
+        .cmp(&cost(right))
         .then_with(|| left.word_id.cmp(&right.word_id))
 }
 
