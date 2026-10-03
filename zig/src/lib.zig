@@ -118,6 +118,26 @@ test "builds raw mecab style dictionary" {
     try std.testing.expect(tokens[1].isUnknown());
 }
 
+test "final word choice includes the connection cost to end-of-sentence" {
+    // Two entries for "b": X is cheaper by word cost (10 < 20) but its right id connects to EOS at +50,
+    // while Y's right id connects at 0. MeCab picks Y (total 20 < 60); ignoring EOS would pick X.
+    const lex = "b,1,1,10,X\nb,1,2,20,Y\n";
+    // "right left cost": BOS (right 0) -> left 1 is free; right 1 -> EOS (left 0) costs 50; right 2 -> EOS is free.
+    const matrix = "3 3\n0 0 0\n0 1 0\n0 2 0\n1 0 50\n1 1 0\n1 2 0\n2 0 0\n2 1 0\n2 2 0\n";
+    const char_def = "DEFAULT 0 1 0\nALPHA 1 1 0\n0x0041..0x005A ALPHA\n";
+    const unk = "DEFAULT,0,0,10000,*\nALPHA,0,0,10000,alpha\n";
+    var dict = try Dictionary.fromRawBytes(std.testing.allocator, lex, matrix, char_def, unk);
+    defer dict.deinit();
+    var worker = Worker.init(std.testing.allocator, &dict, null);
+    defer worker.deinit();
+
+    const tokens = try worker.tokenize("b");
+    try std.testing.expectEqual(@as(usize, 1), tokens.len);
+    try std.testing.expectEqualStrings("Y", tokens[0].feature);
+    // the count-only path must agree
+    try std.testing.expectEqual(@as(usize, 1), try worker.tokenizeCount("b"));
+}
+
 test "cached unknown grouping preserves full and count paths" {
     const lex = "a,0,0,10,system-alpha\n";
     const matrix = "1 1\n0 0 0\n";
