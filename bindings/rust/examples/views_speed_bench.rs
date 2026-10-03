@@ -86,9 +86,12 @@ type PassResult = (std::time::Duration, usize, usize);
 fn run_delarocha(dic: &str, mode: &str, lines: &[String], passes: usize) -> Vec<PassResult> {
     let tokenizer = delarocha::ffi::ZigTokenizer::from_binary_path(dic).expect("load dictionary");
     let mut worker = tokenizer.create_worker().expect("create worker");
-    (0..passes)
+    let results = (0..passes)
         .map(|_| delarocha_pass(&mut worker, mode, lines))
-        .collect()
+        .collect();
+    // After the timed loop: buffer capacity the worker keeps for reuse.
+    eprintln!("Retained-{mode}: {} bytes", worker.retained_bytes());
+    results
 }
 
 #[cfg(feature = "zig-ffi")]
