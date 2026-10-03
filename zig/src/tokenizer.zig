@@ -9,17 +9,46 @@ const invalid_node: u32 = std.math.maxInt(u32);
 const invalid_count_node: u32 = std.math.maxInt(u32);
 const max_cached_unknown_boundaries: usize = 8;
 
-pub const Token = struct {
+/// One token of the best path. The layout is C-compatible and part of the
+/// FFI contract: bindings read the worker's token array in place (see
+/// `delarocha_tokenize_tokens` in ffi.zig), so field order and types must stay in
+/// sync with `RawToken` in bindings/rust/src/lib.rs.
+pub const Token = extern struct {
     start: usize,
     end: usize,
+    feature_ptr: [*]const u8,
+    feature_len: usize,
     word_id: u32,
-    feature: []const u8,
     total_cost: i32,
 
     pub fn isUnknown(self: Token) bool {
         return self.word_id >= unknown_word_base;
     }
+
+    /// The token's feature bytes (empty until features are resolved for
+    /// tokens produced by `Worker.tokenizeDeferred`).
+    pub fn feature(self: Token) []const u8 {
+        return self.feature_ptr[0..self.feature_len];
+    }
+
+    pub fn setFeature(self: *Token, bytes: []const u8) void {
+        self.feature_ptr = bytes.ptr;
+        self.feature_len = bytes.len;
+    }
 };
+
+comptime {
+    // FFI layout contract (mirrored by `RawToken` on the Rust side).
+    const word = @sizeOf(usize);
+    std.debug.assert(@offsetOf(Token, "start") == 0);
+    std.debug.assert(@offsetOf(Token, "end") == word);
+    std.debug.assert(@offsetOf(Token, "feature_ptr") == 2 * word);
+    std.debug.assert(@offsetOf(Token, "feature_len") == 3 * word);
+    std.debug.assert(@offsetOf(Token, "word_id") == 4 * word);
+    std.debug.assert(@offsetOf(Token, "total_cost") == 4 * word + 4);
+    std.debug.assert(@sizeOf(Token) == 4 * word + 8);
+    std.debug.assert(@alignOf(Token) == @alignOf(usize));
+}
 
 const Node = struct {
     word_id: u32,
@@ -286,6 +315,13 @@ pub const Worker = struct {
     /// Like `tokenize`, but token features are left empty until
     /// `resolveFeatures` is called, so callers that only need spans or word
     /// ids skip feature lookup and decoding. `input` may be freed afterwards.
+    ///
+    /// For both entry points, tokens are contiguous from 0 to `input.len`,
+    /// and for UTF-8 `input` every span lies on character boundaries whatever
+    /// the dictionary contains: lattice nodes only begin at character
+    /// boundaries (`nextBoundary`), so a node ending inside a multi-byte
+    /// sequence has no successor and never reaches the best path. The Rust
+    /// token views rely on this.
     pub fn tokenizeDeferred(self: *Worker, input: []const u8) ![]const Token {
         try self.tokenizeWithoutFeatures(input);
         if (self.tokens.items.len == 0) {
@@ -332,7 +368,7 @@ pub const Worker = struct {
     fn fillFeatures(self: *Worker, input: []const u8) Allocator.Error!void {
         const tokens = self.tokens.items;
         if (!self.dictionary.features_compact) {
-            for (tokens) |*token| token.feature = self.featureFor(token.word_id);
+            for (tokens) |*token| token.setFeature(self.featureFor(token.word_id));
             return;
         }
         const base = try self.beginCompactFeatures(tokens.len);
@@ -355,14 +391,14 @@ pub const Worker = struct {
         span.start = no_feature_span;
         const word_id = token.word_id;
         if (word_id >= (1 << 30)) {
-            token.feature = self.featureFor(word_id);
+            token.setFeature(self.featureFor(word_id));
             return;
         }
         const cache = &self.feature_cache;
         const cached = cache.get(word_id) orelse decoded: {
             switch (try self.dictionary.decodeEntryFeature(self.allocator, word_id, input[token.start..token.end], &cache.bytes)) {
                 .borrowed => |bytes| {
-                    token.feature = bytes;
+                    token.setFeature(bytes);
                     return;
                 },
                 .appended => |len| {
@@ -373,7 +409,7 @@ pub const Worker = struct {
             }
         };
         span.* = cached;
-        token.feature = cache.bytes.items.ptr[cached.start..][0..cached.len];
+        token.setFeature(cache.bytes.items.ptr[cached.start..][0..cached.len]);
     }
 
     /// Re-points token features at the cache buffer if it moved.
@@ -381,7 +417,7 @@ pub const Worker = struct {
         const bytes = self.feature_cache.bytes.items;
         if (bytes.ptr == base) return;
         for (self.tokens.items, self.feature_spans.items) |*token, span| {
-            if (span.start != no_feature_span) token.feature = bytes[span.start..][0..span.len];
+            if (span.start != no_feature_span) token.setFeature(bytes[span.start..][0..span.len]);
         }
     }
 
@@ -1184,14 +1220,15 @@ pub const Worker = struct {
             token.* = .{
                 .start = start,
                 .end = end,
+                .feature_ptr = "".ptr,
+                .feature_len = 0,
                 .word_id = node.word_id,
-                .feature = "",
                 .total_cost = node.min_cost,
             };
             if (compact) {
                 try self.fillCompactFeature(input, token, &self.feature_spans.items[i]);
             } else if (with_features) {
-                token.feature = self.featureFor(node.word_id);
+                token.setFeature(self.featureFor(node.word_id));
             }
             start = end;
         }

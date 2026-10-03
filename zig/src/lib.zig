@@ -39,6 +39,9 @@ comptime {
     _ = ffi.delarocha_tokens_copy_spans;
     _ = ffi.delarocha_tokens_copy_metadata;
     _ = ffi.delarocha_token_feature;
+    _ = ffi.delarocha_token_size;
+    _ = ffi.delarocha_tokenize_tokens;
+    _ = ffi.delarocha_worker_resolve_features;
 }
 
 const minimal_dict =
@@ -61,11 +64,35 @@ test "tokenizes with lowest cost path" {
 
     const tokens = try worker.tokenize("本とカレー");
     try std.testing.expectEqual(@as(usize, 2), tokens.len);
-    try std.testing.expectEqualSlices(u8, "compound,book-and", tokens[0].feature);
+    try std.testing.expectEqualSlices(u8, "compound,book-and", tokens[0].feature());
     try std.testing.expectEqual(@as(usize, 0), tokens[0].start);
     try std.testing.expectEqual(@as(usize, 6), tokens[0].end);
     try std.testing.expectEqual(@as(usize, 6), tokens[1].start);
     try std.testing.expectEqual(@as(usize, 15), tokens[1].end);
+}
+
+test "token spans stay on utf8 boundaries even with surfaces splitting a character" {
+    // 本 is e6 9c ac. Very cheap entries for "\xe6" and "\x9c\xac" would
+    // win if a path could pass through byte offset 1, but lattice nodes only
+    // begin at character boundaries, so it cannot.
+    const bad_dict = minimal_dict ++ "entry\t\xe6\t1\t1\t-30000\tbroken\n" ++ "entry\t\x9c\xac\t1\t1\t-30000\tbroken\n";
+    var dict = try Dictionary.parseMinimal(std.testing.allocator, bad_dict);
+    defer dict.deinit();
+    var worker = Worker.init(std.testing.allocator, &dict, null);
+    defer worker.deinit();
+
+    const input = "本X🍛と本カレー";
+    for ([_]bool{ false, true }) |deferred| {
+        const tokens = if (deferred) try worker.tokenizeDeferred(input) else try worker.tokenize(input);
+        var expected_start: usize = 0;
+        for (tokens) |token| {
+            try std.testing.expectEqual(expected_start, token.start);
+            try std.testing.expect(token.end > token.start);
+            try std.testing.expect(token.end == input.len or (input[token.end] & 0xc0) != 0x80);
+            expected_start = token.end;
+        }
+        try std.testing.expectEqual(input.len, expected_start);
+    }
 }
 
 test "emits unknown tokens on utf8 boundaries" {
@@ -188,7 +215,7 @@ fn expectSameTokens(expected: []const Token, actual: []const Token) !void {
         try std.testing.expectEqual(lhs.start, rhs.start);
         try std.testing.expectEqual(lhs.end, rhs.end);
         try std.testing.expectEqual(lhs.word_id, rhs.word_id);
-        try std.testing.expectEqualStrings(lhs.feature, rhs.feature);
+        try std.testing.expectEqualStrings(lhs.feature(), rhs.feature());
     }
 }
 
