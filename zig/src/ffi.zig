@@ -273,6 +273,19 @@ pub export fn delarocha_worker_free(worker: ?*Worker) void {
     }
 }
 
+/// Bytes held by the tokenizer's shared decoded-feature table for compact
+/// dictionaries (see `Tokenizer.sharedFeatureBytes`). Returns 0 for null.
+pub export fn delarocha_tokenizer_shared_feature_bytes(tokenizer: ?*const Tokenizer) usize {
+    return if (tokenizer) |ptr| ptr.sharedFeatureBytes() else 0;
+}
+
+/// Caps the tokenizer's shared decoded-feature table (see
+/// `Tokenizer.setSharedFeatureLimit`). Must not race with tokenization on
+/// the tokenizer's workers.
+pub export fn delarocha_tokenizer_set_shared_feature_limit(tokenizer: ?*Tokenizer, max_bytes: usize) void {
+    if (tokenizer) |ptr| ptr.setSharedFeatureLimit(max_bytes);
+}
+
 /// Bytes of lattice/token buffer capacity the worker holds (see
 /// `Worker.retainedBytes`). Returns 0 for a null worker.
 pub export fn delarocha_worker_retained_bytes(worker: ?*const Worker) usize {

@@ -26,6 +26,8 @@ comptime {
     _ = ffi.delarocha_worker_new;
     _ = ffi.delarocha_worker_free;
     _ = ffi.delarocha_worker_retained_bytes;
+    _ = ffi.delarocha_tokenizer_shared_feature_bytes;
+    _ = ffi.delarocha_tokenizer_set_shared_feature_limit;
     _ = ffi.delarocha_worker_shrink_to;
     _ = ffi.delarocha_worker_set_retained_limit;
     _ = ffi.delarocha_tokenize;
@@ -465,6 +467,391 @@ test "connection-id renumbering preserves tokenization" {
                 try std.testing.expectEqual(try original_worker.tokenizeCount(input), try worker.tokenizeCount(input));
             }
         }
+    }
+}
+
+// Characters of the generated three-character surfaces: hiragana (whose
+// katakana rendering the compact encoding references), katakana and kanji.
+const generated_chars = [_][]const u8{
+    "あ",
+    "い",
+    "う",
+    "え",
+    "お",
+    "か",
+    "き",
+    "く",
+    "け",
+    "こ",
+    "さ",
+    "し",
+    "す",
+    "せ",
+    "そ",
+    "た",
+    "ち",
+    "つ",
+    "て",
+    "と",
+    "な",
+    "に",
+    "ぬ",
+    "ね",
+    "の",
+    "は",
+    "ひ",
+    "ふ",
+    "ア",
+    "イ",
+    "ウ",
+    "エ",
+    "オ",
+    "本",
+    "語",
+    "猫",
+    "犬",
+    "山",
+    "川",
+    "空",
+};
+
+const GeneratedLexicon = struct {
+    lex: []u8,
+    // Per entry (= word id): surface and expected feature bytes.
+    surfaces: [][]u8,
+    features: [][]u8,
+
+    fn deinit(self: GeneratedLexicon, allocator: std.mem.Allocator) void {
+        for (self.surfaces, self.features) |surface, feature| {
+            allocator.free(surface);
+            allocator.free(feature);
+        }
+        allocator.free(self.surfaces);
+        allocator.free(self.features);
+        allocator.free(self.lex);
+    }
+};
+
+fn appendKatakana(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    var view = try std.unicode.Utf8View.init(text);
+    var it = view.iterator();
+    while (it.nextCodepoint()) |code| {
+        const mapped: u21 = if (code >= 0x3041 and code <= 0x3096) code + 0x60 else code;
+        var buf: [4]u8 = undefined;
+        const len = try std.unicode.utf8Encode(mapped, &buf);
+        try out.appendSlice(allocator, buf[0..len]);
+    }
+}
+
+/// `count` entries with distinct three-character surfaces, so a
+/// concatenation of surfaces tokenizes into exactly those entries, and
+/// MeCab-style features of several shapes (surface, katakana and column
+/// references, long literals, short raw-fallback rows, one invalid UTF-8
+/// literal) that select the compact feature encoding.
+fn generatedLexicon(allocator: std.mem.Allocator, count: usize) !GeneratedLexicon {
+    const n = generated_chars.len;
+    std.debug.assert(count <= n * n * n);
+    var lex: std.ArrayList(u8) = .empty;
+    errdefer lex.deinit(allocator);
+    const surfaces = try allocator.alloc([]u8, count);
+    errdefer allocator.free(surfaces);
+    const features = try allocator.alloc([]u8, count);
+    errdefer allocator.free(features);
+    for (0..count) |i| {
+        const surface = try std.mem.concat(allocator, u8, &.{ generated_chars[i % n], generated_chars[(i / n) % n], generated_chars[i / (n * n)] });
+        var kana: std.ArrayList(u8) = .empty;
+        defer kana.deinit(allocator);
+        try appendKatakana(allocator, &kana, surface);
+        var feature: std.ArrayList(u8) = .empty;
+        defer feature.deinit(allocator);
+        switch (i % 6) {
+            0 => try feature.print(allocator, "名詞,一般,*,*,*,*,{s},{s},{s}", .{ surface, kana.items, kana.items }),
+            1 => try feature.print(allocator, "動詞,自立,*,*,五段・ラ行,基本形,{s}る,{s},{s}ー", .{ surface, kana.items, kana.items }),
+            2 => try feature.print(allocator, "名詞,固有名詞,人名,姓,*,*,{s},{s}{d},{s}{d}", .{ surface, kana.items, i, kana.items, i }),
+            3 => try feature.print(allocator, "記号,{d}", .{i}),
+            4 => try feature.print(allocator, "副詞,一般,*,*,*,*,{s},{s},{s},長い説明文その{d}は特徴列の長さを稼ぐためのものです", .{ surface, kana.items, kana.items, i }),
+            else => try feature.print(allocator, "名詞,サ変接続,*,*,*,*,{s},{s},{s}", .{ surface[0..3], kana.items, kana.items[3..] }),
+        }
+        // One entry carries invalid UTF-8; its decoded bytes are still
+        // pinned exactly.
+        if (i == 7) try feature.appendSlice(allocator, "\xff");
+        try lex.print(allocator, "{s},0,0,{d},{s}\n", .{ surface, 10 + i % 7, feature.items });
+        surfaces[i] = surface;
+        features[i] = try feature.toOwnedSlice(allocator);
+    }
+    return .{ .lex = try lex.toOwnedSlice(allocator), .surfaces = surfaces, .features = features };
+}
+
+const generated_matrix = "1 1\n0 0 0\n";
+const generated_char_def = "DEFAULT 0 1 0\nALPHA 1 1 0\n0x0041..0x005A ALPHA\n";
+const generated_unk = "DEFAULT,0,0,30000,*\nALPHA,0,0,10,alpha\n";
+
+/// Lines over the generated entries: runs of consecutive entries, the same
+/// entry repeated, a strided sweep over every entry, and unknown words.
+fn generatedInputs(allocator: std.mem.Allocator, lexicon: GeneratedLexicon) !std.ArrayList([]u8) {
+    var lines: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+    const count = lexicon.surfaces.len;
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(allocator);
+    var start: usize = 0;
+    while (start < count) {
+        const len = @min(1 + random.uintLessThan(usize, 40), count - start);
+        for (lexicon.surfaces[start..][0..len]) |surface| try line.appendSlice(allocator, surface);
+        if (len % 5 == 0) try line.appendSlice(allocator, "ABC");
+        try lines.append(allocator, try line.toOwnedSlice(allocator));
+        start += len;
+    }
+    for (0..200) |_| try line.appendSlice(allocator, lexicon.surfaces[3 % count]);
+    try lines.append(allocator, try line.toOwnedSlice(allocator));
+    var index: usize = 0;
+    for (0..count) |_| {
+        try line.appendSlice(allocator, lexicon.surfaces[index]);
+        index = (index + 7919) % count;
+        if (line.items.len > 300) try lines.append(allocator, try line.toOwnedSlice(allocator));
+    }
+    try lines.append(allocator, try line.toOwnedSlice(allocator));
+    try lines.append(allocator, try allocator.dupe(u8, ""));
+    return lines;
+}
+
+/// Every token's feature equals the generated feature of its word id (or the
+/// unknown-word feature), and tokens are contiguous.
+fn expectGeneratedFeatures(lexicon: GeneratedLexicon, input: []const u8, tokens: []const Token) !void {
+    var end: usize = 0;
+    for (tokens) |token| {
+        try std.testing.expectEqual(end, token.start);
+        end = token.end;
+        if (token.isUnknown()) {
+            try std.testing.expectEqualStrings("alpha", token.feature());
+            continue;
+        }
+        try std.testing.expectEqualStrings(lexicon.surfaces[token.word_id], input[token.start..token.end]);
+        try std.testing.expectEqualStrings(lexicon.features[token.word_id], token.feature());
+    }
+    try std.testing.expectEqual(input.len, end);
+}
+
+test "compact features decode byte-identically under decode cache pressure" {
+    const allocator = std.testing.allocator;
+    const lexicon = try generatedLexicon(allocator, 3000);
+    defer lexicon.deinit(allocator);
+    var lines = try generatedInputs(allocator, lexicon);
+    defer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+    var raw_dict = try Dictionary.fromRawBytes(allocator, lexicon.lex, generated_matrix, generated_char_def, generated_unk);
+    defer raw_dict.deinit();
+    const binary = try raw_dict.toBinaryAlloc(allocator);
+    defer allocator.free(binary);
+    var dict = try Dictionary.fromBinaryBytes(allocator, binary);
+    defer dict.deinit();
+    try std.testing.expect(dict.features_compact);
+
+    // Every entry, through the raw dictionary and the compact one.
+    var raw_worker = Worker.init(allocator, &raw_dict, null);
+    defer raw_worker.deinit();
+    var fresh = Worker.init(allocator, &dict, null);
+    defer fresh.deinit();
+    var distinct = try std.DynamicBitSet.initEmpty(allocator, lexicon.surfaces.len);
+    defer distinct.deinit();
+    var distinct_bytes: usize = 0;
+    var known_tokens: usize = 0;
+    for (lines.items) |line| {
+        const expected = try raw_worker.tokenize(line);
+        try expectGeneratedFeatures(lexicon, line, expected);
+        const tokens = try fresh.tokenize(line);
+        try expectSameTokens(expected, tokens);
+        for (tokens) |token| if (!token.isUnknown()) {
+            known_tokens += 1;
+            if (!distinct.isSet(token.word_id)) {
+                distinct.set(token.word_id);
+                distinct_bytes += token.feature_len;
+            }
+        };
+    }
+    try std.testing.expectEqual(lexicon.surfaces.len, distinct.count());
+    // With the default limit every word is decoded once.
+    const unlimited = fresh.featureStats();
+    try std.testing.expectEqual(@as(u64, 0), unlimited.restarts);
+    try std.testing.expectEqual(@as(u64, known_tokens), unlimited.hits + unlimited.misses);
+
+    // Tiny and moderate cache limits force restarts; eager, deferred,
+    // shrinking and capped workers interleave on the same dictionary and
+    // keep producing the same bytes.
+    for ([_]usize{ 0, 64, 4096 }) |byte_limit| {
+        var eager = Worker.init(allocator, &dict, null);
+        defer eager.deinit();
+        eager.setFeatureCacheByteLimit(byte_limit);
+        var deferred = Worker.init(allocator, &dict, null);
+        defer deferred.deinit();
+        deferred.setFeatureCacheByteLimit(byte_limit);
+        var capped = Worker.init(allocator, &dict, null);
+        defer capped.deinit();
+        capped.setFeatureCacheByteLimit(byte_limit);
+        capped.setRetainedCapacityLimit(2048);
+        var shrinking = Worker.init(allocator, &dict, null);
+        defer shrinking.deinit();
+        shrinking.setFeatureCacheByteLimit(byte_limit);
+        for (0..2) |pass| {
+            for (lines.items, 0..) |line, index| {
+                const expected = try raw_worker.tokenize(line);
+                try expectSameTokens(expected, try eager.tokenize(line));
+
+                const scratch = try allocator.dupe(u8, line);
+                _ = try deferred.tokenizeDeferred(scratch);
+                @memset(scratch, 0);
+                allocator.free(scratch);
+                try deferred.resolveFeatures();
+                try expectSameTokens(expected, deferred.tokens.items);
+
+                try expectSameTokens(expected, try capped.tokenize(line));
+                _ = try capped.tokenizeDeferred(line);
+                try capped.resolveFeatures();
+                try expectSameTokens(expected, capped.tokens.items);
+
+                _ = try shrinking.tokenize(line);
+                if ((index + pass) % 3 == 0) shrinking.shrink() else shrinking.shrinkTo(index * 97 % 8192);
+                try expectSameTokens(expected, try shrinking.tokenize(line));
+            }
+        }
+        const stats = eager.featureStats();
+        try std.testing.expect(stats.restarts > 0);
+        try std.testing.expect(stats.decoded_bytes > distinct_bytes);
+        try std.testing.expect(deferred.featureStats().restarts > 0);
+    }
+}
+
+fn expectGeneratedLines(worker: *Worker, raw_worker: *Worker, lines: []const []u8) !void {
+    for (lines) |line| try expectSameTokens(try raw_worker.tokenize(line), try worker.tokenize(line));
+}
+
+const SharedThreadContext = struct {
+    tokenizer: *Tokenizer,
+    lexicon: *const GeneratedLexicon,
+    lines: []const []u8,
+    offset: usize,
+    failed: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *SharedThreadContext) void {
+        self.runChecked() catch self.failed.store(true, .release);
+    }
+
+    fn runChecked(self: *SharedThreadContext) !void {
+        var worker = self.tokenizer.createWorker(std.testing.allocator);
+        defer worker.deinit();
+        for (0..self.lines.len) |step| {
+            const line = self.lines[(step + self.offset) % self.lines.len];
+            if (step % 2 == 0) {
+                try expectGeneratedFeatures(self.lexicon.*, line, try worker.tokenize(line));
+            } else {
+                _ = try worker.tokenizeDeferred(line);
+                try worker.resolveFeatures();
+                try expectGeneratedFeatures(self.lexicon.*, line, worker.tokens.items);
+            }
+        }
+    }
+};
+
+test "tokenizer workers share decoded compact features" {
+    const allocator = std.testing.allocator;
+    // About 330 KB of decoded features: more than one shared arena chunk.
+    const lexicon = try generatedLexicon(allocator, 5000);
+    defer lexicon.deinit(allocator);
+    var lines = try generatedInputs(allocator, lexicon);
+    defer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+    var raw_dict = try Dictionary.fromRawBytes(allocator, lexicon.lex, generated_matrix, generated_char_def, generated_unk);
+    defer raw_dict.deinit();
+    const binary = try raw_dict.toBinaryAlloc(allocator);
+    defer allocator.free(binary);
+    var raw_worker = Worker.init(allocator, &raw_dict, null);
+    defer raw_worker.deinit();
+
+    const chunk_size = tokenizer.SharedFeatures.chunk_size;
+    for ([_]usize{ tokenizer.SharedFeatures.default_byte_limit, 0, chunk_size }) |shared_limit| {
+        var tok: Tokenizer = .{ .allocator = allocator, .dictionary = try Dictionary.fromBinaryBytes(allocator, binary) };
+        defer tok.deinit();
+        try std.testing.expect(tok.dictionary.features_compact);
+        tok.setSharedFeatureLimit(shared_limit);
+
+        // The first worker decodes; with sharing, later workers find every
+        // feature already decoded.
+        var first = tok.createWorker(allocator);
+        defer first.deinit();
+        first.setFeatureCacheByteLimit(64);
+        try expectGeneratedLines(&first, &raw_worker, lines.items);
+        var second = tok.createWorker(allocator);
+        defer second.deinit();
+        second.setFeatureCacheByteLimit(64);
+        var deferred = tok.createWorker(allocator);
+        defer deferred.deinit();
+        var capped = tok.createWorker(allocator);
+        defer capped.deinit();
+        capped.setRetainedCapacityLimit(2048);
+        var shrinking = tok.createWorker(allocator);
+        defer shrinking.deinit();
+        for (0..2) |pass| {
+            for (lines.items, 0..) |line, index| {
+                const expected = try raw_worker.tokenize(line);
+                try expectSameTokens(expected, try second.tokenize(line));
+                const scratch = try allocator.dupe(u8, line);
+                _ = try deferred.tokenizeDeferred(scratch);
+                @memset(scratch, 0);
+                allocator.free(scratch);
+                try deferred.resolveFeatures();
+                try expectSameTokens(expected, deferred.tokens.items);
+                try expectSameTokens(expected, try capped.tokenize(line));
+                _ = try capped.tokenizeDeferred(line);
+                try capped.resolveFeatures();
+                try expectSameTokens(expected, capped.tokens.items);
+                _ = try shrinking.tokenize(line);
+                if ((index + pass) % 3 == 0) shrinking.shrink() else shrinking.shrinkTo(index * 97 % 8192);
+                try expectSameTokens(expected, try shrinking.tokenize(line));
+            }
+        }
+
+        const shared_bytes = tok.sharedFeatureBytes();
+        const first_stats = first.featureStats();
+        const second_stats = second.featureStats();
+        if (shared_limit == tokenizer.SharedFeatures.default_byte_limit) {
+            try std.testing.expect(!tok.shared_features.full.load(.acquire));
+            try std.testing.expect(shared_bytes > 0);
+            try std.testing.expect(first_stats.decoded_bytes > 0);
+            try std.testing.expectEqual(@as(u64, 0), first_stats.restarts);
+            try std.testing.expectEqual(@as(u64, 0), second_stats.decoded_bytes);
+            try std.testing.expectEqual(@as(u64, 0), deferred.featureStats().decoded_bytes);
+        } else {
+            // Without room for every word, the rest go to the bounded
+            // worker caches, which restart.
+            try std.testing.expect(tok.shared_features.full.load(.acquire));
+            try std.testing.expect(tok.shared_features.arena_bytes <= shared_limit);
+            try std.testing.expectEqual(shared_limit == 0, shared_bytes == 0);
+            try std.testing.expect(first_stats.restarts > 0);
+            try std.testing.expect(second_stats.restarts > 0);
+            try std.testing.expect(second_stats.decoded_bytes > 0);
+        }
+
+        // Workers on several threads decode and share concurrently.
+        var threaded: Tokenizer = .{ .allocator = allocator, .dictionary = try Dictionary.fromBinaryBytes(allocator, binary) };
+        defer threaded.deinit();
+        threaded.setSharedFeatureLimit(shared_limit);
+        var contexts: [4]SharedThreadContext = undefined;
+        var threads: [4]std.Thread = undefined;
+        for (&contexts, &threads, 0..) |*context, *thread, index| {
+            context.* = .{ .tokenizer = &threaded, .lexicon = &lexicon, .lines = lines.items, .offset = index * lines.items.len / 4 };
+            thread.* = try std.Thread.spawn(.{}, SharedThreadContext.run, .{context});
+        }
+        for (threads) |thread| thread.join();
+        for (contexts) |context| try std.testing.expect(!context.failed.load(.acquire));
     }
 }
 

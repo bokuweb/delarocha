@@ -2214,6 +2214,11 @@ pub mod ffi {
         fn delarocha_worker_new(tokenizer: *mut RawTokenizer) -> *mut RawWorker;
         fn delarocha_worker_free(worker: *mut RawWorker);
         fn delarocha_worker_retained_bytes(worker: *const RawWorker) -> usize;
+        fn delarocha_tokenizer_shared_feature_bytes(tokenizer: *const RawTokenizer) -> usize;
+        fn delarocha_tokenizer_set_shared_feature_limit(
+            tokenizer: *mut RawTokenizer,
+            max_bytes: usize,
+        );
         fn delarocha_worker_shrink_to(worker: *mut RawWorker, max_bytes: usize) -> usize;
         fn delarocha_worker_set_retained_limit(worker: *mut RawWorker, max_bytes: usize);
         fn delarocha_tokenize_bytes(worker: *mut RawWorker, input: *const u8, len: usize) -> i32;
@@ -2495,8 +2500,9 @@ pub mod ffi {
             let validated = unsafe { (*self.feature_utf8.get()).is_validated(token.word_id) };
             if validated {
                 // SAFETY: memoized as UTF-8 (see `FeatureUtf8Cache`); the
-                // bytes live in the dictionary or the worker's decode cache,
-                // which outlive the worker borrow behind `&self`.
+                // bytes live in the dictionary, the tokenizer's shared feature
+                // table or the worker's decode cache, which outlive the
+                // worker borrow behind `&self`.
                 unsafe { feature_str(token.feature_ptr, len) }
             } else {
                 unsafe { self.validate_feature(token) }
@@ -2511,8 +2517,9 @@ pub mod ffi {
             if token.feature_ptr.is_null() {
                 return "";
             }
-            // SAFETY: Zig returns a pointer/length pair into the dictionary or
-            // the worker's decode cache.
+            // SAFETY: Zig returns a pointer/length pair into the dictionary,
+            // the tokenizer's shared feature table or the worker's decode
+            // cache.
             let bytes = unsafe { std::slice::from_raw_parts(token.feature_ptr, token.feature_len) };
             // SAFETY: see the type docs; this is the only live reference into
             // the cell, and it ends before returning.
@@ -2549,7 +2556,8 @@ pub mod ffi {
 
     /// Zero-copy token: `surface` borrows the tokenized input and `feature`
     /// borrows dictionary storage (or, for dictionaries with compact features,
-    /// the worker's decoded-feature cache), so producing one allocates nothing.
+    /// decoded features held by the tokenizer or the worker), so producing one
+    /// allocates nothing.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct ZigTokenView<'a> {
         pub surface: &'a str,
@@ -2989,6 +2997,29 @@ pub mod ffi {
                 return Err(last_error());
             }
             Ok(())
+        }
+
+        /// Bytes held by the decoded-feature table that this tokenizer's
+        /// workers share, for dictionaries with compact (format v4)
+        /// features: each distinct word's feature is decoded once per
+        /// tokenizer and kept until the tokenizer is dropped. It grows with
+        /// the distinct words seen, up to the limit of
+        /// [`Self::set_shared_feature_limit`], plus a 4-byte-per-entry index
+        /// allocated with the first decoded feature. Not included in
+        /// [`ZigWorker::retained_bytes`]. Always 0 for other dictionaries.
+        pub fn shared_feature_bytes(&self) -> usize {
+            unsafe { delarocha_tokenizer_shared_feature_bytes(self.raw.as_ptr()) }
+        }
+
+        /// Caps the arena of the shared decoded-feature table (default
+        /// 40 MiB, enough for every IPADIC feature). Words first seen after
+        /// the cap is reached are decoded into the workers' own bounded
+        /// caches instead (about 1 MiB each, emptied when full); `0` turns
+        /// sharing off for words not shared yet. Features already shared
+        /// stay until the tokenizer is dropped. Tokenization output does not
+        /// depend on the limit.
+        pub fn set_shared_feature_limit(&mut self, max_bytes: usize) {
+            unsafe { delarocha_tokenizer_set_shared_feature_limit(self.raw.as_ptr(), max_bytes) }
         }
 
         pub fn create_worker(&self) -> Result<ZigWorker<'_>> {
