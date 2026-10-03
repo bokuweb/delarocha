@@ -189,10 +189,13 @@ keeps raw features when the encoding would not be smaller (Zig:
 `Dictionary.toBinaryAllocWithOptions(.{ .compact_features = false })` forces
 raw). For IPADIC the feature data shrinks from 31.1 MB to 7.5 MB and the
 dictionary file from 63.6 MB to 40.0 MB. Tokens still expose byte-identical
-feature strings: they are decoded once per word into a small per-worker cache
-(bounded to about 1 MiB) when features are requested, so span/count-only
-tokenization does not decode anything, and features borrowed from a worker are
-valid until the worker is used again.
+feature strings: when features are requested, each distinct word is decoded
+once per tokenizer into a table shared by all of its workers (lock-free
+lookups, grown only with the words actually seen, capped at 40 MiB by default,
+which holds all of IPADIC; see `ZigTokenizer::shared_feature_bytes` and
+`set_shared_feature_limit`). Words beyond the cap go to a bounded per-worker
+cache. Span/count-only tokenization does not decode anything, and features
+borrowed from a worker are valid until the worker is used again.
 
 For output-sensitive callers, `ZigWorker::tokenize_borrowed_views` returns a
 lazy `ZigTokenViews` collection that reads the worker's native token array in

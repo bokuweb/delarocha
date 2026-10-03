@@ -115,6 +115,9 @@ pub const Tokenizer = struct {
     allocator: Allocator,
     dictionary: dict_mod.Dictionary,
     max_grouping_len: ?usize = null,
+    /// Compact-dictionary features decoded so far, shared by the workers
+    /// this tokenizer creates (see `SharedFeatures`).
+    shared_features: SharedFeatures = .{},
 
     pub fn initMinimalFile(allocator: Allocator, dict_path: []const u8) !Tokenizer {
         return .{ .allocator = allocator, .dictionary = try dict_mod.Dictionary.fromMinimalFile(allocator, dict_path) };
@@ -139,15 +142,210 @@ pub const Tokenizer = struct {
     }
 
     pub fn deinit(self: *Tokenizer) void {
+        self.shared_features.deinit(self.allocator);
         self.dictionary.deinit();
     }
 
+    /// Workers decode compact features into the tokenizer-wide
+    /// `shared_features`, so the tokenizer must stay at this address and
+    /// outlive them (as it already must for the dictionary they borrow).
     pub fn createWorker(self: *Tokenizer, allocator: Allocator) Worker {
-        return Worker.init(allocator, &self.dictionary, self.max_grouping_len);
+        var worker = Worker.init(allocator, &self.dictionary, self.max_grouping_len);
+        if (self.dictionary.features_compact) worker.shared_features = .{ .table = &self.shared_features, .allocator = self.allocator };
+        return worker;
+    }
+
+    /// Caps the arena bytes of `shared_features` (default
+    /// `SharedFeatures.default_byte_limit`). Words first seen after the cap
+    /// is reached are decoded into the workers' own decode caches; 0
+    /// disables sharing for words not shared yet. Already shared features
+    /// stay until `deinit`. Must not race with tokenization on this
+    /// tokenizer's workers.
+    pub fn setSharedFeatureLimit(self: *Tokenizer, limit: usize) void {
+        self.shared_features.byte_limit = limit;
+        self.shared_features.full.store(self.shared_features.arena_bytes >= limit, .release);
+    }
+
+    /// Bytes held by `shared_features` (arena chunks and the index).
+    pub fn sharedFeatureBytes(self: *const Tokenizer) usize {
+        return self.shared_features.retainedBytes();
+    }
+};
+
+/// Compact-dictionary features decoded so far, indexed by word id and shared
+/// by every worker of a `Tokenizer`, so each distinct word is decoded once
+/// per tokenizer instead of once per worker (and again after every restart
+/// of a worker's bounded cache). Token features borrow it until the
+/// tokenizer is freed.
+///
+/// Lookups take no lock: the index (one atomic u32 per word id, allocated on
+/// the first insert) has each entry set once, from 0 to its record offset,
+/// with release ordering after the record is written, and records are
+/// appended to fixed-size arena chunks that never move. Inserting, once per
+/// word, takes a spin lock. Arena memory grows only with the words actually
+/// seen and is capped by `byte_limit`; beyond it workers fall back to their
+/// own decode cache.
+pub const SharedFeatures = struct {
+    /// Arena bytes allowed (whole chunks of decoded features with 4-byte
+    /// headers), at most `max_chunks * chunk_size` (256 MiB).
+    byte_limit: usize = default_byte_limit,
+    // Entry per word id (0: not shared yet), allocated in one block on the
+    // first insert: one allocation instead of many small ones, which with a
+    // page allocator cost a system call each.
+    index: std.atomic.Value(?[*]std.atomic.Value(u32)) = .init(null),
+    index_len: usize = 0,
+    // Arena chunks; a record never straddles two. Written under the lock
+    // before any entry refers to them.
+    chunks: [max_chunks]?[*]align(header_len) u8 = @splat(null),
+    chunk_count: usize = 0,
+    chunk_used: usize = chunk_size,
+    arena_bytes: usize = 0,
+    // Set once the arena reached `byte_limit` (or an allocation failed), so
+    // misses skip the lock and use the worker cache.
+    full: std.atomic.Value(bool) = .init(false),
+    locked: std.atomic.Value(bool) = .init(false),
+
+    /// Large enough for every feature of IPADIC (about 392k entries,
+    /// 31.7 MiB decoded with headers) while bounding larger
+    /// dictionaries.
+    pub const default_byte_limit: usize = 40 << 20;
+    const chunk_bits = 18;
+    pub const chunk_size: usize = 1 << chunk_bits;
+    const max_chunks = 1024;
+    const header_len = 4;
+
+    comptime {
+        // The largest op-decoded feature plus its header fits one chunk.
+        std.debug.assert(header_len + dict_mod.feature_codec.max_decoded_len <= chunk_size);
+    }
+
+    fn deinit(self: *SharedFeatures, allocator: Allocator) void {
+        if (self.index.load(.acquire)) |index| allocator.free(index[0..self.index_len]);
+        for (self.chunks[0..self.chunk_count]) |chunk| allocator.free(@as([]align(header_len) u8, chunk.?[0..chunk_size]));
+        self.* = .{ .byte_limit = self.byte_limit };
+    }
+
+    fn retainedBytes(self: *const SharedFeatures) usize {
+        return self.arena_bytes + self.index_len * @sizeOf(u32);
+    }
+
+    /// The shared feature of `word_id`, if some worker stored it already.
+    inline fn get(self: *const SharedFeatures, word_id: u32) ?[]const u8 {
+        const index = self.index.load(.acquire) orelse return null;
+        if (word_id >= self.index_len) return null;
+        const entry = index[word_id].load(.acquire);
+        if (entry == 0) return null;
+        return self.record(entry);
+    }
+
+    inline fn record(self: *const SharedFeatures, entry: u32) []const u8 {
+        const offset = @as(usize, entry - 1) * header_len;
+        const at = self.chunks[offset >> chunk_bits].? + (offset & (chunk_size - 1));
+        const len = std.mem.readInt(u32, at[0..header_len], .little);
+        return (at + header_len)[0..len];
+    }
+
+    const Decoded = union(enum) {
+        /// Stored in the table now (`decoded`) or by an earlier call.
+        shared: struct { bytes: []const u8, decoded: bool },
+        /// A raw record of the dictionary, which is not copied.
+        borrowed: []const u8,
+        /// The table is full; use the worker cache.
+        full,
+    };
+
+    /// Decodes the feature of `word_id` (one of `dictionary`'s words, whose
+    /// surface is `surface`) straight into the arena and shares it, unless
+    /// another worker did so first. Decoding holds the insert lock, which
+    /// saves copying the feature out of a scratch buffer and costs the
+    /// other workers at most one decode (about 50 ns) of waiting.
+    fn decode(self: *SharedFeatures, allocator: Allocator, dictionary: *const dict_mod.Dictionary, word_id: u32, surface: []const u8) Decoded {
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        defer self.locked.store(false, .release);
+        if (self.full.load(.monotonic)) return .full;
+        const slot = self.entrySlot(allocator, dictionary.entry_feature_offsets.len -| 1, word_id) orelse return self.markFull();
+        const existing = slot.load(.monotonic);
+        if (existing != 0) return .{ .shared = .{ .bytes = self.record(existing), .decoded = false } };
+
+        // At most two attempts: in the current chunk, then in a fresh one
+        // when the rest of the current chunk is too short. The decoder
+        // writes into the free chunk tail through a list that cannot grow.
+        var fresh = self.chunk_used + header_len >= chunk_size;
+        while (true) {
+            if (fresh and !self.addChunk(allocator)) return self.markFull();
+            const at = self.chunks[self.chunk_count - 1].? + self.chunk_used;
+            var out: std.ArrayList(u8) = .{ .items = (at + header_len)[0..0], .capacity = chunk_size - self.chunk_used - header_len };
+            const decoded = dictionary.decodeEntryFeature(no_growth_allocator, word_id, surface, &out) catch {
+                if (self.chunk_used == 0) return self.markFull();
+                fresh = true;
+                continue;
+            };
+            switch (decoded) {
+                .borrowed => |bytes| return .{ .borrowed = bytes },
+                .appended => |len| {
+                    std.debug.assert(out.items.ptr == at + header_len);
+                    std.mem.writeInt(u32, at[0..header_len], @intCast(len), .little);
+                    const offset = (self.chunk_count - 1) * chunk_size + self.chunk_used;
+                    self.chunk_used += std.mem.alignForward(usize, header_len + len, header_len);
+                    slot.store(@intCast(offset / header_len + 1), .release);
+                    return .{ .shared = .{ .bytes = (at + header_len)[0..len], .decoded = true } };
+                },
+            }
+        }
+    }
+
+    fn addChunk(self: *SharedFeatures, allocator: Allocator) bool {
+        if (self.chunk_count == max_chunks or self.arena_bytes + chunk_size > self.byte_limit) return false;
+        const chunk = allocator.alignedAlloc(u8, .fromByteUnits(header_len), chunk_size) catch return false;
+        self.chunks[self.chunk_count] = chunk.ptr;
+        self.chunk_count += 1;
+        self.chunk_used = 0;
+        self.arena_bytes += chunk_size;
+        return true;
+    }
+
+    fn markFull(self: *SharedFeatures) Decoded {
+        self.full.store(true, .release);
+        return .full;
+    }
+
+    /// The index entry of `word_id`, allocating the index on first use.
+    /// Called with the insert lock held.
+    fn entrySlot(self: *SharedFeatures, allocator: Allocator, entry_count: usize, word_id: u32) ?*std.atomic.Value(u32) {
+        const index = self.index.load(.monotonic) orelse index: {
+            const entries = allocator.alloc(std.atomic.Value(u32), entry_count) catch return null;
+            // Fresh page-allocator memory (an anonymous mapping) is already
+            // zero; not clearing it keeps the untouched part of the index
+            // (most of it for typical text) from becoming resident.
+            const zeroed = comptime !builtin.target.cpu.arch.isWasm();
+            if (!(zeroed and allocator.vtable == std.heap.page_allocator.vtable)) @memset(entries, .init(0));
+            self.index_len = entry_count;
+            self.index.store(entries.ptr, .release);
+            break :index entries.ptr;
+        };
+        if (word_id >= self.index_len) return null;
+        return &index[word_id];
     }
 };
 
 const FeatureSpan = struct { start: u32, len: u32 };
+
+/// Refuses every allocation: lets the decoder write into a fixed buffer (an
+/// `ArrayList` over free arena space) and report `OutOfMemory` when the
+/// buffer is too short instead of reallocating it.
+const no_growth_allocator: Allocator = .{ .ptr = undefined, .vtable = &.{
+    .alloc = Allocator.noAlloc,
+    .resize = Allocator.noResize,
+    .remap = Allocator.noRemap,
+    .free = Allocator.noFree,
+} };
+
+/// A worker's handle on its tokenizer's `SharedFeatures`.
+const SharedFeaturesRef = struct {
+    table: *SharedFeatures,
+    // The tokenizer's allocator, which owns the shared table's memory.
+    allocator: Allocator,
+};
 
 /// Whether workers count compact-feature decode cache events in
 /// `Worker.feature_stats`. Enabled in tests, and in programs whose root
@@ -300,6 +498,9 @@ pub const Worker = struct {
     /// Optional cap on the capacity the worker keeps between calls; see
     /// `setRetainedCapacityLimit`. `null` (the default) never trims.
     retained_capacity_limit: ?usize = null,
+    /// The creating tokenizer's shared decoded features (compact
+    /// dictionaries only; see `Tokenizer.createWorker`).
+    shared_features: ?SharedFeaturesRef = null,
     /// Decode cache counters; `void` unless `collect_feature_stats`.
     feature_stats: if (collect_feature_stats) FeatureStats else void = if (collect_feature_stats) .{} else {},
 
@@ -433,9 +634,9 @@ pub const Worker = struct {
         try self.feature_spans.resize(self.allocator, count);
     }
 
-    /// Fills one token's feature from a compact dictionary through the
-    /// per-word cache. Tokens borrow the cache buffer directly and remember
-    /// their offsets in `span` in case the buffer moves while it grows.
+    /// Fills one token's feature from a compact dictionary: from the
+    /// tokenizer's shared features when the word was decoded before (by any
+    /// worker), otherwise by decoding it once.
     inline fn fillCompactFeature(self: *Worker, input: []const u8, token: *Token, span: *FeatureSpan) Allocator.Error!void {
         span.start = no_feature_span;
         const word_id = token.word_id;
@@ -443,6 +644,41 @@ pub const Worker = struct {
             token.setFeature(self.featureFor(word_id));
             return;
         }
+        if (self.shared_features) |shared| if (shared.table.get(word_id)) |bytes| {
+            if (collect_feature_stats) self.feature_stats.hits += 1;
+            token.setFeature(bytes);
+            return;
+        };
+        return self.decodeCompactFeature(input, token, span);
+    }
+
+    /// Decodes a feature that is not shared yet into the shared table, or,
+    /// without one (or once it is full), through the per-word worker cache.
+    /// Tokens borrow the worker cache buffer directly and remember their
+    /// offsets in `span` in case the buffer moves while it grows.
+    noinline fn decodeCompactFeature(self: *Worker, input: []const u8, token: *Token, span: *FeatureSpan) Allocator.Error!void {
+        const word_id = token.word_id;
+        const surface = input[token.start..token.end];
+        if (self.shared_features) |shared| if (!shared.table.full.load(.acquire)) {
+            switch (shared.table.decode(shared.allocator, self.dictionary, word_id, surface)) {
+                .shared => |result| {
+                    if (collect_feature_stats) {
+                        if (result.decoded) {
+                            self.feature_stats.misses += 1;
+                            self.feature_stats.decoded_bytes += result.bytes.len;
+                        } else self.feature_stats.hits += 1;
+                    }
+                    token.setFeature(result.bytes);
+                    return;
+                },
+                .borrowed => |bytes| {
+                    if (collect_feature_stats) self.feature_stats.misses += 1;
+                    token.setFeature(bytes);
+                    return;
+                },
+                .full => {},
+            }
+        };
         const cache = &self.feature_cache;
         const hit = cache.get(word_id);
         if (collect_feature_stats) {
@@ -508,8 +744,10 @@ pub const Worker = struct {
 
     /// Bytes of buffer capacity the worker currently holds: the full and
     /// count-only lattices, the token buffer, and, for dictionaries with
-    /// compact features, the decode cache (at most about 1 MiB of decoded
-    /// features plus its index) and the deferred input copy. Tokenizing grows these to
+    /// compact features, the deferred input copy and the worker's own decode
+    /// cache (at most about 1 MiB of decoded features plus its index; used
+    /// only without the tokenizer's `SharedFeatures` or once that is full,
+    /// and not counting the shared table). Tokenizing grows these to
     /// fit the largest input seen so far (roughly 60 bytes per input byte for
     /// `tokenize` and 32 for `tokenizeCount` on IPADIC) and keeps them for
     /// reuse; see `shrinkTo` and `setRetainedCapacityLimit`.

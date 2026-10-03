@@ -22,6 +22,8 @@ const CHARS: &[&str] = &[
 // per-worker decode cache limit (1 MiB) several times over a pass.
 const ENTRY_COUNT: usize = 24_000;
 const INVALID_ENTRY: usize = 7;
+// One shared arena chunk (256 KiB), well below the decoded total.
+const SMALL_SHARED_LIMIT: usize = 256 << 10;
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -169,6 +171,10 @@ impl Fixture {
             1,
             "the generated lexicon must select compact features"
         );
+        let limited = |limit: usize, mut tokenizer: ZigTokenizer| {
+            tokenizer.set_shared_feature_limit(limit);
+            tokenizer
+        };
         vec![
             (
                 "mmap",
@@ -177,6 +183,22 @@ impl Fixture {
             (
                 "bytes",
                 ZigTokenizer::from_binary_bytes(&bytes).expect("copy binary"),
+            ),
+            // No sharing: every worker decodes through its own bounded cache.
+            (
+                "unshared",
+                limited(
+                    0,
+                    ZigTokenizer::from_binary_path(&self.binary).expect("mmap binary"),
+                ),
+            ),
+            // Room for part of the features: the rest use the worker caches.
+            (
+                "small-shared",
+                limited(
+                    SMALL_SHARED_LIMIT,
+                    ZigTokenizer::from_binary_bytes(&bytes).expect("copy binary"),
+                ),
             ),
         ]
     }
@@ -256,6 +278,7 @@ fn every_entry_feature_matches_the_lexicon() {
     }
     assert!(seen.iter().all(|&seen| seen), "every entry is tokenized");
     assert_eq!(fixture.features[&fixture.surfaces[INVALID_ENTRY]], "");
+    assert_eq!(fixture.raw_tokenizer().shared_feature_bytes(), 0);
 
     for (name, tokenizer) in fixture.compact_tokenizers() {
         let mut owned = tokenizer.create_worker().expect("worker");
@@ -279,6 +302,21 @@ fn every_entry_feature_matches_the_lexicon() {
                     "{name} pass {pass}"
                 );
             }
+        }
+        // The shared table is tokenizer-level memory, bounded by its limit
+        // plus the 4-byte-per-entry index.
+        let shared = tokenizer.shared_feature_bytes();
+        let index = 4 * ENTRY_COUNT;
+        match name {
+            "unshared" => assert_eq!(shared, 0),
+            "small-shared" => assert!(
+                shared > 0 && shared <= SMALL_SHARED_LIMIT + index,
+                "{shared}"
+            ),
+            _ => assert!(
+                shared > SMALL_SHARED_LIMIT && shared <= (40 << 20) + index,
+                "{shared}"
+            ),
         }
     }
 }

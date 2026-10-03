@@ -98,6 +98,36 @@ inline fn isCopyBoundary(reference: []const u8, len: usize) bool {
     return len == reference.len or !isContinuation(reference[len]);
 }
 
+/// Copies `src` to `dest` (same length, not overlapping). Decoded columns
+/// are short (a few to a few dozen bytes), where a `memcpy` call dominated
+/// the decoder profile; up to 32 bytes are copied with two possibly
+/// overlapping word loads and stores instead.
+inline fn copyShort(dest: []u8, src: []const u8) void {
+    const n = src.len;
+    std.debug.assert(dest.len == n);
+    if (n > 32) return @memcpy(dest, src);
+    if (n >= 16) return copyOverlapping(u128, dest, src);
+    if (n >= 8) return copyOverlapping(u64, dest, src);
+    if (n >= 4) return copyOverlapping(u32, dest, src);
+    if (n == 0) return;
+    // 1 to 3 bytes: first, middle and last cover them without a loop.
+    dest[0] = src[0];
+    dest[n / 2] = src[n / 2];
+    dest[n - 1] = src[n - 1];
+}
+
+/// For `@sizeOf(T) <= n <= 2 * @sizeOf(T)`: copies the first and the last
+/// `@sizeOf(T)` bytes, which together cover all `n`.
+inline fn copyOverlapping(comptime T: type, dest: []u8, src: []const u8) void {
+    const size = @sizeOf(T);
+    const n = src.len;
+    std.debug.assert(n >= size and n <= 2 * size);
+    const head: T = @bitCast(src[0..size].*);
+    const tail: T = @bitCast(src[n - size ..][0..size].*);
+    dest[0..size].* = @bitCast(head);
+    dest[n - size ..][0..size].* = @bitCast(tail);
+}
+
 /// Appends `source` with hiragana (U+3041..U+3096) mapped to katakana. Both
 /// ranges are three-byte UTF-8 sequences, so lengths are preserved.
 fn appendKatakana(out: []u8, source: []const u8) void {
@@ -139,7 +169,8 @@ pub fn decode(allocator: Allocator, table: Table, record: []const u8, surface: [
     const start = out.items.len;
     // A decoded feature is at most the prefix plus, per op, one reference
     // copy (bounded by `max_decoded_len`) and its literal.
-    try out.appendSlice(allocator, prefix);
+    try out.ensureUnusedCapacity(allocator, prefix.len);
+    copyShort(out.addManyAsSliceAssumeCapacity(prefix.len), prefix);
     var column: usize = table.prefix_fields;
     var starts: [max_back_refs]usize = undefined;
     var lens: [max_back_refs]usize = undefined;
@@ -191,13 +222,13 @@ pub fn decode(allocator: Allocator, table: Table, record: []const u8, surface: [
         const dest = out.addManyAsSliceAssumeCapacity(field_len);
         if (source_in_out) {
             // Re-slice after `ensureUnusedCapacity`, which may have moved `out`.
-            @memcpy(dest[0..copy_len], out.items[source_start..][0..copy_len]);
+            copyShort(dest[0..copy_len], out.items[source_start..][0..copy_len]);
         } else if (reference == ref_katakana) {
             appendKatakana(dest[0..copy_len], source[0..copy_len]);
         } else {
-            @memcpy(dest[0..copy_len], source[0..copy_len]);
+            copyShort(dest[0..copy_len], source[0..copy_len]);
         }
-        @memcpy(dest[copy_len..], record[cursor..][0..literal_len]);
+        copyShort(dest[copy_len..], record[cursor..][0..literal_len]);
         cursor += literal_len;
 
         const slot = emitted % max_back_refs;
