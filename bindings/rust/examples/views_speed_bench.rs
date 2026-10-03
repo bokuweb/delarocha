@@ -12,14 +12,16 @@
 //!     --example views_speed_bench -- system.dic.zst vibrato-sf < corpus.txt
 //! ```
 //!
-//! Modes (`<dictionary>` is a delarocha binary dictionary for the first four
-//! and a Vibrato `system.dic[.zst]` for the `vibrato-*` modes):
+//! Modes (`<dictionary>` is a delarocha binary dictionary for all but the
+//! `vibrato-*` modes, which take a Vibrato `system.dic[.zst]`):
 //!
 //! - `raw`: `ZigWorker::tokenize_raw` (token count only).
 //! - `views-len`: `tokenize_borrowed_views(line)?.len()`.
 //! - `views-sf`: borrowed views, reading `surface()` and `feature()` of every
 //!   token.
 //! - `views-char`: borrowed views, reading `range_char()` of every token.
+//! - `owned-sf`: owned `ZigWorker::tokenize` (`Vec<Token>`), reading
+//!   `surface` and `feature` of every token.
 //! - `spans-feature`: `tokenize_raw`, then `copy_token_spans` into reusable
 //!   buffers and `token_feature(i)` for every token, with a per-word-id cache
 //!   of data derived from the feature (the call pattern of span-based
@@ -55,7 +57,7 @@ fn main() {
         .unwrap_or(1)
         .max(1);
     let results = match mode.as_str() {
-        "raw" | "views-len" | "views-sf" | "views-char" | "spans-feature" => {
+        "raw" | "views-len" | "views-sf" | "views-char" | "spans-feature" | "owned-sf" => {
             run_delarocha(dic, mode, &lines, passes)
         }
         "vibrato-num" | "vibrato-sf" => run_vibrato(dic, mode, &lines, passes),
@@ -120,6 +122,15 @@ fn delarocha_pass(
                 words += views.len();
                 for view in views.iter() {
                     checksum += black_box(view.surface()).len() + black_box(view.feature()).len();
+                }
+            }
+        }
+        "owned-sf" => {
+            for line in lines {
+                let tokens = worker.tokenize(line).expect("tokenize");
+                words += tokens.len();
+                for token in &tokens {
+                    checksum += black_box(token.surface()).len() + black_box(token.feature()).len();
                 }
             }
         }
