@@ -160,7 +160,7 @@ test "final word choice includes the connection cost to end-of-sentence" {
 
     const tokens = try worker.tokenize("b");
     try std.testing.expectEqual(@as(usize, 1), tokens.len);
-    try std.testing.expectEqualStrings("Y", tokens[0].feature);
+    try std.testing.expectEqualStrings("Y", tokens[0].feature());
     // the count-only path must agree
     try std.testing.expectEqual(@as(usize, 1), try worker.tokenizeCount("b"));
 }

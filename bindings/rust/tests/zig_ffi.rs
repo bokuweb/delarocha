@@ -50,6 +50,39 @@ fn zig_ffi_full_tokenize_accepts_interior_nul() {
 }
 
 #[test]
+fn zig_ffi_final_word_choice_includes_the_connection_cost_to_eos() {
+    // Same lattice as the pure-Rust test: "ab" is cheaper by word cost, but
+    // its right id connects to EOS at +50, so MeCab picks "a" + "b".
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let write = |name: &str, contents: &str| {
+        let path = temp_dir.path().join(name);
+        std::fs::write(&path, contents).expect("write raw dictionary file");
+        path
+    };
+    let tokenizer = ZigTokenizer::from_raw_paths(
+        write("lex.csv", "a,1,1,10,a\nb,1,2,10,b\nab,1,1,10,ab\n"),
+        write(
+            "matrix.def",
+            "3 3\n0 0 0\n0 1 0\n0 2 0\n1 0 50\n1 1 0\n1 2 0\n2 0 0\n2 1 0\n2 2 0\n",
+        ),
+        write("char.def", "DEFAULT 0 1 0\n"),
+        write("unk.def", "DEFAULT,0,0,10000,*\n"),
+    )
+    .expect("Zig tokenizer loads raw dictionary");
+    let mut worker = tokenizer.create_worker().expect("Zig worker is created");
+
+    let tokens = worker.tokenize("ab").expect("Zig tokenize succeeds");
+    assert_eq!(
+        tokens
+            .iter()
+            .map(|token| token.feature.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(worker.tokenize_count("ab").unwrap(), 2);
+}
+
+#[test]
 fn zig_ffi_tokenizes_raw_dictionary() {
     let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
     let tokenizer = ZigTokenizer::from_raw_paths(
