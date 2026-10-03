@@ -124,6 +124,33 @@ fn bench_zig_ffi(c: &mut Criterion) {
         });
     });
 
+    c.bench_function("delarocha/zig-ffi-borrowed-views-len", |b| {
+        b.iter(|| {
+            for sentence in SENTENCES {
+                black_box(
+                    worker
+                        .tokenize_borrowed_views(black_box(sentence))
+                        .unwrap()
+                        .len(),
+                );
+            }
+        });
+    });
+
+    c.bench_function("delarocha/zig-ffi-borrowed-views-range-char", |b| {
+        b.iter(|| {
+            for sentence in SENTENCES {
+                let views = worker.tokenize_borrowed_views(black_box(sentence)).unwrap();
+                black_box(
+                    views
+                        .iter()
+                        .map(|token| token.range_char().len())
+                        .sum::<usize>(),
+                );
+            }
+        });
+    });
+
     let batch = delarocha::ffi::ZigBatch::new(SENTENCES);
     c.bench_function("delarocha/zig-ffi-batch", |b| {
         b.iter(|| {
