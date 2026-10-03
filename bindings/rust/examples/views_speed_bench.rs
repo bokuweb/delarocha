@@ -46,27 +46,57 @@ fn main() {
         .map(|line| line.expect("read stdin line"))
         .collect();
 
-    let (elapsed, words, checksum) = match mode.as_str() {
+    // Timed passes over the corpus with the same worker (default 1). Pass 1
+    // is the cold run the harness measures; later passes show the steady
+    // state once per-word state (decoded features, UTF-8 memo) is warm.
+    let passes: usize = std::env::var("VIEWS_BENCH_PASSES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let results = match mode.as_str() {
         "raw" | "views-len" | "views-sf" | "views-char" | "spans-feature" => {
-            run_delarocha(dic, mode, &lines)
+            run_delarocha(dic, mode, &lines, passes)
         }
-        "vibrato-num" | "vibrato-sf" => run_vibrato(dic, mode, &lines),
+        "vibrato-num" | "vibrato-sf" => run_vibrato(dic, mode, &lines, passes),
         _ => {
             eprintln!("unknown mode {mode}");
             std::process::exit(2);
         }
     };
-    println!("Elapsed-{mode}: {} [sec]", elapsed.as_secs_f64());
-    eprintln!("Words-{mode}: {words}");
-    eprintln!("Checksum-{mode}: {checksum}");
+    for (pass, (elapsed, words, checksum)) in results.into_iter().enumerate() {
+        let label = if pass == 0 {
+            mode.clone()
+        } else {
+            format!("{mode}-pass{}", pass + 1)
+        };
+        println!("Elapsed-{label}: {} [sec]", elapsed.as_secs_f64());
+        eprintln!("Words-{label}: {words}");
+        eprintln!("Checksum-{label}: {checksum}");
+    }
+}
+
+/// Elapsed time, token count and checksum of one timed pass.
+#[cfg(feature = "zig-ffi")]
+type PassResult = (std::time::Duration, usize, usize);
+
+#[cfg(feature = "zig-ffi")]
+fn run_delarocha(dic: &str, mode: &str, lines: &[String], passes: usize) -> Vec<PassResult> {
+    let tokenizer = delarocha::ffi::ZigTokenizer::from_binary_path(dic).expect("load dictionary");
+    let mut worker = tokenizer.create_worker().expect("create worker");
+    (0..passes)
+        .map(|_| delarocha_pass(&mut worker, mode, lines))
+        .collect()
 }
 
 #[cfg(feature = "zig-ffi")]
-fn run_delarocha(dic: &str, mode: &str, lines: &[String]) -> (std::time::Duration, usize, usize) {
+fn delarocha_pass(
+    worker: &mut delarocha::ffi::ZigWorker<'_>,
+    mode: &str,
+    lines: &[String],
+) -> PassResult {
     use std::hint::black_box;
 
-    let tokenizer = delarocha::ffi::ZigTokenizer::from_binary_path(dic).expect("load dictionary");
-    let mut worker = tokenizer.create_worker().expect("create worker");
     let mut words = 0usize;
     let mut checksum = 0usize;
     let start = std::time::Instant::now();
@@ -132,8 +162,7 @@ fn run_delarocha(dic: &str, mode: &str, lines: &[String]) -> (std::time::Duratio
 }
 
 #[cfg(all(feature = "zig-ffi", feature = "vibrato-bench"))]
-fn run_vibrato(dic: &str, mode: &str, lines: &[String]) -> (std::time::Duration, usize, usize) {
-    use std::hint::black_box;
+fn run_vibrato(dic: &str, mode: &str, lines: &[String], passes: usize) -> Vec<PassResult> {
     use std::io::BufReader;
 
     let file = std::fs::File::open(dic).expect("open Vibrato dictionary");
@@ -145,6 +174,19 @@ fn run_vibrato(dic: &str, mode: &str, lines: &[String]) -> (std::time::Duration,
     };
     let tokenizer = vibrato::Tokenizer::new(dictionary);
     let mut worker = tokenizer.new_worker();
+    (0..passes)
+        .map(|_| vibrato_pass(&mut worker, mode, lines))
+        .collect()
+}
+
+#[cfg(all(feature = "zig-ffi", feature = "vibrato-bench"))]
+fn vibrato_pass(
+    worker: &mut vibrato::tokenizer::worker::Worker<'_>,
+    mode: &str,
+    lines: &[String],
+) -> PassResult {
+    use std::hint::black_box;
+
     let mut words = 0usize;
     let mut checksum = 0usize;
     let start = std::time::Instant::now();
@@ -172,7 +214,7 @@ fn run_vibrato(dic: &str, mode: &str, lines: &[String]) -> (std::time::Duration,
 }
 
 #[cfg(all(feature = "zig-ffi", not(feature = "vibrato-bench")))]
-fn run_vibrato(_dic: &str, mode: &str, _lines: &[String]) -> (std::time::Duration, usize, usize) {
+fn run_vibrato(_dic: &str, mode: &str, _lines: &[String], _passes: usize) -> Vec<PassResult> {
     eprintln!("mode {mode} needs the `vibrato-bench` feature");
     std::process::exit(2);
 }

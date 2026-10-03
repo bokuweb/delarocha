@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const dict_mod = @import("dictionary.zig");
 
 const Allocator = std.mem.Allocator;
@@ -148,6 +149,25 @@ pub const Tokenizer = struct {
 
 const FeatureSpan = struct { start: u32, len: u32 };
 
+/// Whether workers count compact-feature decode cache events in
+/// `Worker.feature_stats`. Enabled in tests, and in programs whose root
+/// source file declares `pub const delarocha_collect_feature_stats = true;`
+/// (benchmarks). Otherwise the counters are `void` and cost nothing.
+pub const collect_feature_stats = builtin.is_test or
+    (@hasDecl(@import("root"), "delarocha_collect_feature_stats") and @import("root").delarocha_collect_feature_stats);
+
+/// Compact-feature decode counters (see `collect_feature_stats`).
+pub const FeatureStats = struct {
+    /// Tokens whose feature came from the decode cache.
+    hits: u64 = 0,
+    /// Tokens whose feature was decoded from the dictionary record.
+    misses: u64 = 0,
+    /// Bytes appended to the decode cache by misses.
+    decoded_bytes: u64 = 0,
+    /// Times the decode cache was emptied while it held entries.
+    restarts: u64 = 0,
+};
+
 /// Per-worker memo of decoded compact features keyed by word id. Text repeats
 /// words heavily, so most tokens reuse an earlier decode instead of reading
 /// the dictionary record. Entries refer to `bytes` by offset, so growing the
@@ -161,16 +181,22 @@ const FeatureCache = struct {
     // Set by the worker's capacity trimming when `bytes` is still borrowed by
     // tokens: the next fill frees it instead of reusing it.
     release_on_next_fill: bool = false,
+    // Whether `bytes` was reallocated during the current fill.
+    moved: bool = false,
+    // Decoded bytes kept before the cache restarts at the next fill.
+    byte_limit: usize = default_byte_limit,
+    // Times entries were dropped (see `FeatureStats.restarts`).
+    restarts: if (collect_feature_stats) u64 else void = if (collect_feature_stats) 0 else {},
 
     const Slot = struct { key: u32, span: FeatureSpan };
     const empty_key: u32 = std.math.maxInt(u32);
-    const byte_limit: usize = 1 << 20;
+    pub const default_byte_limit: usize = 1 << 20;
     const initial_bits: u5 = 10;
 
     fn deinit(self: *FeatureCache, allocator: Allocator) void {
         self.bytes.deinit(allocator);
         allocator.free(self.slots);
-        self.* = .{};
+        self.* = .{ .byte_limit = self.byte_limit };
     }
 
     fn startFill(self: *FeatureCache, allocator: Allocator) void {
@@ -179,14 +205,20 @@ const FeatureCache = struct {
             self.freeBytes(allocator);
             return;
         }
-        if (self.bytes.items.len <= byte_limit) return;
+        if (self.bytes.items.len <= self.byte_limit) return;
+        self.countRestart();
         self.bytes.clearRetainingCapacity();
         for (self.slots) |*entry| entry.key = empty_key;
         self.len = 0;
     }
 
+    inline fn countRestart(self: *FeatureCache) void {
+        if (collect_feature_stats and self.len != 0) self.restarts += 1;
+    }
+
     /// Frees the decoded bytes; the index refers to them, so it is emptied.
     fn freeBytes(self: *FeatureCache, allocator: Allocator) void {
+        self.countRestart();
         self.bytes.clearAndFree(allocator);
         for (self.slots) |*entry| entry.key = empty_key;
         self.len = 0;
@@ -195,6 +227,7 @@ const FeatureCache = struct {
     /// Frees the index. Decoded bytes stay valid for tokens borrowing them
     /// but are no longer reachable, so the next fill starts over.
     fn freeIndex(self: *FeatureCache, allocator: Allocator) void {
+        self.countRestart();
         allocator.free(self.slots);
         self.slots = &.{};
         self.len = 0;
@@ -267,6 +300,8 @@ pub const Worker = struct {
     /// Optional cap on the capacity the worker keeps between calls; see
     /// `setRetainedCapacityLimit`. `null` (the default) never trims.
     retained_capacity_limit: ?usize = null,
+    /// Decode cache counters; `void` unless `collect_feature_stats`.
+    feature_stats: if (collect_feature_stats) FeatureStats else void = if (collect_feature_stats) .{} else {},
 
     const features_resolved: u8 = 0;
     const features_pending: u8 = 1;
@@ -285,6 +320,21 @@ pub const Worker = struct {
             .tokens = .empty,
             .group_cache = null,
         };
+    }
+
+    /// Decode cache counters including restarts (tests and benchmarks; see
+    /// `collect_feature_stats`).
+    pub fn featureStats(self: *const Worker) FeatureStats {
+        if (!collect_feature_stats) @compileError("feature stats are disabled; see collect_feature_stats");
+        var stats = self.feature_stats;
+        stats.restarts = self.feature_cache.restarts;
+        return stats;
+    }
+
+    /// Sets how many decoded feature bytes the per-worker decode cache keeps
+    /// before it restarts (default 1 MiB). Exposed for tests.
+    pub fn setFeatureCacheByteLimit(self: *Worker, limit: usize) void {
+        self.feature_cache.byte_limit = limit;
     }
 
     pub fn deinit(self: *Worker) void {
@@ -371,17 +421,16 @@ pub const Worker = struct {
             for (tokens) |*token| token.setFeature(self.featureFor(token.word_id));
             return;
         }
-        const base = try self.beginCompactFeatures(tokens.len);
+        try self.beginCompactFeatures(tokens.len);
         for (tokens, self.feature_spans.items) |*token, *span| try self.fillCompactFeature(input, token, span);
-        self.endCompactFeatures(base);
+        self.endCompactFeatures();
     }
 
-    /// Prepares decoding compact features for `count` tokens and returns the
-    /// cache buffer address that `endCompactFeatures` compares against.
-    fn beginCompactFeatures(self: *Worker, count: usize) Allocator.Error![*]u8 {
+    /// Prepares decoding compact features for `count` tokens.
+    fn beginCompactFeatures(self: *Worker, count: usize) Allocator.Error!void {
         self.feature_cache.startFill(self.allocator);
+        self.feature_cache.moved = false;
         try self.feature_spans.resize(self.allocator, count);
-        return self.feature_cache.bytes.items.ptr;
     }
 
     /// Fills one token's feature from a compact dictionary through the
@@ -395,13 +444,20 @@ pub const Worker = struct {
             return;
         }
         const cache = &self.feature_cache;
-        const cached = cache.get(word_id) orelse decoded: {
+        const hit = cache.get(word_id);
+        if (collect_feature_stats) {
+            if (hit != null) self.feature_stats.hits += 1 else self.feature_stats.misses += 1;
+        }
+        const cached = hit orelse decoded: {
+            const before = cache.bytes.items.ptr;
+            defer cache.moved = cache.moved or cache.bytes.items.ptr != before;
             switch (try self.dictionary.decodeEntryFeature(self.allocator, word_id, input[token.start..token.end], &cache.bytes)) {
                 .borrowed => |bytes| {
                     token.setFeature(bytes);
                     return;
                 },
                 .appended => |len| {
+                    if (collect_feature_stats) self.feature_stats.decoded_bytes += len;
                     const decoded: FeatureSpan = .{ .start = @intCast(cache.bytes.items.len - len), .len = @intCast(len) };
                     try cache.put(self.allocator, word_id, decoded);
                     break :decoded decoded;
@@ -412,10 +468,12 @@ pub const Worker = struct {
         token.setFeature(cache.bytes.items.ptr[cached.start..][0..cached.len]);
     }
 
-    /// Re-points token features at the cache buffer if it moved.
-    fn endCompactFeatures(self: *Worker, base: [*]u8) void {
+    /// Re-points token features at the cache buffer if it moved during the
+    /// fill. Comparing only the start and end addresses would miss a buffer
+    /// that moved away and was reallocated at its old address.
+    fn endCompactFeatures(self: *Worker) void {
         const bytes = self.feature_cache.bytes.items;
-        if (bytes.ptr == base) return;
+        if (!self.feature_cache.moved) return;
         for (self.tokens.items, self.feature_spans.items) |*token, span| {
             if (span.start != no_feature_span) token.setFeature(bytes[span.start..][0..span.len]);
         }
@@ -1212,7 +1270,7 @@ pub const Worker = struct {
         // Features are filled in the same pass when requested, so the token
         // array is written once.
         const compact = with_features and self.dictionary.features_compact;
-        const base = if (compact) try self.beginCompactFeatures(count) else undefined;
+        if (compact) try self.beginCompactFeatures(count);
         var start: usize = 0;
         for (self.tokens.items, 0..) |*token, i| {
             const node = self.nodes.items[path[count - 1 - i]];
@@ -1232,7 +1290,7 @@ pub const Worker = struct {
             }
             start = end;
         }
-        if (compact) self.endCompactFeatures(base);
+        if (compact) self.endCompactFeatures();
     }
 
     fn featureFor(self: *const Worker, word_id: u32) []const u8 {
