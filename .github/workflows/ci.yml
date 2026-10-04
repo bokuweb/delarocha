@@ -29,6 +29,9 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Set up mbx cache
+        uses: jdx/mr-boxington-action@v1
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -41,14 +44,14 @@ jobs:
           "$py" scripts/check_ar_alignment.py
 
       - name: Rust tests
-        run: cargo test --workspace --all-targets
+        run: mbx test --workspace --all-targets
 
       - name: Rust tests with Vibrato system dictionary support
-        run: cargo test -p delarocha --features "vibrato-system" --test vibrato_system_dictionary
+        run: mbx test -p delarocha --features "vibrato-system" --test vibrato_system_dictionary
 
       - name: Rust tests with Zig FFI
         if: runner.os != 'Windows'
-        run: cargo test -p delarocha --features "zig-ffi"
+        run: mbx test -p delarocha --features "zig-ffi"
 
       - name: Check prebuilt WASM Zig library size
         if: runner.os == 'Linux'
@@ -56,11 +59,11 @@ jobs:
 
       - name: Compile Yokohama text benchmark
         if: runner.os != 'Windows'
-        run: cargo test -p delarocha --features "zig-ffi vibrato-bench" --example yokohama_text_bench --no-run
+        run: mbx test -p delarocha --features "zig-ffi vibrato-bench" --example yokohama_text_bench --no-run
 
       - name: Compile WASM package
         if: runner.os == 'Linux'
-        run: cargo build -p delarocha --lib --target wasm32-unknown-unknown --features wasm --release
+        run: mbx build -p delarocha --lib --target wasm32-unknown-unknown --features wasm --release
 
       - name: Zig tests
         working-directory: zig
